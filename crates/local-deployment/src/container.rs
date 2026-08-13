@@ -594,57 +594,91 @@ impl LocalContainerService {
                         .is_some();
                     let mut started_queued_follow_up = false;
 
-                    // Only execute queued messages if the execution succeeded
-                    // If it failed or was killed, just clear the queue and finalize
+                    // Only execute queued messages if the execution succeeded. Failed
+                    // executions leave the durable message pending for retry or cancellation.
                     let should_execute_queued = !matches!(
                         ctx.execution_process.status,
                         ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
                     );
 
-                    if let Some(queued_msg) =
-                        container.queued_message_service.take_queued(ctx.session.id)
-                    {
-                        if should_execute_queued {
-                            tracing::info!(
-                                "Found queued message for session {}, starting follow-up execution",
-                                ctx.session.id
-                            );
-
-                            // Delete the scratch since we're consuming the queued message
-                            if let Err(e) = Scratch::delete(
-                                &db.pool,
-                                ctx.session.id,
-                                &ScratchType::DraftFollowUp,
-                            )
+                    if should_execute_queued {
+                        match container
+                            .queued_message_service
+                            .claim_queued(ctx.session.id)
                             .await
-                            {
-                                tracing::warn!(
-                                    "Failed to delete scratch after consuming queued message: {}",
-                                    e
+                        {
+                            Ok(Some(queued_msg)) => {
+                                tracing::info!(
+                                    "Found queued message for session {}, starting follow-up execution",
+                                    ctx.session.id
                                 );
-                            }
 
-                            // Execute the queued follow-up
-                            if let Err(e) = container
-                                .start_queued_follow_up(&ctx, &queued_msg.data)
-                                .await
-                            {
-                                tracing::error!("Failed to start queued follow-up: {}", e);
-                                // Fall back to finalization if follow-up fails
-                                container.finalize_task(&ctx).await;
-                            } else {
-                                started_queued_follow_up = true;
+                                if let Err(e) = container
+                                    .start_queued_follow_up(&ctx, &queued_msg.data)
+                                    .await
+                                {
+                                    tracing::error!("Failed to start queued follow-up: {}", e);
+                                    if let Err(retry_error) = container
+                                        .queued_message_service
+                                        .retry_claim(&queued_msg)
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to return queued follow-up to pending state: {}",
+                                            retry_error
+                                        );
+                                    }
+                                    container.finalize_task(&ctx).await;
+                                } else {
+                                    started_queued_follow_up = true;
+
+                                    if let Err(e) = container
+                                        .queued_message_service
+                                        .complete_claim(&queued_msg)
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Follow-up started but its durable queue claim could not be completed: {}",
+                                            e
+                                        );
+                                    }
+
+                                    if let Err(e) = Scratch::delete(
+                                        &db.pool,
+                                        ctx.session.id,
+                                        &ScratchType::DraftFollowUp,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to delete scratch after consuming queued message: {}",
+                                            e
+                                        );
+                                    }
+                                }
                             }
-                        } else {
-                            // Execution failed or was killed - discard the queued message and finalize
-                            tracing::info!(
-                                "Discarding queued message for session {} due to execution status {:?}",
-                                ctx.session.id,
-                                ctx.execution_process.status
-                            );
-                            container.finalize_task(&ctx).await;
+                            Ok(None) => container.finalize_task(&ctx).await,
+                            Err(e) => {
+                                tracing::error!("Failed to claim queued follow-up: {}", e);
+                                container.finalize_task(&ctx).await;
+                            }
                         }
                     } else {
+                        match container
+                            .queued_message_service
+                            .has_queued(ctx.session.id)
+                            .await
+                        {
+                            Ok(true) => {
+                                tracing::info!(
+                                    "Leaving queued message pending for session {} after execution status {:?}",
+                                    ctx.session.id,
+                                    ctx.execution_process.status
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(e) => tracing::error!("Failed to check queued follow-up: {}", e),
+                        }
                         container.finalize_task(&ctx).await;
                     }
 
@@ -683,33 +717,66 @@ impl LocalContainerService {
                     .await
                     .unwrap_or(true);
 
-                    if !has_running_agent
-                        && let Some(queued_msg) =
-                            container.queued_message_service.take_queued(ctx.session.id)
-                    {
-                        tracing::info!(
-                            "Parallel setup script finished with queued message for session {}, starting follow-up",
-                            ctx.session.id
-                        );
-
-                        if let Err(e) =
-                            Scratch::delete(&db.pool, ctx.session.id, &ScratchType::DraftFollowUp)
-                                .await
-                        {
-                            tracing::warn!(
-                                "Failed to delete scratch after consuming queued message: {}",
-                                e
-                            );
-                        }
-
-                        if let Err(e) = container
-                            .start_queued_follow_up(&ctx, &queued_msg.data)
+                    if !has_running_agent {
+                        match container
+                            .queued_message_service
+                            .claim_queued(ctx.session.id)
                             .await
                         {
-                            tracing::error!(
-                                "Failed to start queued follow-up from setup script completion: {}",
-                                e
-                            );
+                            Ok(Some(queued_msg)) => {
+                                tracing::info!(
+                                    "Parallel setup script finished with queued message for session {}, starting follow-up",
+                                    ctx.session.id
+                                );
+
+                                if let Err(e) = container
+                                    .start_queued_follow_up(&ctx, &queued_msg.data)
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Failed to start queued follow-up from setup script completion: {}",
+                                        e
+                                    );
+                                    if let Err(retry_error) = container
+                                        .queued_message_service
+                                        .retry_claim(&queued_msg)
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to return queued follow-up to pending state: {}",
+                                            retry_error
+                                        );
+                                    }
+                                } else {
+                                    if let Err(e) = container
+                                        .queued_message_service
+                                        .complete_claim(&queued_msg)
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Follow-up started but its durable queue claim could not be completed: {}",
+                                            e
+                                        );
+                                    }
+
+                                    if let Err(e) = Scratch::delete(
+                                        &db.pool,
+                                        ctx.session.id,
+                                        &ScratchType::DraftFollowUp,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to delete scratch after consuming queued message: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!("Failed to claim queued follow-up: {}", e);
+                            }
                         }
                     }
                 }

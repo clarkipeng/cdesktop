@@ -21,6 +21,7 @@ use services::services::{
     config::{ConfigError, EditorOpenError},
     container::ContainerError,
     file::FileError,
+    queued_message::QueuedMessageError,
     remote_client::RemoteClientError,
     repo::RepoError as RepoServiceError,
 };
@@ -55,6 +56,8 @@ pub enum ApiError {
     Executor(#[from] ExecutorError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    QueuedMessage(#[from] QueuedMessageError),
     #[error(transparent)]
     Worktree(WorktreeError),
     #[error(transparent)]
@@ -494,6 +497,7 @@ impl IntoResponse for ApiError {
             ApiError::Executor(_) => ErrorInfo::internal("ExecutorError"),
             ApiError::CommandBuilder(_) => ErrorInfo::internal("CommandBuildError"),
             ApiError::Database(_) => ErrorInfo::internal("DatabaseError"),
+            ApiError::QueuedMessage(_) => ErrorInfo::internal("QueuedMessageError"),
             ApiError::Worktree(err) => ErrorInfo::with_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "WorktreeError",

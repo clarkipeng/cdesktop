@@ -10773,7 +10773,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.2.3-sightmesh.2"
+version = "0.2.3-sightmesh.3"
 dependencies = [
  "anyhow",
  "api-types",

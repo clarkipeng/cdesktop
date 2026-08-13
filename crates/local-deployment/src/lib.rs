@@ -158,7 +158,8 @@ impl Deployment for LocalDeployment {
         }
 
         let approvals = Approvals::new();
-        let queued_message_service = QueuedMessageService::new();
+        let queued_message_service = QueuedMessageService::new(db.pool.clone());
+        queued_message_service.recover_interrupted_claims().await?;
 
         let oauth_credentials = Arc::new(OAuthCredentials::new(credentials_path()));
         if let Err(e) = oauth_credentials.load().await {

@@ -1627,6 +1627,21 @@ export const queueApi = {
   },
 };
 
+export interface SightMeshUpdateStatus {
+  managed: boolean;
+  status: string;
+  pending_version: string | null;
+  active_version: string | null;
+  updated_at: number | null;
+}
+
+export const maintenanceApi = {
+  getUpdateStatus: async (): Promise<SightMeshUpdateStatus> => {
+    const response = await makeRequest('/api/maintenance/update');
+    return handleApiResponse<SightMeshUpdateStatus>(response);
+  },
+};
+
 // Relay API
 export const relayApi = {
   getEnrollmentCode: async (): Promise<{ enrollment_code: string }> => {

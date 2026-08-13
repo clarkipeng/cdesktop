@@ -24,7 +24,7 @@ use services::services::{
     file_search::FileSearchCache,
     filesystem::{FilesystemError, FilesystemService},
     filesystem_watcher::FilesystemWatcherError,
-    queued_message::QueuedMessageService,
+    queued_message::{QueuedMessageError, QueuedMessageService},
     remote_client::RemoteClient,
     repo::RepoService,
 };
@@ -68,6 +68,8 @@ pub enum DeploymentError {
     Worktree(#[from] WorktreeError),
     #[error(transparent)]
     Event(#[from] EventError),
+    #[error(transparent)]
+    QueuedMessage(#[from] QueuedMessageError),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error("Remote client not configured")]
