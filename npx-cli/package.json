@@ -1,7 +1,7 @@
 {
   "name": "cdesktop",
   "private": false,
-  "version": "0.2.3-sightmesh.4",
+  "version": "0.2.4",
   "main": "index.js",
   "bin": {
     "cdesktop": "bin/cli.js"
