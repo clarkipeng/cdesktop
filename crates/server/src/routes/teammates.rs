@@ -370,12 +370,19 @@ fn validate_name(name: &str) -> Result<(), TeammateError> {
 fn build_wrap_template(name: &str, workspace: &Workspace, user_prompt: Option<&str>) -> String {
     let workspace_label = workspace_label(workspace);
     let body = user_prompt.map(|p| p.trim()).unwrap_or("");
-    let fallback = "Run `npx cdesktop team list` to orient, then await further instructions from another team member.";
+    let fallback = "Run `cdesktop team list` to orient, then await further instructions from another team member.";
     let user_section = if body.is_empty() { fallback } else { body };
 
     format!(
         "[Spawned as teammate \"{name}\" in team for workspace \"{workspace_label}\".\n\
-         Use `npx cdesktop team list`/`send`/`transcript` to coordinate.]\n\n{user_section}",
+         Use `cdesktop team list` and `cdesktop team send` to coordinate with peers.\n\
+         Use `sightmesh peers`, `sightmesh peek`, and `sightmesh steer` to inspect or\n\
+         immediately contact any visible local agent, including other workspaces.\n\
+         Contact your manager whenever you need a decision, feedback, or help with a blocker,\n\
+         and when you finish: `cdesktop team manager --message 'STATUS: concise details'`.\n\
+         Batch independent read-only tool calls and all currently known questions.\n\
+         Keep dependent or destructive actions sequential.\n\
+         Do not assume your manager is reading this transcript in real time.]\n\n{user_section}",
     )
 }
 
@@ -428,7 +435,8 @@ mod tests {
     fn wrap_template_uses_fallback_when_no_prompt() {
         let ws = make_test_workspace("demo");
         let out = build_wrap_template("reviewer", &ws, None);
-        assert!(out.contains("npx cdesktop team list"));
+        assert!(out.contains("cdesktop team list"));
+        assert!(out.contains("cdesktop team manager"));
         assert!(out.contains("reviewer"));
         assert!(out.contains("demo"));
     }
@@ -438,7 +446,8 @@ mod tests {
         let ws = make_test_workspace("demo");
         let out = build_wrap_template("reviewer", &ws, Some("audit the diff"));
         assert!(out.contains("audit the diff"));
-        assert!(!out.contains("Run `npx cdesktop team list` to orient"));
+        assert!(!out.contains("Run `cdesktop team list` to orient"));
+        assert!(out.contains("cdesktop team manager"));
     }
 
     #[test]

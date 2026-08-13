@@ -12,7 +12,7 @@ use db::models::{
 };
 use deployment::Deployment;
 use futures_util::{StreamExt, TryStreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use services::services::container::ContainerService;
 use utils::{log_msg::LogMsg, response::ApiResponse};
 use uuid::Uuid;
@@ -34,11 +34,108 @@ struct SessionExecutionProcessQuery {
     pub show_soft_deleted: Option<bool>,
 }
 
+#[derive(Debug, Serialize)]
+struct NormalizedLogSnapshot {
+    entries: Vec<serde_json::Value>,
+    patch_count: usize,
+    skipped_patch_count: usize,
+    complete: bool,
+}
+
+fn apply_normalized_message(
+    document: &mut serde_json::Value,
+    message: LogMsg,
+    patch_count: &mut usize,
+    skipped_patch_count: &mut usize,
+) -> bool {
+    match message {
+        LogMsg::JsonPatch(patch) => {
+            if json_patch::patch(document, &patch).is_ok() {
+                *patch_count += 1;
+            } else {
+                *skipped_patch_count += 1;
+            }
+            false
+        }
+        LogMsg::Finished => true,
+        _ => false,
+    }
+}
+
 async fn get_execution_process_by_id(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(_deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<ExecutionProcess>>, ApiError> {
     Ok(ResponseJson(ApiResponse::success(execution_process)))
+}
+
+async fn list_execution_processes_by_session(
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<SessionExecutionProcessQuery>,
+) -> Result<ResponseJson<ApiResponse<Vec<ExecutionProcess>>>, ApiError> {
+    let processes = ExecutionProcess::find_by_session_id(
+        &deployment.db().pool,
+        query.session_id,
+        query.show_soft_deleted.unwrap_or(false),
+    )
+    .await?;
+    Ok(ResponseJson(ApiResponse::success(processes)))
+}
+
+async fn get_normalized_log_snapshot(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<NormalizedLogSnapshot>>, ApiError> {
+    let Some(mut stream) = deployment
+        .container()
+        .stream_normalized_logs(&execution_process.id)
+        .await
+    else {
+        return Err(ApiError::BadRequest(
+            "normalized logs are unavailable for this execution".into(),
+        ));
+    };
+
+    let mut document = serde_json::json!({ "entries": [] });
+    let mut patch_count = 0;
+    let mut skipped_patch_count = 0;
+    let mut complete = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+    while patch_count < 100_000 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let next = tokio::time::timeout(
+            remaining.min(std::time::Duration::from_millis(50)),
+            stream.next(),
+        )
+        .await;
+        let Ok(Some(message)) = next else {
+            break;
+        };
+        if apply_normalized_message(
+            &mut document,
+            message?,
+            &mut patch_count,
+            &mut skipped_patch_count,
+        ) {
+            complete = true;
+            break;
+        }
+    }
+
+    let entries = document
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    Ok(ResponseJson(ApiResponse::success(NormalizedLogSnapshot {
+        entries,
+        patch_count,
+        skipped_patch_count,
+        complete,
+    })))
 }
 
 async fn stream_raw_logs_ws(
@@ -288,6 +385,7 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .route("/", get(get_execution_process_by_id))
         .route("/stop", post(stop_execution_process))
         .route("/repo-states", get(get_execution_process_repo_states))
+        .route("/normalized-snapshot", get(get_normalized_log_snapshot))
         .route("/raw-logs/ws", get(stream_raw_logs_ws))
         .route("/normalized-logs/ws", get(stream_normalized_logs_ws))
         .layer(from_fn_with_state(
@@ -296,6 +394,7 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         ));
 
     let workspaces_router = Router::new()
+        .route("/", get(list_execution_processes_by_session))
         .route(
             "/stream/session/ws",
             get(stream_execution_processes_by_session_ws),
@@ -303,4 +402,47 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .nest("/{id}", workspace_id_router);
 
     Router::new().nest("/execution-processes", workspaces_router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_snapshot_coalesces_streaming_replacements() {
+        let mut document = serde_json::json!({ "entries": [] });
+        let mut applied = 0;
+        let mut skipped = 0;
+        for patch in [
+            serde_json::json!([{
+                "op": "add",
+                "path": "/entries/0",
+                "value": { "content": "hel" }
+            }]),
+            serde_json::json!([{
+                "op": "replace",
+                "path": "/entries/0",
+                "value": { "content": "hello" }
+            }]),
+        ] {
+            let message =
+                LogMsg::JsonPatch(serde_json::from_value(patch).expect("valid JSON patch fixture"));
+            assert!(!apply_normalized_message(
+                &mut document,
+                message,
+                &mut applied,
+                &mut skipped,
+            ));
+        }
+
+        assert_eq!(applied, 2);
+        assert_eq!(skipped, 0);
+        assert_eq!(document["entries"][0]["content"], "hello");
+        assert!(apply_normalized_message(
+            &mut document,
+            LogMsg::Finished,
+            &mut applied,
+            &mut skipped,
+        ));
+    }
 }

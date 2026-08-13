@@ -765,9 +765,9 @@ export type Codex = { append_prompt: AppendPrompt, sandbox?: SandboxMode | null,
 
 export type SandboxMode = "auto" | "read-only" | "workspace-write" | "danger-full-access";
 
-export type AskForApproval = "unless-trusted" | "on-failure" | "on-request" | "never";
+export type AskForApproval = "unless-trusted" | "on-request" | "never";
 
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export type ReasoningSummary = "auto" | "concise" | "detailed" | "none";
 
