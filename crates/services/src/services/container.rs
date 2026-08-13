@@ -401,10 +401,16 @@ pub trait ContainerService {
         }
 
         let execution_id = Uuid::new_v4();
-        let commands = SessionCommand::claim_pending(pool, session_id, execution_id).await?;
+        let commands = SessionCommand::pending(pool, session_id).await?;
         let Some(first) = commands.first() else {
             return Ok(None);
         };
+        let first_config = first.config.clone();
+        let commands = commands
+            .into_iter()
+            .take_while(|command| command.config == first_config)
+            .collect::<Vec<_>>();
+        let first = &commands[0];
         let SessionCommandConfig {
             mut executor_config,
             selected_provider_id,
@@ -508,6 +514,7 @@ pub trait ContainerService {
                 &action,
                 &ExecutionProcessRunReason::CodingAgent,
                 execution_id,
+                true,
             )
             .await
         }
@@ -1397,6 +1404,7 @@ pub trait ContainerService {
             executor_action,
             run_reason,
             Uuid::new_v4(),
+            false,
         )
         .await
     }
@@ -1408,6 +1416,7 @@ pub trait ContainerService {
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
         execution_process_id: Uuid,
+        claim_pending_commands: bool,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Create new execution process record
         // Capture current HEAD per repository as the "before" commit for this execution
@@ -1446,6 +1455,10 @@ pub trait ContainerService {
         )
         .await?;
         if *run_reason == ExecutionProcessRunReason::CodingAgent {
+            if claim_pending_commands {
+                SessionCommand::claim_pending(&self.db().pool, session.id, execution_process.id)
+                    .await?;
+            }
             let command = match executor_action.typ() {
                 ExecutorActionType::CodingAgentInitialRequest(request) => {
                     Some((request.prompt.clone(), request.executor_config.clone()))
