@@ -13,6 +13,7 @@ pub mod routine;
 pub mod routine_run;
 pub mod scratch;
 pub mod session;
+pub mod session_command;
 pub mod tag;
 pub mod task;
 pub mod workspace;
