@@ -3269,6 +3269,7 @@ dependencies = [
  "utils",
  "uuid",
  "walkdir",
+ "winapi",
  "winsplit",
  "xdg",
 ]
