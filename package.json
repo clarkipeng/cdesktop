@@ -1,6 +1,6 @@
 {
   "name": "cdesktop",
-  "version": "0.2.3-sightmesh.3",
+  "version": "0.2.3-sightmesh.4",
   "private": true,
   "bin": {
     "cdesktop": "npx-cli/bin/cli.js"

@@ -68,6 +68,7 @@ import {
   TokenResponse,
   CurrentUserResponse,
   QueueStatus,
+  SessionCommand,
   PrCommentsResponse,
   MergeWorkspaceRequest,
   PushWorkspaceRequest,
@@ -350,12 +351,12 @@ export const sessionsApi = {
   followUp: async (
     sessionId: string,
     data: CreateFollowUpAttempt
-  ): Promise<ExecutionProcess> => {
+  ): Promise<SessionCommand> => {
     const response = await makeRequest(`/api/sessions/${sessionId}/follow-up`, {
       method: 'POST',
       body: JSON.stringify(data),
     });
-    return handleApiResponse<ExecutionProcess>(response);
+    return handleApiResponse<SessionCommand>(response);
   },
 
   startReview: async (

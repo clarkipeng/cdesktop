@@ -97,6 +97,11 @@ async fn main() -> Result<(), VibeKanbanError> {
         .await
         .map_err(DeploymentError::from)?;
     deployment
+        .container()
+        .dispatch_all_pending_commands()
+        .await
+        .map_err(DeploymentError::from)?;
+    deployment
         .track_if_analytics_allowed("session_start", serde_json::json!({}))
         .await;
     // Preload global executor options cache for all executors with DEFAULT presets

@@ -1,7 +1,7 @@
 //! Agent Teams MVP — spawn endpoint shared between two HTTP routes:
 //!
 //! - `POST /api/workspaces/{workspace_id}/teammates` (UI; caller-agnostic)
-//! - `POST /api/sessions/{caller_id}/teammates` (CLI; lead-only)
+//! - `POST /api/sessions/{caller_id}/teammates` (CLI; records parentage)
 //!
 //! See `plans/agent-teams-mvp.md` for the design contract.
 
@@ -66,7 +66,7 @@ pub struct SpawnTeammateResponse {
 pub enum SpawnSource {
     /// `/workspaces/{id}/teammates` — caller-agnostic.
     WorkspaceUi,
-    /// `/sessions/{caller_id}/teammates` — lead-only.
+    /// `/sessions/{caller_id}/teammates`: agent initiated.
     SessionCli,
 }
 
@@ -89,8 +89,6 @@ pub enum TeammateError {
     ProviderNotConfigured(String),
     #[error("{0}")]
     NameInvalid(&'static str),
-    #[error("Caller is not the lead session of this workspace")]
-    NotLead,
     #[error("Workspace not found")]
     WorkspaceNotFound,
     #[error("Workspace is archived")]
@@ -107,7 +105,6 @@ impl TeammateError {
             TeammateError::ExecutorRequiresProvider => "EXECUTOR_REQUIRES_PROVIDER",
             TeammateError::ProviderNotConfigured(_) => "PROVIDER_NOT_CONFIGURED",
             TeammateError::NameInvalid(_) => "NAME_INVALID",
-            TeammateError::NotLead => "NOT_LEAD",
             TeammateError::WorkspaceNotFound => "WORKSPACE_NOT_FOUND",
             TeammateError::WorkspaceArchived => "WORKSPACE_ARCHIVED",
             TeammateError::NoCallerHistory => "NO_CALLER_HISTORY",
@@ -121,7 +118,6 @@ impl TeammateError {
             | TeammateError::ProviderNotConfigured(_)
             | TeammateError::NameInvalid(_)
             | TeammateError::NoCallerHistory => StatusCode::BAD_REQUEST,
-            TeammateError::NotLead => StatusCode::FORBIDDEN,
             TeammateError::WorkspaceNotFound => StatusCode::NOT_FOUND,
             TeammateError::WorkspaceArchived => StatusCode::CONFLICT,
             TeammateError::SpawnFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -150,7 +146,7 @@ pub async fn spawn_via_workspace(
 }
 
 /// `POST /api/sessions/{caller_id}/teammates` — used by the `cdesktop team
-/// spawn` CLI. Enforces lead-only.
+/// spawn` CLI. The caller becomes the new session's parent.
 pub async fn spawn_via_session(
     Extension(caller): Extension<Session>,
     axum::extract::State(deployment): axum::extract::State<DeploymentImpl>,
@@ -161,14 +157,6 @@ pub async fn spawn_via_session(
     let workspace = Workspace::find_by_id(pool, caller.workspace_id)
         .await?
         .ok_or_else(|| ApiError::from(TeammateError::WorkspaceNotFound))?;
-
-    let lead = Session::find_first_by_workspace_id(pool, workspace.id)
-        .await?
-        .ok_or_else(|| ApiError::from(TeammateError::WorkspaceNotFound))?;
-
-    if lead.id != caller.id {
-        return Err(ApiError::from(TeammateError::NotLead));
-    }
 
     let session_id = spawn_teammate_core(
         &deployment,
@@ -270,6 +258,7 @@ async fn spawn_teammate_core(
         &CreateSession {
             executor: Some(executor_config.executor.to_string()),
             name: Some(payload.name.clone()),
+            parent_session_id: caller.map(|session| session.id),
         },
         Uuid::new_v4(),
         workspace.id,
@@ -456,12 +445,10 @@ mod tests {
             TeammateError::ExecutorRequiresProvider.code(),
             "EXECUTOR_REQUIRES_PROVIDER"
         );
-        assert_eq!(TeammateError::NotLead.code(), "NOT_LEAD");
         assert_eq!(
             TeammateError::WorkspaceArchived.status(),
             StatusCode::CONFLICT
         );
-        assert_eq!(TeammateError::NotLead.status(), StatusCode::FORBIDDEN);
     }
 
     fn make_test_workspace(name: &str) -> Workspace {
