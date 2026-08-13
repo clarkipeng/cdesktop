@@ -196,6 +196,7 @@ jobs:
     needs: [bump-version, build-frontend]
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       # Platform matrix - keep target/name in sync with package-npx-cli job
       matrix:
         include:
