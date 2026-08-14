@@ -94,11 +94,7 @@ impl Executable for ScriptRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        time::SystemTime,
-    };
+    use std::{fs, path::PathBuf, time::SystemTime};
 
     use super::*;
     use crate::{
@@ -156,25 +152,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_script_rejects_parent_directory_working_dir() {
-        let request = ScriptRequest {
-            script: "true".to_string(),
-            language: ScriptRequestLanguage::Bash,
-            context: ScriptContext::SetupScript,
-            working_dir: Some("../outside".to_string()),
-        };
+    async fn setup_script_rejects_unsafe_working_dirs() {
         let env = ExecutionEnv::new(RepoContext::default(), false, String::new());
 
-        let error = request
-            .spawn(
-                Path::new("/tmp"),
-                Arc::new(NoopExecutorApprovalService {}),
-                &env,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, ExecutorError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
-        );
+        let unsafe_dirs = if cfg!(windows) {
+            ["../outside", "C:\\outside"]
+        } else {
+            ["../outside", "/outside"]
+        };
+        for working_dir in unsafe_dirs {
+            let request = ScriptRequest {
+                script: "true".to_string(),
+                language: ScriptRequestLanguage::Bash,
+                context: ScriptContext::SetupScript,
+                working_dir: Some(working_dir.to_string()),
+            };
+
+            let error = request
+                .spawn(
+                    Path::new("/tmp"),
+                    Arc::new(NoopExecutorApprovalService {}),
+                    &env,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ExecutorError::Io(error) if error.kind() == io::ErrorKind::InvalidInput),
+                "{working_dir} should be rejected"
+            );
+        }
     }
 }
