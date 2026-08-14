@@ -26,7 +26,7 @@ use db::{
 };
 use deployment::DeploymentError;
 use executors::{
-    actions::{Executable, ExecutorAction},
+    actions::{Executable, ExecutorAction, ExecutorActionType},
     approvals::{ExecutorApprovalService, NoopExecutorApprovalService},
     env::{ExecutionEnv, RepoContext},
     executors::{BaseCodingAgent, CancellationToken, ExecutorExitResult, ExecutorExitSignal},
@@ -62,6 +62,22 @@ use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 use crate::{command, copy};
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
+
+fn execution_current_dir(
+    worktree_root: Option<&Path>,
+    primary_repo_name: &str,
+    primary_repo_path: &Path,
+    executor_action: &ExecutorAction,
+) -> PathBuf {
+    match (worktree_root, executor_action.typ()) {
+        // Script actions retain a repository-relative working_dir so a chain
+        // can address each workspace repo. Resolve that relative path from
+        // the worktree root, not from the primary repository itself.
+        (Some(root), ExecutorActionType::ScriptRequest(_)) => root.to_path_buf(),
+        (Some(root), _) => root.join(primary_repo_name),
+        (None, _) => primary_repo_path.to_path_buf(),
+    }
+}
 
 #[derive(Clone)]
 pub struct LocalContainerService {
@@ -1189,10 +1205,12 @@ impl ContainerService for LocalContainerService {
         } else {
             None
         };
-        let current_dir = match &worktree_root {
-            Some(root) => root.join(&primary_repo.name),
-            None => primary_repo.path.clone(),
-        };
+        let current_dir = execution_current_dir(
+            worktree_root.as_deref(),
+            &primary_repo.name,
+            &primary_repo.path,
+            executor_action,
+        );
 
         let approvals_service: Arc<dyn ExecutorApprovalService> =
             match executor_action.base_executor() {
@@ -1552,5 +1570,36 @@ fn success_exit_status() -> std::process::ExitStatus {
     {
         use std::os::windows::process::ExitStatusExt;
         ExitStatusExt::from_raw(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use executors::actions::script::{ScriptContext, ScriptRequest, ScriptRequestLanguage};
+
+    use super::*;
+
+    #[test]
+    fn worktree_setup_script_resolves_repo_dir_from_workspace_root() {
+        let root = Path::new("/tmp/workspace");
+        let action = ExecutorAction::new(
+            ExecutorActionType::ScriptRequest(ScriptRequest {
+                script: "true".to_string(),
+                language: ScriptRequestLanguage::Bash,
+                context: ScriptContext::SetupScript,
+                working_dir: Some("catapult-games".to_string()),
+            }),
+            None,
+        );
+
+        assert_eq!(
+            execution_current_dir(
+                Some(root),
+                "catapult-games",
+                Path::new("/source/catapult-games"),
+                &action,
+            ),
+            root,
+        );
     }
 }
