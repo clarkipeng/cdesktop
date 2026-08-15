@@ -125,26 +125,6 @@ impl StopExecutionOperation {
             }
         }
     }
-
-    /// Followers wait for the owner's durable outcome; they never invoke the
-    /// destructive stop. A bounded wait lets the API surface an in-progress
-    /// request instead of deadlocking when the owner is still active.
-    pub async fn wait_for_completion(
-        pool: &SqlitePool,
-        execution_process_id: Uuid,
-        dedupe_key: &str,
-        instance_id: Uuid,
-    ) -> Result<Option<StopExecutionOutcome>, sqlx::Error> {
-        for _ in 0..100 {
-            if let StopExecutionOperationState::Complete(outcome) =
-                Self::state(pool, execution_process_id, dedupe_key, instance_id).await?
-            {
-                return Ok(Some(outcome));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -328,6 +308,7 @@ mod tests {
                 ));
                 owner_started.wait().await;
                 before_stop.wait().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
                 stop_calls.fetch_add(1, Ordering::SeqCst);
                 StopExecutionOperation::complete(
                     &pool,
@@ -355,19 +336,25 @@ mod tests {
                     }
                 ));
                 before_stop.wait().await;
-                StopExecutionOperation::wait_for_completion(
-                    &pool,
-                    process_id,
-                    "concurrent",
-                    instance_id,
-                )
-                .await
-                .unwrap()
-                .unwrap()
+                StopExecutionOperation::state(&pool, process_id, "concurrent", instance_id)
+                    .await
+                    .unwrap()
             })
         };
 
-        assert_eq!(owner.await.unwrap(), follower.await.unwrap());
+        assert!(matches!(
+            follower.await.unwrap(),
+            StopExecutionOperationState::Pending {
+                owned_by_current_instance: true
+            }
+        ));
+        assert_eq!(owner.await.unwrap(), StopExecutionOutcome::Accepted);
+        assert!(matches!(
+            StopExecutionOperation::begin(&pool, process_id, "concurrent", instance_id)
+                .await
+                .unwrap(),
+            StopExecutionOperationState::Complete(StopExecutionOutcome::Accepted)
+        ));
         assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
     }
 }

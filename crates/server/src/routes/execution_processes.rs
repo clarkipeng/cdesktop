@@ -348,21 +348,11 @@ async fn stop_execution_process(
         StopExecutionOperationState::Pending {
             owned_by_current_instance: true,
         } => {
-            let outcome = StopExecutionOperation::wait_for_completion(
-                pool,
-                execution_process.id,
-                &dedupe_key,
-                instance_id,
-            )
-            .await?;
-            return outcome.map_or_else(
-                || {
-                    Err(ApiError::Conflict(
-                        "The original stop request is still in progress.".into(),
-                    ))
-                },
-                stop_outcome_response,
-            );
+            // 425 is deliberately distinct from the durable 409 rejection:
+            // retry this exact key until the owner publishes its outcome.
+            return Err(ApiError::TooEarly(
+                "The original stop request is still in progress; retry the same dedupe_key.".into(),
+            ));
         }
         StopExecutionOperationState::Pending {
             owned_by_current_instance: false,

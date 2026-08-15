@@ -75,6 +75,8 @@ pub enum ApiError {
     BadRequest(String),
     #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Too early: {0}")]
+    TooEarly(String),
     #[error("Forbidden: {0}")]
     Forbidden(String),
     #[error("Too many requests: {0}")]
@@ -468,6 +470,9 @@ impl IntoResponse for ApiError {
             ),
             ApiError::BadRequest(msg) => ErrorInfo::bad_request("BadRequest", msg.clone()),
             ApiError::Conflict(msg) => ErrorInfo::conflict("ConflictError", msg.clone()),
+            ApiError::TooEarly(msg) => {
+                ErrorInfo::with_status(StatusCode::TOO_EARLY, "TooEarly", msg.clone())
+            }
             ApiError::Forbidden(msg) => {
                 ErrorInfo::with_status(StatusCode::FORBIDDEN, "ForbiddenError", msg.clone())
             }
@@ -557,6 +562,23 @@ impl From<TrustedKeyAuthError> for ApiError {
             TrustedKeyAuthError::TooManyRequests(msg) => ApiError::TooManyRequests(msg),
             TrustedKeyAuthError::Io(e) => ApiError::Io(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    #[test]
+    fn in_progress_stop_response_is_protocol_distinct_from_rejection() {
+        assert_eq!(
+            ApiError::TooEarly("still running".into())
+                .into_response()
+                .status(),
+            StatusCode::TOO_EARLY
+        );
     }
 }
 
