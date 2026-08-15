@@ -355,12 +355,7 @@ async fn stop_execution_process(
         StopExecutionOperationState::Pending {
             owned_by_current_instance: false,
         } => {
-            let current = ExecutionProcess::find_by_id(pool, execution_process.id)
-                .await?
-                .ok_or(
-                    db::models::execution_process::ExecutionProcessError::ExecutionProcessNotFound,
-                )?;
-            let outcome = orphaned_stop_outcome(&current.status);
+            let outcome = orphaned_stop_outcome();
             let outcome = StopExecutionOperation::complete(
                 pool,
                 execution_process.id,
@@ -409,14 +404,12 @@ fn stop_outcome_response(
     }
 }
 
-fn orphaned_stop_outcome(status: &ExecutionProcessStatus) -> StopExecutionOutcome {
-    if *status == ExecutionProcessStatus::Running {
-        // The owner died after recording intent but before the authoritative
-        // terminal state. Do not take over or claim success.
-        StopExecutionOutcome::Rejected
-    } else {
-        StopExecutionOutcome::Accepted
-    }
+fn orphaned_stop_outcome() -> StopExecutionOutcome {
+    // A terminal execution row can come from the independent exit monitor,
+    // not this stop operation. Without a durable process-controller identity,
+    // it cannot prove this key performed the side effect. Preserve safety by
+    // recording a definitive rejection rather than inferring acceptance.
+    StopExecutionOutcome::Rejected
 }
 
 async fn stream_execution_processes_by_session_ws(
@@ -557,14 +550,13 @@ mod tests {
     }
 
     #[test]
-    fn orphaned_intent_before_stop_side_effect_is_not_accepted() {
-        assert_eq!(
-            orphaned_stop_outcome(&ExecutionProcessStatus::Running),
-            StopExecutionOutcome::Rejected
-        );
-        assert_eq!(
-            orphaned_stop_outcome(&ExecutionProcessStatus::Killed),
-            StopExecutionOutcome::Accepted
-        );
+    fn orphaned_intent_never_infers_acceptance_from_natural_exit_status() {
+        for _natural_status in [
+            ExecutionProcessStatus::Running,
+            ExecutionProcessStatus::Completed,
+            ExecutionProcessStatus::Failed,
+        ] {
+            assert_eq!(orphaned_stop_outcome(), StopExecutionOutcome::Rejected);
+        }
     }
 }
