@@ -220,6 +220,24 @@ impl SessionCommand {
         Ok(result.rows_affected())
     }
 
+    /// A keyed stop can race the exit monitor, which records its claimed rows
+    /// as done. Only the cdesktop route that has verified a killed process may
+    /// use this wider transition.
+    pub async fn requeue_killed_execution(
+        pool: &SqlitePool,
+        execution_process_id: Uuid,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE session_commands SET state = 'pending', execution_process_id = NULL, \
+             finished_at = NULL WHERE execution_process_id = ? \
+             AND state IN ('claimed', 'failed', 'done')",
+        )
+        .bind(execution_process_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn ensure_claimed(
         pool: &SqlitePool,
         session_id: Uuid,

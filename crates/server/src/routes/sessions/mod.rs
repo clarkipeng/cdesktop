@@ -429,6 +429,18 @@ async fn requeue_commands(
                 "Cannot requeue commands while the execution is running.".into(),
             ));
         }
+        let count =
+            if process.status == db::models::execution_process::ExecutionProcessStatus::Killed {
+                SessionCommand::requeue_killed_execution(pool, payload.execution_process_id).await?
+            } else {
+                SessionCommand::requeue_execution(pool, payload.execution_process_id).await?
+            };
+        if count == 0 {
+            return Err(ApiError::Conflict(
+                "No interrupted command is available to requeue for this execution.".into(),
+            ));
+        }
+        return Ok(ResponseJson(ApiResponse::success(count as usize)));
     }
     let count = SessionCommand::requeue_execution(pool, payload.execution_process_id).await?;
     if count == 0 {
