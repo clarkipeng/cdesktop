@@ -1336,9 +1336,6 @@ impl ContainerService for LocalContainerService {
             None
         };
 
-        ExecutionProcess::update_completion(&self.db.pool, execution_process.id, status, exit_code)
-            .await?;
-
         // Try graceful cancellation first, then force kill
         if let Some(cancel) = self.take_cancellation_token(&execution_process.id).await {
             cancel.cancel();
@@ -1371,6 +1368,13 @@ impl ContainerService for LocalContainerService {
                 return Err(e);
             }
         }
+
+        // Terminal state is the durable record that the stop side effect has
+        // completed. Never publish it before cancellation/kill succeeds: a
+        // keyed-stop replay must not mistake an interrupted intent for a
+        // stopped process after restart.
+        ExecutionProcess::update_completion(&self.db.pool, execution_process.id, status, exit_code)
+            .await?;
         self.remove_child_from_store(&execution_process.id).await;
 
         // Mark the process finished in the MsgStore and wait for DB persistence
