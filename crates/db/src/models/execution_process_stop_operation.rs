@@ -357,4 +357,48 @@ mod tests {
         ));
         assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn owner_crash_before_stop_side_effect_replays_rejection_without_takeover() {
+        let pool = pool("sqlite::memory:").await;
+        let process_id = Uuid::new_v4();
+        let owner = instance_id();
+        let restarted_server = instance_id();
+
+        assert!(matches!(
+            StopExecutionOperation::begin(&pool, process_id, "crash-boundary", owner)
+                .await
+                .unwrap(),
+            StopExecutionOperationState::Owner
+        ));
+        // The owner is paused after durable intent and lost before it can
+        // cancel or kill. Restart reconciliation must not run that side
+        // effect a second time or report acceptance.
+        assert!(matches!(
+            StopExecutionOperation::begin(&pool, process_id, "crash-boundary", restarted_server)
+                .await
+                .unwrap(),
+            StopExecutionOperationState::Pending {
+                owned_by_current_instance: false
+            }
+        ));
+        assert_eq!(
+            StopExecutionOperation::complete(
+                &pool,
+                process_id,
+                "crash-boundary",
+                StopExecutionOutcome::Rejected,
+                restarted_server,
+            )
+            .await
+            .unwrap(),
+            StopExecutionOutcome::Rejected
+        );
+        assert!(matches!(
+            StopExecutionOperation::begin(&pool, process_id, "crash-boundary", restarted_server)
+                .await
+                .unwrap(),
+            StopExecutionOperationState::Complete(StopExecutionOutcome::Rejected)
+        ));
+    }
 }

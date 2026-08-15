@@ -340,11 +340,9 @@ async fn stop_execution_process(
     match state {
         StopExecutionOperationState::Complete(outcome) => return stop_outcome_response(outcome),
         StopExecutionOperationState::Owner => {}
-        // `stop_execution` first changes the execution row from running. That
-        // is the durable destructive-action boundary: a pending operation
-        // observed after a restart with a non-running process has already
-        // crossed it, so a retry completes its original accepted outcome
-        // without stopping again.
+        // Terminal execution status is only written after cancellation/kill
+        // succeeds. Therefore an orphaned pending request may be accepted
+        // only when that durable side-effect boundary was crossed.
         StopExecutionOperationState::Pending {
             owned_by_current_instance: true,
         } => {
@@ -362,14 +360,7 @@ async fn stop_execution_process(
                 .ok_or(
                     db::models::execution_process::ExecutionProcessError::ExecutionProcessNotFound,
                 )?;
-            let outcome = if current.status == ExecutionProcessStatus::Running {
-                // The prior server died before the durable destructive
-                // boundary. Do not take over: a new key can request a fresh
-                // stop, while this key deterministically replays rejection.
-                StopExecutionOutcome::Rejected
-            } else {
-                StopExecutionOutcome::Accepted
-            };
+            let outcome = orphaned_stop_outcome(&current.status);
             let outcome = StopExecutionOperation::complete(
                 pool,
                 execution_process.id,
@@ -415,6 +406,16 @@ fn stop_outcome_response(
         StopExecutionOutcome::Rejected => Err(ApiError::Conflict(
             "The original stop request was rejected.".into(),
         )),
+    }
+}
+
+fn orphaned_stop_outcome(status: &ExecutionProcessStatus) -> StopExecutionOutcome {
+    if *status == ExecutionProcessStatus::Running {
+        // The owner died after recording intent but before the authoritative
+        // terminal state. Do not take over or claim success.
+        StopExecutionOutcome::Rejected
+    } else {
+        StopExecutionOutcome::Accepted
     }
 }
 
@@ -553,5 +554,17 @@ mod tests {
             &mut applied,
             &mut skipped,
         ));
+    }
+
+    #[test]
+    fn orphaned_intent_before_stop_side_effect_is_not_accepted() {
+        assert_eq!(
+            orphaned_stop_outcome(&ExecutionProcessStatus::Running),
+            StopExecutionOutcome::Rejected
+        );
+        assert_eq!(
+            orphaned_stop_outcome(&ExecutionProcessStatus::Killed),
+            StopExecutionOutcome::Accepted
+        );
     }
 }
