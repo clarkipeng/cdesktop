@@ -9,6 +9,9 @@ use axum::{
 use db::models::{
     execution_process::{ExecutionProcess, ExecutionProcessStatus},
     execution_process_repo_state::ExecutionProcessRepoState,
+    execution_process_stop_operation::{
+        StopExecutionOperation, StopExecutionOperationState, StopExecutionOutcome,
+    },
 };
 use deployment::Deployment;
 use futures_util::{StreamExt, TryStreamExt};
@@ -32,6 +35,13 @@ struct SessionExecutionProcessQuery {
     /// If true, include soft-deleted (dropped) processes in results/stream
     #[serde(default)]
     pub show_soft_deleted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StopExecutionProcessRequest {
+    /// Caller-owned, deterministic key used to replay a lost stop response.
+    #[serde(default)]
+    dedupe_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,13 +310,80 @@ async fn handle_normalized_logs_ws(
 async fn stop_execution_process(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(deployment): State<DeploymentImpl>,
+    payload: Option<axum::Json<StopExecutionProcessRequest>>,
 ) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
-    deployment
+    let Some(dedupe_key) = payload
+        .map(|axum::Json(request)| request.dedupe_key)
+        .flatten()
+    else {
+        deployment
+            .container()
+            .stop_execution(&execution_process, ExecutionProcessStatus::Killed)
+            .await?;
+
+        return Ok(ResponseJson(ApiResponse::success(())));
+    };
+    if dedupe_key.is_empty() {
+        return Err(ApiError::BadRequest("dedupe_key must not be empty".into()));
+    }
+
+    let pool = &deployment.db().pool;
+    let state = StopExecutionOperation::begin(pool, execution_process.id, &dedupe_key).await?;
+    match state {
+        StopExecutionOperationState::Complete(outcome) => return stop_outcome_response(outcome),
+        StopExecutionOperationState::New => {}
+        // `stop_execution` first changes the execution row from running. That
+        // is the durable destructive-action boundary: a pending operation
+        // observed after a restart with a non-running process has already
+        // crossed it, so a retry completes its original accepted outcome
+        // without stopping again.
+        StopExecutionOperationState::Pending => {
+            let current = ExecutionProcess::find_by_id(pool, execution_process.id)
+                .await?
+                .ok_or(
+                    db::models::execution_process::ExecutionProcessError::ExecutionProcessNotFound,
+                )?;
+            if current.status != ExecutionProcessStatus::Running {
+                let outcome = StopExecutionOperation::complete(
+                    pool,
+                    execution_process.id,
+                    &dedupe_key,
+                    StopExecutionOutcome::Accepted,
+                )
+                .await?;
+                return stop_outcome_response(outcome);
+            }
+        }
+    }
+
+    let outcome = match deployment
         .container()
         .stop_execution(&execution_process, ExecutionProcessStatus::Killed)
-        .await?;
+        .await
+    {
+        Ok(()) => StopExecutionOutcome::Accepted,
+        Err(error) => {
+            tracing::warn!(
+                execution_process_id = %execution_process.id,
+                "keyed stop request rejected: {error}"
+            );
+            StopExecutionOutcome::Rejected
+        }
+    };
+    let outcome =
+        StopExecutionOperation::complete(pool, execution_process.id, &dedupe_key, outcome).await?;
+    stop_outcome_response(outcome)
+}
 
-    Ok(ResponseJson(ApiResponse::success(())))
+fn stop_outcome_response(
+    outcome: StopExecutionOutcome,
+) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
+    match outcome {
+        StopExecutionOutcome::Accepted => Ok(ResponseJson(ApiResponse::success(()))),
+        StopExecutionOutcome::Rejected => Err(ApiError::Conflict(
+            "The original stop request was rejected.".into(),
+        )),
+    }
 }
 
 async fn stream_execution_processes_by_session_ws(
