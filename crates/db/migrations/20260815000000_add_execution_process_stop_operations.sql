@@ -5,7 +5,7 @@ CREATE TABLE execution_process_stop_operations (
     execution_process_id BLOB NOT NULL,
     dedupe_key TEXT NOT NULL,
     owner_instance_id BLOB NOT NULL,
-    outcome TEXT CHECK (outcome IN ('accepted', 'rejected')),
+    outcome TEXT CHECK (outcome IN ('accepted', 'rejected', 'interrupted')),
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec')),
     completed_at TEXT,
     PRIMARY KEY (execution_process_id, dedupe_key),

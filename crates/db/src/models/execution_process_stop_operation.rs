@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub enum StopExecutionOutcome {
     Accepted,
     Rejected,
+    Interrupted,
 }
 
 impl StopExecutionOutcome {
@@ -13,6 +14,7 @@ impl StopExecutionOutcome {
         match self {
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -20,6 +22,7 @@ impl StopExecutionOutcome {
         match value {
             "accepted" => Ok(Self::Accepted),
             "rejected" => Ok(Self::Rejected),
+            "interrupted" => Ok(Self::Interrupted),
             _ => Err(sqlx::Error::Protocol(format!(
                 "invalid execution process stop outcome: {value}"
             ))),
@@ -267,6 +270,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_stop_replays_as_a_distinct_durable_outcome() {
+        let pool = pool("sqlite::memory:").await;
+        let process_id = Uuid::new_v4();
+        let instance_id = instance_id();
+        StopExecutionOperation::begin(&pool, process_id, "interrupted", instance_id)
+            .await
+            .unwrap();
+        StopExecutionOperation::complete(
+            &pool,
+            process_id,
+            "interrupted",
+            StopExecutionOutcome::Interrupted,
+            instance_id,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            StopExecutionOperation::begin(&pool, process_id, "interrupted", instance_id)
+                .await
+                .unwrap(),
+            StopExecutionOperationState::Complete(StopExecutionOutcome::Interrupted)
+        ));
+    }
+
+    #[tokio::test]
     async fn dedupe_key_is_scoped_to_an_execution_process() {
         let pool = pool("sqlite::memory:").await;
         let key = "same-key";
@@ -359,7 +388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_crash_before_stop_side_effect_replays_rejection_without_takeover() {
+    async fn owner_crash_before_stop_side_effect_replays_interrupted_without_takeover() {
         let pool = pool("sqlite::memory:").await;
         let process_id = Uuid::new_v4();
         let owner = instance_id();
@@ -387,18 +416,18 @@ mod tests {
                 &pool,
                 process_id,
                 "crash-boundary",
-                StopExecutionOutcome::Rejected,
+                StopExecutionOutcome::Interrupted,
                 restarted_server,
             )
             .await
             .unwrap(),
-            StopExecutionOutcome::Rejected
+            StopExecutionOutcome::Interrupted
         );
         assert!(matches!(
             StopExecutionOperation::begin(&pool, process_id, "crash-boundary", restarted_server)
                 .await
                 .unwrap(),
-            StopExecutionOperationState::Complete(StopExecutionOutcome::Rejected)
+            StopExecutionOperationState::Complete(StopExecutionOutcome::Interrupted)
         ));
     }
 }

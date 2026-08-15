@@ -77,6 +77,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("Too early: {0}")]
     TooEarly(String),
+    #[error("Stop interrupted: {0}")]
+    StopInterrupted(String),
     #[error("Forbidden: {0}")]
     Forbidden(String),
     #[error("Too many requests: {0}")]
@@ -473,6 +475,11 @@ impl IntoResponse for ApiError {
             ApiError::TooEarly(msg) => {
                 ErrorInfo::with_status(StatusCode::TOO_EARLY, "TooEarly", msg.clone())
             }
+            ApiError::StopInterrupted(msg) => ErrorInfo::with_status(
+                StatusCode::FAILED_DEPENDENCY,
+                "StopInterrupted",
+                msg.clone(),
+            ),
             ApiError::Forbidden(msg) => {
                 ErrorInfo::with_status(StatusCode::FORBIDDEN, "ForbiddenError", msg.clone())
             }
@@ -578,6 +585,16 @@ mod tests {
                 .into_response()
                 .status(),
             StatusCode::TOO_EARLY
+        );
+    }
+
+    #[test]
+    fn interrupted_stop_response_is_protocol_distinct_from_rejection_and_pending() {
+        assert_eq!(
+            ApiError::StopInterrupted("owner exited".into())
+                .into_response()
+                .status(),
+            StatusCode::FAILED_DEPENDENCY
         );
     }
 }

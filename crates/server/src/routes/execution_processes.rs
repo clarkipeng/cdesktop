@@ -401,6 +401,10 @@ fn stop_outcome_response(
         StopExecutionOutcome::Rejected => Err(ApiError::Conflict(
             "The original stop request was rejected.".into(),
         )),
+        StopExecutionOutcome::Interrupted => Err(ApiError::StopInterrupted(
+            "The original stop owner ended before its result was durably known; reconcile this key without issuing another stop."
+                .into(),
+        )),
     }
 }
 
@@ -408,8 +412,9 @@ fn orphaned_stop_outcome() -> StopExecutionOutcome {
     // A terminal execution row can come from the independent exit monitor,
     // not this stop operation. Without a durable process-controller identity,
     // it cannot prove this key performed the side effect. Preserve safety by
-    // recording a definitive rejection rather than inferring acceptance.
-    StopExecutionOutcome::Rejected
+    // recording a distinct terminal interruption rather than inferring either
+    // acceptance or rejection.
+    StopExecutionOutcome::Interrupted
 }
 
 async fn stream_execution_processes_by_session_ws(
@@ -556,7 +561,27 @@ mod tests {
             ExecutionProcessStatus::Completed,
             ExecutionProcessStatus::Failed,
         ] {
-            assert_eq!(orphaned_stop_outcome(), StopExecutionOutcome::Rejected);
+            assert_eq!(orphaned_stop_outcome(), StopExecutionOutcome::Interrupted);
         }
+    }
+
+    #[test]
+    fn keyed_stop_outcomes_keep_rejection_and_interruption_distinct() {
+        assert!(matches!(
+            stop_outcome_response(StopExecutionOutcome::Rejected),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            stop_outcome_response(StopExecutionOutcome::Interrupted),
+            Err(ApiError::StopInterrupted(_))
+        ));
+        assert!(stop_outcome_response(StopExecutionOutcome::Accepted).is_ok());
+    }
+
+    #[test]
+    fn omitted_dedupe_key_preserves_the_legacy_stop_request() {
+        let request: StopExecutionProcessRequest =
+            serde_json::from_value(serde_json::json!({})).expect("empty stop request is valid");
+        assert!(request.dedupe_key.is_none());
     }
 }
