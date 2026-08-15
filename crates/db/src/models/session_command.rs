@@ -111,6 +111,19 @@ impl SessionCommand {
         .await
     }
 
+    /// Durable command history for one session, oldest first.
+    pub async fn for_session(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        sqlx::query_as::<_, Self>(
+            "SELECT * FROM session_commands WHERE session_id = ? ORDER BY rowid",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+    }
+
     pub async fn has_pending(pool: &SqlitePool, session_id: Uuid) -> Result<bool, sqlx::Error> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM session_commands WHERE session_id = ? AND state = 'pending')",
@@ -189,6 +202,22 @@ impl SessionCommand {
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    /// Return commands from an interrupted terminal execution to the native
+    /// queue without changing their durable identity or dedupe key.
+    pub async fn requeue_execution(
+        pool: &SqlitePool,
+        execution_process_id: Uuid,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE session_commands SET state = 'pending', execution_process_id = NULL, \
+             finished_at = NULL WHERE execution_process_id = ? AND state IN ('claimed', 'failed')",
+        )
+        .bind(execution_process_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn ensure_claimed(
@@ -433,6 +462,80 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].body, "recover");
         assert_eq!(pending[0].execution_process_id, None);
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_execution_requeues_with_its_original_dedupe_key() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let (original, _) =
+            SessionCommand::enqueue(&pool, command(session_id, "recover", Some("k")))
+                .await
+                .unwrap();
+        let execution_id = Uuid::new_v4();
+        SessionCommand::claim_pending(&pool, session_id, execution_id)
+            .await
+            .unwrap();
+        SessionCommand::finish_execution(&pool, execution_id, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SessionCommand::requeue_execution(&pool, execution_id)
+                .await
+                .unwrap(),
+            1
+        );
+        let pending = SessionCommand::pending(&pool, session_id).await.unwrap();
+        assert_eq!(pending[0].id, original.id);
+        assert_eq!(pending[0].dedupe_key.as_deref(), Some("k"));
+    }
+
+    #[tokio::test]
+    async fn requeue_is_process_scoped_and_duplicate_safe_after_reopen() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
+        let (first, _) = SessionCommand::enqueue(&pool, command(session_id, "first", Some("a")))
+            .await
+            .unwrap();
+        SessionCommand::enqueue(&pool, command(other_session_id, "other", Some("b")))
+            .await
+            .unwrap();
+        let process_id = Uuid::new_v4();
+        let other_process_id = Uuid::new_v4();
+        SessionCommand::claim_pending(&pool, session_id, process_id)
+            .await
+            .unwrap();
+        SessionCommand::claim_pending(&pool, other_session_id, other_process_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SessionCommand::requeue_execution(&pool, process_id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            SessionCommand::requeue_execution(&pool, process_id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            SessionCommand::for_session(&pool, session_id)
+                .await
+                .unwrap()[0]
+                .id,
+            first.id
+        );
+        assert!(
+            SessionCommand::pending(&pool, other_session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

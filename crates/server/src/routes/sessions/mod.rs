@@ -157,6 +157,11 @@ pub struct CreateFollowUpAttempt {
     #[serde(default)]
     #[ts(optional)]
     pub intent: Option<SessionCommandIntent>,
+    /// Persist the command without claiming it. A recovery controller can
+    /// dispatch it later after its provider-reachability gate passes.
+    #[serde(default)]
+    #[ts(optional)]
+    pub defer_dispatch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -347,10 +352,12 @@ pub async fn follow_up(
             }
         }
     }
-    deployment
-        .container()
-        .dispatch_pending_commands(session.id)
-        .await?;
+    if !payload.defer_dispatch.unwrap_or(false) {
+        deployment
+            .container()
+            .dispatch_pending_commands(session.id)
+            .await?;
+    }
     let command = SessionCommand::find_by_id(pool, command.id)
         .await?
         .ok_or(ApiError::Database(sqlx::Error::RowNotFound))?;
@@ -386,6 +393,61 @@ pub async fn follow_up(
     }
 
     Ok(ResponseJson(ApiResponse::success(command)))
+}
+
+async fn list_commands(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<Vec<SessionCommand>>>, ApiError> {
+    Ok(ResponseJson(ApiResponse::success(
+        SessionCommand::for_session(&deployment.db().pool, session.id).await?,
+    )))
+}
+
+#[derive(Debug, Deserialize)]
+struct RequeueCommandsRequest {
+    execution_process_id: Uuid,
+}
+
+/// Recover all commands claimed by one execution observed dead by the
+/// caller. The native queue keeps the same rows and dedupe keys; dispatch is
+/// explicit so the recovery controller can gate on provider reachability.
+async fn requeue_commands(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+    Json(payload): Json<RequeueCommandsRequest>,
+) -> Result<ResponseJson<ApiResponse<usize>>, ApiError> {
+    let pool = &deployment.db().pool;
+    if let Some(process) = ExecutionProcess::find_by_id(pool, payload.execution_process_id).await? {
+        if process.session_id != session.id {
+            return Err(ApiError::BadRequest(
+                "Execution does not belong to this session.".into(),
+            ));
+        }
+        if process.status == db::models::execution_process::ExecutionProcessStatus::Running {
+            return Err(ApiError::Conflict(
+                "Cannot requeue commands while the execution is running.".into(),
+            ));
+        }
+    }
+    let count = SessionCommand::requeue_execution(pool, payload.execution_process_id).await?;
+    if count == 0 {
+        return Err(ApiError::Conflict(
+            "No interrupted command is available to requeue for this execution.".into(),
+        ));
+    }
+    Ok(ResponseJson(ApiResponse::success(count as usize)))
+}
+
+async fn dispatch_commands(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
+    deployment
+        .container()
+        .dispatch_pending_commands(session.id)
+        .await?;
+    Ok(ResponseJson(ApiResponse::success(())))
 }
 
 pub async fn get_turn_selections(
@@ -492,6 +554,9 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
             get(get_session).put(update_session).delete(delete_session),
         )
         .route("/follow-up", post(follow_up))
+        .route("/commands", get(list_commands))
+        .route("/commands/requeue", post(requeue_commands))
+        .route("/commands/dispatch", post(dispatch_commands))
         .route("/turn-selections", get(get_turn_selections))
         .route("/reset", post(reset_process))
         .route("/setup", post(run_setup_script))
