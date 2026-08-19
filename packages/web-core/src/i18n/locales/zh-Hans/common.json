@@ -238,6 +238,7 @@
   },
   "turnNavigation": {
     "title": "你的消息",
+    "count_one": "{{count}} 轮",
     "count_other": "{{count}} 轮"
   },
   "commandBar": {
@@ -598,10 +599,7 @@
       "prFilterLabel": "PR",
       "prFilterAll": "All",
       "prFilterHasPr": "Has PR",
-      "prFilterNoPr": "No PR",
-      "noProject": "No project",
-      "sortButtonTitle": "Sort 会话",
-      "filterButtonTitle": "Filter 会话"
+      "prFilterNoPr": "No PR"
     },
     "sortAscending": "Ascending",
     "sortDescending": "Descending",
