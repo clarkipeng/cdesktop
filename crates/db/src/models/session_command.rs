@@ -35,6 +35,12 @@ pub struct SessionCommandConfig {
     #[serde(default)]
     #[ts(optional)]
     pub auth_binding_id: Option<Uuid>,
+    /// Declares this command as metered execution and carries the operator's
+    /// `auto`/`ask`/`never` fallback policy; `None` means unmetered. Enforced
+    /// durably by the dispatcher gate (`MeteredApproval::gate`).
+    #[serde(default)]
+    #[ts(optional)]
+    pub metered: Option<super::metered_approval::MeteredExecution>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]
@@ -392,6 +398,7 @@ mod tests {
                 ),
                 selected_provider_id: None,
                 auth_binding_id: None,
+                metered: None,
             },
         }
     }

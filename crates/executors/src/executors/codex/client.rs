@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -38,7 +38,8 @@ use super::jsonrpc::{JsonRpcCallbacks, JsonRpcPeer};
 use crate::{
     approvals::{ExecutorApprovalError, ExecutorApprovalService},
     env::RepoContext,
-    executors::{ExecutorError, codex::normalize_logs::Approval},
+    executors::{ExecutorError, ExecutorExitResult, codex::normalize_logs::Approval},
+    outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
 };
 
 struct PendingPlan {
@@ -60,6 +61,9 @@ pub struct AppServerClient {
     commit_reminder_prompt: String,
     commit_reminder_sent: AtomicBool,
     cancel: CancellationToken,
+    /// Normalized failure observed in the notification stream (e.g. a failed
+    /// turn); reported through `final_exit_result` when the stream ends.
+    exit_outcome: StdMutex<Option<NormalizedExecutionOutcome>>,
 }
 
 impl AppServerClient {
@@ -89,6 +93,7 @@ impl AppServerClient {
             commit_reminder_prompt,
             commit_reminder_sent: AtomicBool::new(false),
             cancel,
+            exit_outcome: StdMutex::new(None),
         })
     }
 
@@ -877,13 +882,23 @@ impl JsonRpcCallbacks for AppServerClient {
         if method == "turn/completed" {
             let mut keep_alive = false;
 
-            if let Some(params) = notification.params
-                && let Ok(completed) = serde_json::from_value::<TurnCompletedNotification>(params)
-                && completed.turn.status == TurnStatus::Interrupted
-            {
-                tracing::debug!("codex turn interrupted; flushing feedback queue");
-                if self.flush_pending_feedback().await {
-                    keep_alive = true;
+            let completed = notification.params.and_then(|params| {
+                serde_json::from_value::<TurnCompletedNotification>(params).ok()
+            });
+
+            if let Some(completed) = &completed {
+                match completed.turn.status {
+                    TurnStatus::Interrupted => {
+                        tracing::debug!("codex turn interrupted; flushing feedback queue");
+                        if self.flush_pending_feedback().await {
+                            keep_alive = true;
+                        }
+                    }
+                    TurnStatus::Failed => {
+                        let outcome = normalized_turn_failure(completed.turn.error.as_ref());
+                        *self.exit_outcome.lock().unwrap() = Some(outcome);
+                    }
+                    TurnStatus::Completed | TurnStatus::InProgress => {}
                 }
             }
 
@@ -919,6 +934,61 @@ impl JsonRpcCallbacks for AppServerClient {
     async fn on_non_json(&self, raw: &str) -> Result<(), ExecutorError> {
         self.log_writer.log_raw(raw).await?;
         Ok(())
+    }
+
+    async fn final_exit_result(&self) -> ExecutorExitResult {
+        match self.exit_outcome.lock().unwrap().take() {
+            Some(outcome) => ExecutorExitResult::Failure(Some(outcome)),
+            None => ExecutorExitResult::Success,
+        }
+    }
+}
+
+/// Map Codex's stable structured turn error taxonomy to the normalized
+/// outcome contract. Only `codex_error_info` (a stable enum) drives the
+/// classification; raw `message` text is never used, so unrecognized errors
+/// map to `Unknown` instead of being guessed from text.
+fn normalized_turn_failure(
+    error: Option<&codex_app_server_protocol::TurnError>,
+) -> NormalizedExecutionOutcome {
+    use codex_app_server_protocol::CodexErrorInfo;
+
+    let Some(info) = error.and_then(|error| error.codex_error_info.as_ref()) else {
+        return NormalizedExecutionOutcome::new(ExecutionOutcomeClass::Unknown);
+    };
+
+    match info {
+        CodexErrorInfo::UsageLimitExceeded => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::QuotaExhausted)
+                .with_provider_code("usage_limit_exceeded")
+        }
+        CodexErrorInfo::SessionBudgetExceeded => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::QuotaExhausted)
+                .with_provider_code("session_budget_exceeded")
+        }
+        CodexErrorInfo::Unauthorized => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::AuthExpired)
+                .with_provider_code("unauthorized")
+        }
+        CodexErrorInfo::ServerOverloaded => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::NetworkTransient)
+                .with_provider_code("server_overloaded")
+        }
+        CodexErrorInfo::InternalServerError => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::NetworkTransient)
+                .with_provider_code("internal_server_error")
+        }
+        CodexErrorInfo::HttpConnectionFailed { http_status_code }
+        | CodexErrorInfo::ResponseStreamConnectionFailed { http_status_code }
+        | CodexErrorInfo::ResponseStreamDisconnected { http_status_code }
+        | CodexErrorInfo::ResponseTooManyFailedAttempts { http_status_code } => {
+            NormalizedExecutionOutcome::from_http_status(*http_status_code)
+        }
+        CodexErrorInfo::ContextWindowExceeded => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::TaskFailed)
+                .with_provider_code("context_window_exceeded")
+        }
+        _ => NormalizedExecutionOutcome::new(ExecutionOutcomeClass::Unknown),
     }
 }
 
@@ -1003,5 +1073,75 @@ impl LogWriter {
         guard.write_all(b"\n").await.map_err(ExecutorError::Io)?;
         guard.flush().await.map_err(ExecutorError::Io)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod outcome_mapping_tests {
+    use codex_app_server_protocol::{CodexErrorInfo, TurnError};
+
+    use super::*;
+
+    fn turn_error(info: CodexErrorInfo) -> TurnError {
+        TurnError {
+            message: "raw provider text that must never be classified".to_string(),
+            codex_error_info: Some(info),
+            additional_details: None,
+        }
+    }
+
+    #[test]
+    fn usage_limit_maps_to_quota_exhausted() {
+        let outcome =
+            normalized_turn_failure(Some(&turn_error(CodexErrorInfo::UsageLimitExceeded)));
+        assert_eq!(outcome.class, ExecutionOutcomeClass::QuotaExhausted);
+        assert_eq!(
+            outcome.provider_code.as_deref(),
+            Some("usage_limit_exceeded")
+        );
+    }
+
+    #[test]
+    fn unauthorized_maps_to_auth_expired() {
+        let outcome = normalized_turn_failure(Some(&turn_error(CodexErrorInfo::Unauthorized)));
+        assert_eq!(outcome.class, ExecutionOutcomeClass::AuthExpired);
+        assert_eq!(outcome.provider_code.as_deref(), Some("unauthorized"));
+    }
+
+    #[test]
+    fn transport_failures_map_by_http_status() {
+        let throttled = normalized_turn_failure(Some(&turn_error(
+            CodexErrorInfo::ResponseStreamConnectionFailed {
+                http_status_code: Some(429),
+            },
+        )));
+        assert_eq!(throttled.class, ExecutionOutcomeClass::RateLimitedTransient);
+        assert_eq!(throttled.provider_code.as_deref(), Some("http_429"));
+
+        let disconnected = normalized_turn_failure(Some(&turn_error(
+            CodexErrorInfo::ResponseStreamDisconnected {
+                http_status_code: None,
+            },
+        )));
+        assert_eq!(disconnected.class, ExecutionOutcomeClass::NetworkTransient);
+    }
+
+    #[test]
+    fn overloaded_maps_to_network_transient() {
+        let outcome = normalized_turn_failure(Some(&turn_error(CodexErrorInfo::ServerOverloaded)));
+        assert_eq!(outcome.class, ExecutionOutcomeClass::NetworkTransient);
+        assert_eq!(outcome.provider_code.as_deref(), Some("server_overloaded"));
+    }
+
+    #[test]
+    fn missing_or_unrecognized_signal_maps_to_unknown_without_provider_text() {
+        let missing = normalized_turn_failure(None);
+        assert_eq!(missing.class, ExecutionOutcomeClass::Unknown);
+        assert_eq!(missing.provider_code, None);
+
+        let unrecognized = normalized_turn_failure(Some(&turn_error(CodexErrorInfo::Other)));
+        assert_eq!(unrecognized.class, ExecutionOutcomeClass::Unknown);
+        // Raw provider message text must never leak into the safe contract.
+        assert!(!unrecognized.safe_message.contains("raw provider text"));
     }
 }

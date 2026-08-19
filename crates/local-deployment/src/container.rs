@@ -31,6 +31,7 @@ use executors::{
     env::{ExecutionEnv, RepoContext},
     executors::{BaseCodingAgent, CancellationToken, ExecutorExitResult, ExecutorExitSignal},
     logs::{NormalizedEntryType, utils::patch::extract_normalized_entry_from_patch},
+    outcome::NormalizedExecutionOutcome,
 };
 use futures::{FutureExt, TryStreamExt, stream::select};
 use git::GitService;
@@ -542,7 +543,11 @@ impl LocalContainerService {
             let (status, exit_code) = outcome.status_and_exit_code();
 
             let completed_attempt = match ExecutionProcess::complete_running_attempt(
-                &db.pool, exec_id, status, exit_code,
+                &db.pool,
+                exec_id,
+                status,
+                exit_code,
+                outcome.normalized_outcome(),
             )
             .await
             {
@@ -941,10 +946,17 @@ impl LocalContainerService {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum NormalizedProcessOutcome {
-    Success { exit_code: i64 },
-    Failure { exit_code: Option<i64> },
+    Success {
+        exit_code: i64,
+    },
+    Failure {
+        exit_code: Option<i64>,
+        /// Normalized classification when the executor observed a stable
+        /// provider signal; `None` falls back to `Unknown` at read time.
+        outcome: Option<NormalizedExecutionOutcome>,
+    },
 }
 
 impl NormalizedProcessOutcome {
@@ -953,7 +965,14 @@ impl NormalizedProcessOutcome {
     ) -> Self {
         match result {
             Ok(ExecutorExitResult::Success) => Self::Success { exit_code: 0 },
-            Ok(ExecutorExitResult::Failure) | Err(_) => Self::Failure { exit_code: Some(1) },
+            Ok(ExecutorExitResult::Failure(outcome)) => Self::Failure {
+                exit_code: Some(1),
+                outcome,
+            },
+            Err(_) => Self::Failure {
+                exit_code: Some(1),
+                outcome: None,
+            },
         }
     }
 
@@ -966,17 +985,28 @@ impl NormalizedProcessOutcome {
                 } else {
                     Self::Failure {
                         exit_code: Some(exit_code),
+                        outcome: None,
                     }
                 }
             }
-            Err(_) => Self::Failure { exit_code: None },
+            Err(_) => Self::Failure {
+                exit_code: None,
+                outcome: None,
+            },
         }
     }
 
-    fn status_and_exit_code(self) -> (ExecutionProcessStatus, Option<i64>) {
+    fn status_and_exit_code(&self) -> (ExecutionProcessStatus, Option<i64>) {
         match self {
-            Self::Success { exit_code } => (ExecutionProcessStatus::Completed, Some(exit_code)),
-            Self::Failure { exit_code } => (ExecutionProcessStatus::Failed, exit_code),
+            Self::Success { exit_code } => (ExecutionProcessStatus::Completed, Some(*exit_code)),
+            Self::Failure { exit_code, .. } => (ExecutionProcessStatus::Failed, *exit_code),
+        }
+    }
+
+    fn normalized_outcome(&self) -> Option<&NormalizedExecutionOutcome> {
+        match self {
+            Self::Success { .. } => None,
+            Self::Failure { outcome, .. } => outcome.as_ref(),
         }
     }
 }
@@ -1599,13 +1629,19 @@ mod tests {
         );
         assert_eq!(
             NormalizedProcessOutcome::from_exit_status_result(Ok(exit_status(2))),
-            NormalizedProcessOutcome::Failure { exit_code: Some(2) }
+            NormalizedProcessOutcome::Failure {
+                exit_code: Some(2),
+                outcome: None
+            }
         );
         assert_eq!(
             NormalizedProcessOutcome::from_exit_status_result(Err(std::io::Error::other(
                 "missing child"
             ))),
-            NormalizedProcessOutcome::Failure { exit_code: None }
+            NormalizedProcessOutcome::Failure {
+                exit_code: None,
+                outcome: None
+            }
         );
     }
 
@@ -1616,11 +1652,31 @@ mod tests {
 
         assert_eq!(
             NormalizedProcessOutcome::from_executor_signal(rx.blocking_recv()),
-            NormalizedProcessOutcome::Failure { exit_code: Some(1) }
+            NormalizedProcessOutcome::Failure {
+                exit_code: Some(1),
+                outcome: None
+            }
         );
         assert_eq!(
             NormalizedProcessOutcome::from_executor_signal(Ok(ExecutorExitResult::Success)),
             NormalizedProcessOutcome::Success { exit_code: 0 }
+        );
+    }
+
+    #[test]
+    fn executor_signal_failure_preserves_normalized_outcome() {
+        use executors::outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome};
+
+        let outcome = NormalizedExecutionOutcome::new(ExecutionOutcomeClass::QuotaExhausted)
+            .with_provider_code("usage_limit_exceeded");
+        let normalized = NormalizedProcessOutcome::from_executor_signal(Ok(
+            ExecutorExitResult::Failure(Some(outcome.clone())),
+        ));
+
+        assert_eq!(normalized.normalized_outcome(), Some(&outcome));
+        assert_eq!(
+            normalized.status_and_exit_code(),
+            (ExecutionProcessStatus::Failed, Some(1))
         );
     }
 

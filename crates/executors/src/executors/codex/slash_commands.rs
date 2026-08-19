@@ -279,7 +279,7 @@ impl Codex {
             for event in events {
                 if let Err(err) = log_event_notification(&log_writer, event).await {
                     tracing::error!("Failed to emit slash command output: {err}");
-                    exit_result = ExecutorExitResult::Failure;
+                    exit_result = ExecutorExitResult::Failure(None);
                     break;
                 }
             }

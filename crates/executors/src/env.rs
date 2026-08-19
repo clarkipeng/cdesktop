@@ -113,7 +113,7 @@ pub struct CodexProviderInjection {
 }
 
 /// Environment variables to inject into executor processes
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionEnv {
     pub vars: HashMap<String, String>,
     pub repo_context: RepoContext,
@@ -125,6 +125,25 @@ pub struct ExecutionEnv {
     /// Codex-specific spawn injection (config overrides + model_provider id).
     /// Populated only when the active session's provider record routes Codex.
     pub provider_codex: Option<CodexProviderInjection>,
+}
+
+/// Manual `Debug` so a logged spawn environment can never print resolved
+/// credential values: env var names stay visible, values are redacted.
+impl std::fmt::Debug for ExecutionEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_keys =
+            |vars: &HashMap<String, String>| vars.keys().cloned().collect::<Vec<_>>();
+        f.debug_struct("ExecutionEnv")
+            .field("vars", &redacted_keys(&self.vars))
+            .field("repo_context", &self.repo_context)
+            .field("commit_reminder", &self.commit_reminder)
+            .field("provider_vars", &redacted_keys(&self.provider_vars))
+            .field(
+                "provider_codex",
+                &self.provider_codex.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl ExecutionEnv {

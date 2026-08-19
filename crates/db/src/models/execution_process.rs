@@ -38,9 +38,12 @@ pub enum ExecutionProcessError {
 
 #[cfg(test)]
 mod tests {
-    use executors::actions::{
-        ExecutorAction, ExecutorActionType,
-        script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
+    use executors::{
+        actions::{
+            ExecutorAction, ExecutorActionType,
+            script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
+        },
+        outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use uuid::Uuid;
@@ -86,6 +89,16 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE execution_process_outcomes (
+                execution_process_id BLOB PRIMARY KEY NOT NULL,
+                outcome TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec'))
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let id = Uuid::new_v4();
         sqlx::query(
@@ -103,6 +116,7 @@ mod tests {
                 id,
                 ExecutionProcessStatus::Completed,
                 Some(0),
+                None,
             )
             .await
             .unwrap()
@@ -113,6 +127,9 @@ mod tests {
                 id,
                 ExecutionProcessStatus::Failed,
                 Some(1),
+                Some(&NormalizedExecutionOutcome::new(
+                    ExecutionOutcomeClass::Unknown
+                )),
             )
             .await
             .unwrap()
@@ -126,16 +143,88 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "completed");
         assert_eq!(exit_code, 0);
+        // The losing duplicate completion must not attach its outcome either.
+        let outcomes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_process_outcomes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(outcomes, 0);
 
         let missing = ExecutionProcess::complete_running_attempt(
             &pool,
             Uuid::new_v4(),
             ExecutionProcessStatus::Completed,
             Some(0),
+            None,
         )
         .await
         .unwrap();
         assert!(!missing);
+    }
+
+    #[tokio::test]
+    async fn winning_failed_attempt_records_normalized_outcome_once() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE execution_processes (
+                id BLOB PRIMARY KEY NOT NULL,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                completed_at TEXT
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE execution_process_outcomes (
+                execution_process_id BLOB PRIMARY KEY NOT NULL,
+                outcome TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec'))
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_processes (id, status) VALUES (?, 'running')")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = NormalizedExecutionOutcome::new(ExecutionOutcomeClass::QuotaExhausted)
+            .with_provider_code("usage_limit_exceeded");
+        assert!(
+            ExecutionProcess::complete_running_attempt(
+                &pool,
+                id,
+                ExecutionProcessStatus::Failed,
+                Some(1),
+                Some(&outcome),
+            )
+            .await
+            .unwrap()
+        );
+
+        let stored: String = sqlx::query_scalar(
+            "SELECT outcome FROM execution_process_outcomes WHERE execution_process_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let stored: NormalizedExecutionOutcome = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored.class, ExecutionOutcomeClass::QuotaExhausted);
+        assert_eq!(
+            stored.provider_code.as_deref(),
+            Some("usage_limit_exceeded")
+        );
     }
 }
 
@@ -567,11 +656,16 @@ impl ExecutionProcess {
         Ok(())
     }
 
+    /// Exact-once completion of a running attempt. The single winner also
+    /// records the normalized outcome (when provided) in the same
+    /// transaction, so a stale duplicate completion can neither flip the
+    /// status nor attach a competing classification.
     pub async fn complete_running_attempt(
         pool: &SqlitePool,
         id: Uuid,
         status: ExecutionProcessStatus,
         exit_code: Option<i64>,
+        outcome: Option<&executors::outcome::NormalizedExecutionOutcome>,
     ) -> Result<bool, sqlx::Error> {
         let completed_at = if matches!(status, ExecutionProcessStatus::Running) {
             None
@@ -579,6 +673,7 @@ impl ExecutionProcess {
             Some(Utc::now())
         };
 
+        let mut transaction = pool.begin().await?;
         let result = sqlx::query(
             "UPDATE execution_processes \
              SET status = ?, exit_code = ?, completed_at = ? \
@@ -588,10 +683,23 @@ impl ExecutionProcess {
         .bind(exit_code)
         .bind(completed_at)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+        let won = result.rows_affected() == 1;
 
-        Ok(result.rows_affected() == 1)
+        if won && let Some(outcome) = outcome {
+            sqlx::query(
+                "INSERT OR IGNORE INTO execution_process_outcomes \
+                 (execution_process_id, outcome) VALUES (?, ?)",
+            )
+            .bind(id)
+            .bind(sqlx::types::Json(outcome))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+
+        Ok(won)
     }
 
     pub fn executor_action(&self) -> Result<&ExecutorAction, anyhow::Error> {

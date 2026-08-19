@@ -363,13 +363,7 @@ impl Provider {
         if matches!(kind, AiProviderKind::Default) {
             return Ok(());
         }
-        let is_on = |k: &str| {
-            payloads
-                .per_agent_enabled
-                .get(k)
-                .copied()
-                .unwrap_or(false)
-        };
+        let is_on = |k: &str| payloads.per_agent_enabled.get(k).copied().unwrap_or(false);
         let has = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.is_empty());
         let missing = |agent: &str, ok: bool| {
             if ok {
@@ -666,9 +660,7 @@ impl Provider {
     /// `record.codex.env` is overlaid first so the `CDT_API_KEY` we set
     /// last cannot be silently clobbered by a vendor-quirk env entry.
     /// Returns `Ok(None)` for the Default provider (ambient auth path).
-    pub fn build_codex_injection(
-        &self,
-    ) -> Result<Option<CodexInjection>, ProviderError> {
+    pub fn build_codex_injection(&self) -> Result<Option<CodexInjection>, ProviderError> {
         if self.kind == AiProviderKind::Default {
             return Ok(None);
         }
@@ -1049,7 +1041,7 @@ impl Provider {
 /// Per-agent spawn injection bundle — env vars + agent-specific structured
 /// payloads. One slot per agent that has a non-trivial spawn-time applier.
 /// Phases D/E/F add more slots; route handlers remain agent-agnostic.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AgentInjection {
     /// Process env to merge into `ExecutionEnv.provider_vars` for spawn.
     /// Carries `CDT_API_KEY` for Codex, native auth env for every other
@@ -1063,6 +1055,23 @@ pub struct AgentInjection {
     // and DeepSeek TUI (Phase E) are env-only too — the DeepSeek TUI
     // runtime intentionally exposes no provider/credential CLI flags, so
     // it never needs a dedicated argv slot.
+}
+
+/// Manual `Debug` so a logged injection bundle can never print resolved
+/// credential values: env var names stay visible, values are redacted.
+impl std::fmt::Debug for AgentInjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentInjection")
+            .field(
+                "env",
+                &self
+                    .env
+                    .as_ref()
+                    .map(|env| env.keys().cloned().collect::<Vec<_>>()),
+            )
+            .field("codex", &self.codex.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[cfg(test)]

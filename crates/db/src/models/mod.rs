@@ -1,10 +1,12 @@
 pub mod coding_agent_turn;
 pub mod execution_process;
 pub mod execution_process_logs;
+pub mod execution_process_outcome;
 pub mod execution_process_repo_state;
 pub mod execution_process_stop_operation;
 pub mod file;
 pub mod merge;
+pub mod metered_approval;
 pub mod project;
 pub mod provider;
 pub mod pull_request;

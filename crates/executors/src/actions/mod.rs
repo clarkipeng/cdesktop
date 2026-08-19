@@ -1,9 +1,10 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, fmt, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use enum_dispatch::enum_dispatch;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+use workspace_utils::redact::REDACTED_PLACEHOLDER;
 
 use crate::{
     actions::{
@@ -32,20 +33,23 @@ pub enum ExecutorActionType {
     ReviewRequest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Clone, Serialize, Deserialize, TS)]
 pub struct ExecutorAction {
     pub typ: ExecutorActionType,
     pub next_action: Option<Box<ExecutorAction>>,
-    /// Provider-resolved env vars to inject at spawn. These are runtime-only:
-    /// durable records must keep only opaque provider/model identifiers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Provider-resolved env vars to inject at spawn. These are runtime-only
+    /// and `serde(skip)`: resolved secrets can never serialize into durable
+    /// records, APIs, or snapshots — persistence keeps only opaque
+    /// provider/model identifiers.
+    #[serde(skip)]
     #[ts(skip)]
     pub provider_env: Option<HashMap<String, String>>,
     /// Codex-specific spawn injection (config overrides + model_provider id),
     /// populated alongside `provider_env` when the active agent is Codex and
     /// the user picked a non-Default provider record. See
     /// `crates/executors/src/env.rs::CodexProviderInjection` for shape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `serde(skip)` for the same reason as `provider_env`.
+    #[serde(skip)]
     #[ts(skip)]
     pub provider_codex: Option<CodexProviderInjection>,
     /// Provider ID selected for this message; persisted to coding_agent_turns
@@ -57,6 +61,31 @@ pub struct ExecutorAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(skip)]
     pub selected_model_id: Option<String>,
+}
+
+/// Manual `Debug` so tracing/logging an in-flight action can never print
+/// resolved provider secrets: env var names stay visible for diagnostics,
+/// values are redacted.
+impl fmt::Debug for ExecutorAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutorAction")
+            .field("typ", &self.typ)
+            .field("next_action", &self.next_action)
+            .field(
+                "provider_env",
+                &self
+                    .provider_env
+                    .as_ref()
+                    .map(|env| env.keys().map(String::as_str).collect::<Vec<_>>()),
+            )
+            .field(
+                "provider_codex",
+                &self.provider_codex.as_ref().map(|_| REDACTED_PLACEHOLDER),
+            )
+            .field("selected_provider_id", &self.selected_provider_id)
+            .field("selected_model_id", &self.selected_model_id)
+            .finish()
+    }
 }
 
 impl ExecutorAction {
@@ -205,6 +234,32 @@ mod tests {
         );
         assert!(serialized.get("provider_env").is_none());
         assert!(serialized.get("provider_codex").is_none());
+    }
+
+    #[test]
+    fn runtime_action_with_resolved_secrets_never_serializes_or_debugs_them() {
+        let action = ExecutorAction::new(
+            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                prompt: "ship it".to_string(),
+                executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
+                working_dir: None,
+            }),
+            None,
+        )
+        .with_provider_env(HashMap::from([(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            "sk-live-secret".to_string(),
+        )]));
+
+        // Even the unstripped runtime action must not serialize secrets.
+        let serialized = serde_json::to_string(&action).unwrap();
+        assert!(!serialized.contains("sk-live-secret"));
+        assert!(!serialized.contains("provider_env"));
+
+        // Debug keeps the env var name for diagnostics but never the value.
+        let debugged = format!("{action:?}");
+        assert!(debugged.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!debugged.contains("sk-live-secret"));
     }
 }
 
