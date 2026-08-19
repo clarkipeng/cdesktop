@@ -46,6 +46,7 @@ async fn queue_message(
             config: SessionCommandConfig {
                 executor_config: data.executor_config,
                 selected_provider_id: None,
+                auth_binding_id: None,
             },
         },
     )

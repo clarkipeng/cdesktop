@@ -517,10 +517,7 @@ impl LocalContainerService {
                 .map(|rx| rx.boxed()) // wait for result
                 .unwrap_or_else(|| std::future::pending().boxed()); // no signal, stall forever
 
-            let status_result: std::io::Result<std::process::ExitStatus>;
-
-            // Wait for process to exit, or exit signal from executor
-            tokio::select! {
+            let outcome = tokio::select! {
                 // Exit signal with result.
                 // Some coding agent processes do not automatically exit after processing the user request; instead the executor
                 // signals when processing has finished to gracefully kill the process.
@@ -533,40 +530,32 @@ impl LocalContainerService {
                         }
                     }
 
-                    // Map the exit result to appropriate exit status
-                    status_result = match exit_result {
-                        Ok(ExecutorExitResult::Success) => Ok(success_exit_status()),
-                        Ok(ExecutorExitResult::Failure) => Ok(failure_exit_status()),
-                        Err(_) => Ok(success_exit_status()), // Channel closed, assume success
-                    };
+                    NormalizedProcessOutcome::from_executor_signal(exit_result)
                 }
                 // Process exit
                 exit_status_result = &mut process_exit_rx => {
-                    status_result = exit_status_result.unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                    NormalizedProcessOutcome::from_exit_status_result(
+                        exit_status_result.unwrap_or_else(|e| Err(std::io::Error::other(e))),
+                    )
                 }
-            }
+            };
+            let (status, exit_code) = outcome.status_and_exit_code();
 
-            let (exit_code, status) = match status_result {
-                Ok(exit_status) => {
-                    let code = exit_status.code().unwrap_or(-1) as i64;
-                    let status = if exit_status.success() {
-                        ExecutionProcessStatus::Completed
-                    } else {
-                        ExecutionProcessStatus::Failed
-                    };
-                    (Some(code), status)
+            let completed_attempt = match ExecutionProcess::complete_running_attempt(
+                &db.pool, exec_id, status, exit_code,
+            )
+            .await
+            {
+                Ok(completed) => completed,
+                Err(e) => {
+                    tracing::error!("Failed to update execution process completion: {}", e);
+                    false
                 }
-                Err(_) => (None, ExecutionProcessStatus::Failed),
             };
 
-            if !ExecutionProcess::was_stopped(&db.pool, exec_id).await
-                && let Err(e) =
-                    ExecutionProcess::update_completion(&db.pool, exec_id, status, exit_code).await
+            if completed_attempt
+                && let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await
             {
-                tracing::error!("Failed to update execution process completion: {}", e);
-            }
-
-            if let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await {
                 // Update executor session summary if available
                 if let Err(e) = container.update_executor_session_summary(&exec_id).await {
                     tracing::warn!("Failed to update executor session summary: {}", e);
@@ -698,9 +687,11 @@ impl LocalContainerService {
                 }
             }
 
-            // Now that commit/next-action/finalization steps for this process are complete,
-            // capture the HEAD OID as the definitive "after" state (best-effort).
-            container.update_after_head_commits(exec_id).await;
+            if completed_attempt {
+                // Now that commit/next-action/finalization steps for this process are complete,
+                // capture the HEAD OID as the definitive "after" state (best-effort).
+                container.update_after_head_commits(exec_id).await;
+            }
 
             // Wait for DB persistence to complete before cleaning up MsgStore
             let db_stream_handle = container.take_db_stream_handle(&exec_id).await;
@@ -950,16 +941,43 @@ impl LocalContainerService {
     }
 }
 
-fn failure_exit_status() -> std::process::ExitStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        ExitStatusExt::from_raw(256) // Exit code 1 (shifted by 8 bits)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalizedProcessOutcome {
+    Success { exit_code: i64 },
+    Failure { exit_code: Option<i64> },
+}
+
+impl NormalizedProcessOutcome {
+    fn from_executor_signal(
+        result: Result<ExecutorExitResult, tokio::sync::oneshot::error::RecvError>,
+    ) -> Self {
+        match result {
+            Ok(ExecutorExitResult::Success) => Self::Success { exit_code: 0 },
+            Ok(ExecutorExitResult::Failure) | Err(_) => Self::Failure { exit_code: Some(1) },
+        }
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::ExitStatusExt;
-        ExitStatusExt::from_raw(1)
+
+    fn from_exit_status_result(result: std::io::Result<std::process::ExitStatus>) -> Self {
+        match result {
+            Ok(status) => {
+                let exit_code = status.code().unwrap_or(-1) as i64;
+                if status.success() {
+                    Self::Success { exit_code }
+                } else {
+                    Self::Failure {
+                        exit_code: Some(exit_code),
+                    }
+                }
+            }
+            Err(_) => Self::Failure { exit_code: None },
+        }
+    }
+
+    fn status_and_exit_code(self) -> (ExecutionProcessStatus, Option<i64>) {
+        match self {
+            Self::Success { exit_code } => (ExecutionProcessStatus::Completed, Some(exit_code)),
+            Self::Failure { exit_code } => (ExecutionProcessStatus::Failed, exit_code),
+        }
     }
 }
 
@@ -1553,24 +1571,58 @@ impl ContainerService for LocalContainerService {
         Ok(())
     }
 }
-fn success_exit_status() -> std::process::ExitStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        ExitStatusExt::from_raw(0)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::ExitStatusExt;
-        ExitStatusExt::from_raw(0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use executors::actions::script::{ScriptContext, ScriptRequest, ScriptRequestLanguage};
+    use tokio::sync::oneshot;
 
     use super::*;
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatusExt::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatusExt::from_raw(code as u32)
+        }
+    }
+
+    #[test]
+    fn normalizes_exit_status_to_process_outcome() {
+        assert_eq!(
+            NormalizedProcessOutcome::from_exit_status_result(Ok(exit_status(0))),
+            NormalizedProcessOutcome::Success { exit_code: 0 }
+        );
+        assert_eq!(
+            NormalizedProcessOutcome::from_exit_status_result(Ok(exit_status(2))),
+            NormalizedProcessOutcome::Failure { exit_code: Some(2) }
+        );
+        assert_eq!(
+            NormalizedProcessOutcome::from_exit_status_result(Err(std::io::Error::other(
+                "missing child"
+            ))),
+            NormalizedProcessOutcome::Failure { exit_code: None }
+        );
+    }
+
+    #[test]
+    fn unknown_executor_signal_fails_closed() {
+        let (tx, rx) = oneshot::channel::<ExecutorExitResult>();
+        drop(tx);
+
+        assert_eq!(
+            NormalizedProcessOutcome::from_executor_signal(rx.blocking_recv()),
+            NormalizedProcessOutcome::Failure { exit_code: Some(1) }
+        );
+        assert_eq!(
+            NormalizedProcessOutcome::from_executor_signal(Ok(ExecutorExitResult::Success)),
+            NormalizedProcessOutcome::Success { exit_code: 0 }
+        );
+    }
 
     #[test]
     fn worktree_setup_script_resolves_repo_dir_from_workspace_root() {

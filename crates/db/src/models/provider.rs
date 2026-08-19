@@ -44,6 +44,8 @@ pub const CODEX_INJECTED_API_KEY_ENV: &str = "CDT_API_KEY";
 
 pub const DEFAULT_PROVIDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
+type CodexInjection = (HashMap<String, String>, CodexProviderInjection);
+
 /// Kind of AI routing provider. PascalCase end-to-end (wire + DB CHECK constraint).
 /// Renamed in TypeScript to `AiProviderKind` to avoid collision with the git-host
 /// `ProviderKind` already in `shared/types.ts`.
@@ -207,6 +209,44 @@ struct ProviderRow {
     updated_at: DateTime<Utc>,
 }
 
+struct EnabledAgentPayloads<'a> {
+    per_agent_enabled: &'a HashMap<String, bool>,
+    claude: &'a ClaudePayload,
+    codex: &'a CodexPayload,
+    opencode: &'a OpencodePayload,
+    deepseek_tui: &'a DeepseekTuiPayload,
+    gemini: &'a GeminiPayload,
+    hermes: &'a HermesPayload,
+}
+
+impl<'a> From<&'a CreateProvider> for EnabledAgentPayloads<'a> {
+    fn from(provider: &'a CreateProvider) -> Self {
+        Self {
+            per_agent_enabled: &provider.per_agent_enabled,
+            claude: &provider.claude,
+            codex: &provider.codex,
+            opencode: &provider.opencode,
+            deepseek_tui: &provider.deepseek_tui,
+            gemini: &provider.gemini,
+            hermes: &provider.hermes,
+        }
+    }
+}
+
+impl<'a> From<&'a UpdateProvider> for EnabledAgentPayloads<'a> {
+    fn from(provider: &'a UpdateProvider) -> Self {
+        Self {
+            per_agent_enabled: &provider.per_agent_enabled,
+            claude: &provider.claude,
+            codex: &provider.codex,
+            opencode: &provider.opencode,
+            deepseek_tui: &provider.deepseek_tui,
+            gemini: &provider.gemini,
+            hermes: &provider.hermes,
+        }
+    }
+}
+
 impl TryFrom<ProviderRow> for Provider {
     type Error = ProviderError;
 
@@ -318,19 +358,19 @@ impl Provider {
     /// The Default provider is exempt: it carries no per-agent payloads.
     fn validate_enabled_agent_payloads(
         kind: &AiProviderKind,
-        per_agent_enabled: &HashMap<String, bool>,
-        claude: &ClaudePayload,
-        codex: &CodexPayload,
-        opencode: &OpencodePayload,
-        deepseek_tui: &DeepseekTuiPayload,
-        gemini: &GeminiPayload,
-        hermes: &HermesPayload,
+        payloads: EnabledAgentPayloads<'_>,
     ) -> Result<(), ProviderError> {
         if matches!(kind, AiProviderKind::Default) {
             return Ok(());
         }
-        let is_on = |k: &str| per_agent_enabled.get(k).copied().unwrap_or(false);
-        let has = |s: &Option<String>| s.as_deref().map_or(false, |v| !v.is_empty());
+        let is_on = |k: &str| {
+            payloads
+                .per_agent_enabled
+                .get(k)
+                .copied()
+                .unwrap_or(false)
+        };
+        let has = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.is_empty());
         let missing = |agent: &str, ok: bool| {
             if ok {
                 Ok(())
@@ -339,22 +379,22 @@ impl Provider {
             }
         };
         if is_on("CLAUDE_CODE") {
-            missing("CLAUDE_CODE", has(&claude.base_url))?;
+            missing("CLAUDE_CODE", has(&payloads.claude.base_url))?;
         }
         if is_on("CODEX") {
-            missing("CODEX", has(&codex.base_url))?;
+            missing("CODEX", has(&payloads.codex.base_url))?;
         }
         if is_on("OPENCODE") {
-            missing("OPENCODE", has(&opencode.base_url))?;
+            missing("OPENCODE", has(&payloads.opencode.base_url))?;
         }
         if is_on("DEEPSEEK_TUI") {
-            missing("DEEPSEEK_TUI", has(&deepseek_tui.base_url))?;
+            missing("DEEPSEEK_TUI", has(&payloads.deepseek_tui.base_url))?;
         }
         if is_on("GEMINI") {
-            missing("GEMINI", has(&gemini.base_url))?;
+            missing("GEMINI", has(&payloads.gemini.base_url))?;
         }
         if is_on("HERMES") {
-            missing("HERMES", has(&hermes.base_url))?;
+            missing("HERMES", has(&payloads.hermes.base_url))?;
         }
         Ok(())
     }
@@ -365,16 +405,7 @@ impl Provider {
         data: &CreateProvider,
     ) -> Result<Self, ProviderError> {
         Self::validate_enabled_models(&data.kind, &data.enabled_models)?;
-        Self::validate_enabled_agent_payloads(
-            &data.kind,
-            &data.per_agent_enabled,
-            &data.claude,
-            &data.codex,
-            &data.opencode,
-            &data.deepseek_tui,
-            &data.gemini,
-            &data.hermes,
-        )?;
+        Self::validate_enabled_agent_payloads(&data.kind, data.into())?;
 
         let id_str = id.to_string();
         let kind_str = data.kind.to_string();
@@ -432,16 +463,7 @@ impl Provider {
         // Look up kind to know whether to enforce the non-empty rule (Default exempt).
         let existing = Self::find_by_id(pool, id).await?;
         Self::validate_enabled_models(&existing.kind, &data.enabled_models)?;
-        Self::validate_enabled_agent_payloads(
-            &existing.kind,
-            &data.per_agent_enabled,
-            &data.claude,
-            &data.codex,
-            &data.opencode,
-            &data.deepseek_tui,
-            &data.gemini,
-            &data.hermes,
-        )?;
+        Self::validate_enabled_agent_payloads(&existing.kind, data.into())?;
 
         let id_str = id.to_string();
         let per_agent_enabled = serde_json::to_string(&data.per_agent_enabled)?;
@@ -646,7 +668,7 @@ impl Provider {
     /// Returns `Ok(None)` for the Default provider (ambient auth path).
     pub fn build_codex_injection(
         &self,
-    ) -> Result<Option<(HashMap<String, String>, CodexProviderInjection)>, ProviderError> {
+    ) -> Result<Option<CodexInjection>, ProviderError> {
         if self.kind == AiProviderKind::Default {
             return Ok(None);
         }

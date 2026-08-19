@@ -401,7 +401,7 @@ pub trait ContainerService {
         }
 
         let execution_id = Uuid::new_v4();
-        let commands = SessionCommand::pending(pool, session_id).await?;
+        let commands = SessionCommand::claim_pending(pool, session_id, execution_id).await?;
         let Some(first) = commands.first() else {
             return Ok(None);
         };
@@ -414,6 +414,7 @@ pub trait ContainerService {
         let SessionCommandConfig {
             mut executor_config,
             selected_provider_id,
+            auth_binding_id: _,
         } = first.config.0.clone();
         let prompt = commands
             .iter()
@@ -1443,7 +1444,7 @@ pub trait ContainerService {
         }
         let create_execution_process = CreateExecutionProcess {
             session_id: session.id,
-            executor_action: executor_action.clone(),
+            executor_action: executor_action.without_provider_bindings(),
             run_reason: run_reason.clone(),
         };
 
@@ -1455,9 +1456,21 @@ pub trait ContainerService {
         )
         .await?;
         if *run_reason == ExecutionProcessRunReason::CodingAgent {
-            if claim_pending_commands {
-                SessionCommand::claim_pending(&self.db().pool, session.id, execution_process.id)
-                    .await?;
+            if claim_pending_commands
+                && !SessionCommand::has_claimed_execution(&self.db().pool, execution_process.id)
+                    .await?
+            {
+                ExecutionProcess::update_completion(
+                    &self.db().pool,
+                    execution_process.id,
+                    ExecutionProcessStatus::Failed,
+                    None,
+                )
+                .await?;
+                return Err(ContainerError::Other(anyhow!(
+                    "No claimed session command for execution attempt {}",
+                    execution_process.id
+                )));
             }
             let command = match executor_action.typ() {
                 ExecutorActionType::CodingAgentInitialRequest(request) => {
@@ -1471,7 +1484,8 @@ pub trait ContainerService {
                 }
                 ExecutorActionType::ScriptRequest(_) => None,
             };
-            if let Some((body, executor_config)) = command
+            if !claim_pending_commands
+                && let Some((body, executor_config)) = command
                 && let Err(error) = SessionCommand::ensure_claimed(
                     &self.db().pool,
                     session.id,
@@ -1480,6 +1494,10 @@ pub trait ContainerService {
                     SessionCommandConfig {
                         executor_config,
                         selected_provider_id: executor_action
+                            .selected_provider_id
+                            .as_deref()
+                            .and_then(|id| id.parse().ok()),
+                        auth_binding_id: executor_action
                             .selected_provider_id
                             .as_deref()
                             .and_then(|id| id.parse().ok()),

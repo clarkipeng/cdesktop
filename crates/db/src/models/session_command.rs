@@ -32,6 +32,9 @@ pub struct SessionCommandConfig {
     #[serde(default)]
     #[ts(optional)]
     pub selected_provider_id: Option<Uuid>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub auth_binding_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]
@@ -45,6 +48,7 @@ pub struct SessionCommand {
     pub config: Json<SessionCommandConfig>,
     pub state: SessionCommandState,
     pub execution_process_id: Option<Uuid>,
+    pub attempt_number: i64,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -140,6 +144,18 @@ impl SessionCommand {
         execution_process_id: Uuid,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let mut transaction = pool.begin().await?;
+        let has_active_attempt: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM session_commands \
+             WHERE session_id = ? AND state = 'claimed')",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_active_attempt != 0 {
+            transaction.commit().await?;
+            return Ok(Vec::new());
+        }
+
         let pending = sqlx::query_as::<_, Self>(
             r#"SELECT * FROM session_commands
                WHERE session_id = ? AND state = 'pending'
@@ -158,7 +174,7 @@ impl SessionCommand {
             .map(|command| command.id)
             .collect();
         let mut update = QueryBuilder::<Sqlite>::new(
-            "UPDATE session_commands SET state = 'claimed', execution_process_id = ",
+            "UPDATE session_commands SET state = 'claimed', attempt_number = attempt_number + 1, execution_process_id = ",
         );
         update
             .push_bind(execution_process_id)
@@ -179,6 +195,20 @@ impl SessionCommand {
         .await?;
         transaction.commit().await?;
         Ok(claimed)
+    }
+
+    pub async fn has_claimed_execution(
+        pool: &SqlitePool,
+        execution_process_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM session_commands \
+             WHERE execution_process_id = ? AND state = 'claimed')",
+        )
+        .bind(execution_process_id)
+        .fetch_one(pool)
+        .await?;
+        Ok(exists != 0)
     }
 
     pub async fn pending_session_ids(pool: &SqlitePool) -> Result<Vec<Uuid>, sqlx::Error> {
@@ -247,9 +277,9 @@ impl SessionCommand {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"INSERT INTO session_commands (
-                   id, session_id, intent, body, config, state, execution_process_id
+                   id, session_id, intent, body, config, state, execution_process_id, attempt_number
                )
-               SELECT ?, ?, 'continue', ?, ?, 'claimed', ?
+               SELECT ?, ?, 'continue', ?, ?, 'claimed', ?, 1
                WHERE NOT EXISTS (
                    SELECT 1 FROM session_commands WHERE execution_process_id = ?
                )"#,
@@ -329,11 +359,12 @@ mod tests {
                 dedupe_key TEXT,
                 intent TEXT NOT NULL,
                 body TEXT NOT NULL,
-                config TEXT,
-                state TEXT NOT NULL DEFAULT 'pending',
-                execution_process_id BLOB,
-                created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec')),
-                finished_at TEXT
+               config TEXT,
+               state TEXT NOT NULL DEFAULT 'pending',
+               execution_process_id BLOB,
+                attempt_number INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec')),
+               finished_at TEXT
             )"#,
         )
         .execute(&pool)
@@ -360,6 +391,7 @@ mod tests {
                     executors::executors::BaseCodingAgent::ClaudeCode,
                 ),
                 selected_provider_id: None,
+                auth_binding_id: None,
             },
         }
     }
@@ -461,6 +493,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_fails_closed_when_session_has_active_attempt() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        SessionCommand::enqueue(&pool, command(session_id, "active", None))
+            .await
+            .unwrap();
+        let active_execution_id = Uuid::new_v4();
+        SessionCommand::claim_pending(&pool, session_id, active_execution_id)
+            .await
+            .unwrap();
+        SessionCommand::enqueue(&pool, command(session_id, "later", None))
+            .await
+            .unwrap();
+
+        let stale_execution_id = Uuid::new_v4();
+        let claimed = SessionCommand::claim_pending(&pool, session_id, stale_execution_id)
+            .await
+            .unwrap();
+
+        assert!(claimed.is_empty());
+        assert!(
+            SessionCommand::has_claimed_execution(&pool, active_execution_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !SessionCommand::has_claimed_execution(&pool, stale_execution_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            SessionCommand::pending(&pool, session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn interrupted_execution_returns_to_pending() {
         let pool = pool().await;
         let session_id = Uuid::new_v4();
@@ -480,6 +552,96 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].body, "recover");
         assert_eq!(pending[0].execution_process_id, None);
+        assert_eq!(pending[0].attempt_number, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_logical_command_id_and_orders_attempts() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let (command, _) = SessionCommand::enqueue(&pool, command(session_id, "retry", Some("k")))
+            .await
+            .unwrap();
+        let first_execution_id = Uuid::new_v4();
+        let first = SessionCommand::claim_pending(&pool, session_id, first_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(first[0].id, command.id);
+        assert_eq!(first[0].attempt_number, 1);
+
+        SessionCommand::release_execution(&pool, first_execution_id)
+            .await
+            .unwrap();
+        let second_execution_id = Uuid::new_v4();
+        let second = SessionCommand::claim_pending(&pool, session_id, second_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(second[0].id, command.id);
+        assert_eq!(second[0].execution_process_id, Some(second_execution_id));
+        assert_eq!(second[0].attempt_number, 2);
+    }
+
+    #[tokio::test]
+    async fn stale_predecessor_completion_cannot_finish_retry() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        SessionCommand::enqueue(&pool, command(session_id, "retry", None))
+            .await
+            .unwrap();
+        let predecessor_id = Uuid::new_v4();
+        SessionCommand::claim_pending(&pool, session_id, predecessor_id)
+            .await
+            .unwrap();
+        SessionCommand::release_execution(&pool, predecessor_id)
+            .await
+            .unwrap();
+        let retry_id = Uuid::new_v4();
+        SessionCommand::claim_pending(&pool, session_id, retry_id)
+            .await
+            .unwrap();
+
+        SessionCommand::finish_execution(&pool, predecessor_id, true)
+            .await
+            .unwrap();
+
+        let active = SessionCommand::for_session(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(active[0].state, SessionCommandState::Claimed);
+        assert_eq!(active[0].execution_process_id, Some(retry_id));
+        assert_eq!(active[0].attempt_number, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_have_one_winner() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        SessionCommand::enqueue(&pool, command(session_id, "one", None))
+            .await
+            .unwrap();
+        let first_execution_id = Uuid::new_v4();
+        let second_execution_id = Uuid::new_v4();
+
+        let (first, second) = tokio::join!(
+            SessionCommand::claim_pending(&pool, session_id, first_execution_id),
+            SessionCommand::claim_pending(&pool, session_id, second_execution_id),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.len() + second.len(), 1);
+        let winner = if first.is_empty() {
+            second_execution_id
+        } else {
+            first_execution_id
+        };
+        assert!(
+            SessionCommand::has_claimed_execution(&pool, winner)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

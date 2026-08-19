@@ -36,6 +36,109 @@ pub enum ExecutionProcessError {
     ValidationError(String),
 }
 
+#[cfg(test)]
+mod tests {
+    use executors::actions::{
+        ExecutorAction, ExecutorActionType,
+        script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
+    };
+    use sqlx::sqlite::SqlitePoolOptions;
+    use uuid::Uuid;
+
+    use super::{ExecutionProcess, ExecutionProcessStatus, ExecutorActionField};
+
+    #[test]
+    fn boxed_executor_action_preserves_json_shape() {
+        let action = ExecutorAction::new(
+            ExecutorActionType::ScriptRequest(ScriptRequest {
+                script: "echo ready".to_string(),
+                language: ScriptRequestLanguage::Bash,
+                context: ScriptContext::SetupScript,
+                working_dir: None,
+            }),
+            None,
+        );
+        let expected = serde_json::to_value(&action).unwrap();
+        let field = ExecutorActionField::ExecutorAction(Box::new(action));
+
+        assert_eq!(serde_json::to_value(&field).unwrap(), expected);
+        assert!(matches!(
+            serde_json::from_value::<ExecutorActionField>(expected).unwrap(),
+            ExecutorActionField::ExecutorAction(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_running_attempt_is_exact_once() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE execution_processes (
+                id BLOB PRIMARY KEY NOT NULL,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                completed_at TEXT
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO execution_processes (id, status, exit_code, completed_at) \
+             VALUES (?, 'running', NULL, NULL)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            ExecutionProcess::complete_running_attempt(
+                &pool,
+                id,
+                ExecutionProcessStatus::Completed,
+                Some(0),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !ExecutionProcess::complete_running_attempt(
+                &pool,
+                id,
+                ExecutionProcessStatus::Failed,
+                Some(1),
+            )
+            .await
+            .unwrap()
+        );
+
+        let (status, exit_code): (String, i64) =
+            sqlx::query_as("SELECT status, exit_code FROM execution_processes WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(exit_code, 0);
+
+        let missing = ExecutionProcess::complete_running_attempt(
+            &pool,
+            Uuid::new_v4(),
+            ExecutionProcessStatus::Completed,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert!(!missing);
+    }
+}
+
 #[derive(Debug, Clone, Type, Serialize, Deserialize, PartialEq, TS)]
 #[sqlx(type_name = "execution_process_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
@@ -105,7 +208,7 @@ pub struct LatestProcessInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExecutorActionField {
-    ExecutorAction(ExecutorAction),
+    ExecutorAction(Box<ExecutorAction>),
     Other(Value),
 }
 
@@ -464,9 +567,36 @@ impl ExecutionProcess {
         Ok(())
     }
 
+    pub async fn complete_running_attempt(
+        pool: &SqlitePool,
+        id: Uuid,
+        status: ExecutionProcessStatus,
+        exit_code: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        let completed_at = if matches!(status, ExecutionProcessStatus::Running) {
+            None
+        } else {
+            Some(Utc::now())
+        };
+
+        let result = sqlx::query(
+            "UPDATE execution_processes \
+             SET status = ?, exit_code = ?, completed_at = ? \
+             WHERE id = ? AND status = 'running'",
+        )
+        .bind(status)
+        .bind(exit_code)
+        .bind(completed_at)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     pub fn executor_action(&self) -> Result<&ExecutorAction, anyhow::Error> {
         match &self.executor_action.0 {
-            ExecutorActionField::ExecutorAction(action) => Ok(action),
+            ExecutorActionField::ExecutorAction(action) => Ok(action.as_ref()),
             ExecutorActionField::Other(_) => Err(anyhow::anyhow!(
                 "Executor action is not a valid ExecutorAction JSON object"
             )),

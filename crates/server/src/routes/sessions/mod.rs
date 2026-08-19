@@ -332,6 +332,7 @@ pub async fn follow_up(
             config: SessionCommandConfig {
                 executor_config,
                 selected_provider_id: payload.selected_provider_id,
+                auth_binding_id: payload.selected_provider_id,
             },
         },
     )
