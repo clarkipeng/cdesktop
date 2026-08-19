@@ -5,7 +5,14 @@ import {
   ProhibitIcon,
   WarningCircleIcon,
 } from '@phosphor-icons/react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useState } from 'react';
 import { cn } from '@/shared/lib/utils';
+import { meteredApprovalsApi } from '@/shared/lib/api';
+import type {
+  MeteredApproval,
+  MeteredApprovalState,
+} from '@/shared/lib/execution-routing/apiTypes';
 import {
   executionRoutingFixture,
   getExecutionRoutingRouteById,
@@ -174,9 +181,108 @@ export function AgentRouteRow({ agent }: { agent: AgentRouteFixture }) {
   );
 }
 
+function approvalTone(state: MeteredApprovalState) {
+  return state === 'blocked' || state === 'denied'
+    ? 'error'
+    : state === 'pending'
+      ? 'brand'
+      : 'success';
+}
+
+function approvalLabel(state: MeteredApprovalState) {
+  return state.replaceAll('_', ' ');
+}
+
+export function MeteredApprovalCard({
+  approval,
+  onRespond,
+  isResponding,
+}: {
+  approval: MeteredApproval;
+  onRespond: (approved: boolean, reason?: string) => void;
+  isResponding: boolean;
+}) {
+  const [reason, setReason] = useState('');
+  const pending = approval.state === 'pending';
+
+  return (
+    <div className="rounded-sm border border-brand/40 bg-brand/5 p-base">
+      <div className="flex min-w-0 items-start justify-between gap-base">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-high">Metered execution</p>
+          <p className="mt-half truncate text-xs text-low">
+            Command {approval.session_command_id}
+            {approval.account_alias ? ` · ${approval.account_alias}` : ''}
+          </p>
+        </div>
+        <RoutingBadge tone={approvalTone(approval.state)}>
+          {approvalLabel(approval.state)}
+        </RoutingBadge>
+      </div>
+      {approval.reason && (
+        <p className="mt-base text-sm text-normal">{approval.reason}</p>
+      )}
+      {pending && (
+        <>
+          <textarea
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="Optional reason"
+            aria-label="Approval reason"
+            className="mt-base min-h-16 w-full resize-y rounded-sm border border-border bg-secondary px-half py-half text-sm text-normal placeholder:text-low focus:outline-none focus:ring-1 focus:ring-brand"
+          />
+          <div className="mt-base flex flex-wrap justify-end gap-half">
+            <button
+              type="button"
+              disabled={isResponding}
+              onClick={() => onRespond(false, reason || undefined)}
+              className="rounded-sm border border-error/40 px-base py-half text-sm text-error hover:bg-error/10 disabled:opacity-50"
+            >
+              Deny
+            </button>
+            <button
+              type="button"
+              disabled={isResponding}
+              onClick={() => onRespond(true, reason || undefined)}
+              className="rounded-sm bg-brand px-base py-half text-sm text-white hover:opacity-90 disabled:opacity-50"
+            >
+              Approve
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function ExecutionRoutingOverview() {
   const { settings, selection } = executionRoutingFixture;
   const selectedRoute = getExecutionRoutingRouteById(selection.selectedRouteId);
+  const queryClient = useQueryClient();
+  const [resolvedApprovals, setResolvedApprovals] = useState<MeteredApproval[]>(
+    []
+  );
+  const approvalsQuery = useQuery({
+    queryKey: ['metered-approvals'],
+    queryFn: meteredApprovalsApi.listPending,
+    refetchInterval: 5_000,
+  });
+  const respondMutation = useMutation({
+    mutationFn: ({
+      id,
+      approved,
+      reason,
+    }: {
+      id: string;
+      approved: boolean;
+      reason?: string;
+    }) => meteredApprovalsApi.respond(id, { approved, reason }),
+    onSuccess: (approval) => {
+      setResolvedApprovals((current) => [approval, ...current].slice(0, 5));
+      queryClient.invalidateQueries({ queryKey: ['metered-approvals'] });
+    },
+  });
+  const pendingApprovals = approvalsQuery.data ?? [];
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-primary">
@@ -202,6 +308,56 @@ export function ExecutionRoutingOverview() {
       <div className="min-h-0 flex-1 overflow-y-auto p-double">
         <div className="grid gap-double xl:grid-cols-[minmax(0,1fr)_360px]">
           <div className="min-w-0 space-y-base">
+            {(pendingApprovals.length > 0 ||
+              resolvedApprovals.length > 0 ||
+              approvalsQuery.isError) && (
+              <div className="rounded-sm border border-border bg-panel p-double">
+                <div className="flex items-center justify-between gap-base">
+                  <div>
+                    <h2 className="text-base font-medium text-high">
+                      Metered approvals
+                    </h2>
+                    <p className="mt-half text-sm text-low">
+                      Durable decisions from the execution dispatcher.
+                    </p>
+                  </div>
+                  {pendingApprovals.length > 0 && (
+                    <RoutingBadge tone="brand">
+                      {pendingApprovals.length} pending
+                    </RoutingBadge>
+                  )}
+                </div>
+                <div className="mt-base space-y-base">
+                  {pendingApprovals.map((approval) => (
+                    <MeteredApprovalCard
+                      key={approval.id}
+                      approval={approval}
+                      isResponding={respondMutation.isPending}
+                      onRespond={(approved, reason) =>
+                        respondMutation.mutate({
+                          id: approval.id,
+                          approved,
+                          reason,
+                        })
+                      }
+                    />
+                  ))}
+                  {resolvedApprovals.map((approval) => (
+                    <MeteredApprovalCard
+                      key={approval.id}
+                      approval={approval}
+                      isResponding={false}
+                      onRespond={() => undefined}
+                    />
+                  ))}
+                </div>
+                {approvalsQuery.isError && (
+                  <p className="mt-base text-sm text-error">
+                    Unable to load metered approvals.
+                  </p>
+                )}
+              </div>
+            )}
             <div className="rounded-sm border border-border bg-panel p-double">
               <p className="text-sm font-medium text-high">Current selection</p>
               <div className="mt-base">
