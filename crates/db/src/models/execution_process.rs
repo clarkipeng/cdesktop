@@ -36,6 +36,37 @@ pub enum ExecutionProcessError {
     ValidationError(String),
 }
 
+#[cfg(test)]
+mod tests {
+    use executors::actions::{
+        script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
+        ExecutorAction, ExecutorActionType,
+    };
+
+    use super::ExecutorActionField;
+
+    #[test]
+    fn boxed_executor_action_preserves_json_shape() {
+        let action = ExecutorAction::new(
+            ExecutorActionType::ScriptRequest(ScriptRequest {
+                script: "echo ready".to_string(),
+                language: ScriptRequestLanguage::Bash,
+                context: ScriptContext::SetupScript,
+                working_dir: None,
+            }),
+            None,
+        );
+        let expected = serde_json::to_value(&action).unwrap();
+        let field = ExecutorActionField::ExecutorAction(Box::new(action));
+
+        assert_eq!(serde_json::to_value(&field).unwrap(), expected);
+        assert!(matches!(
+            serde_json::from_value::<ExecutorActionField>(expected).unwrap(),
+            ExecutorActionField::ExecutorAction(_)
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Type, Serialize, Deserialize, PartialEq, TS)]
 #[sqlx(type_name = "execution_process_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
@@ -105,7 +136,7 @@ pub struct LatestProcessInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExecutorActionField {
-    ExecutorAction(ExecutorAction),
+    ExecutorAction(Box<ExecutorAction>),
     Other(Value),
 }
 
@@ -466,7 +497,7 @@ impl ExecutionProcess {
 
     pub fn executor_action(&self) -> Result<&ExecutorAction, anyhow::Error> {
         match &self.executor_action.0 {
-            ExecutorActionField::ExecutorAction(action) => Ok(action),
+            ExecutorActionField::ExecutorAction(action) => Ok(action.as_ref()),
             ExecutorActionField::Other(_) => Err(anyhow::anyhow!(
                 "Executor action is not a valid ExecutorAction JSON object"
             )),
