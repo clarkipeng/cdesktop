@@ -410,8 +410,7 @@ pub(crate) async fn spawn_routine_run(
             &managed.workspace,
             executor_config,
             routine.instructions.clone(),
-            injection.env,
-            injection.codex,
+            injection,
             selected_provider_id,
             selected_model_id,
         )

@@ -498,10 +498,9 @@ mod tests {
                 .is_some(),
             request.selected_provider_id.is_some(),
         )
-        .and_then(|()| {
+        .map(|()| {
             created_session = true;
             created_process = true;
-            Ok(())
         });
 
         assert!(matches!(

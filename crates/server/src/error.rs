@@ -92,7 +92,8 @@ pub enum ApiError {
     #[error(transparent)]
     Pty(#[from] PtyError),
     #[error(transparent)]
-    WebRtc(#[from] WebRtcError),
+    // Boxed: WebRtcError is the outsized ApiError variant (clippy result_large_err).
+    WebRtc(Box<WebRtcError>),
     #[error(transparent)]
     Teammate(#[from] crate::routes::teammates::TeammateError),
     #[error(transparent)]
@@ -525,7 +526,7 @@ impl IntoResponse for ApiError {
                 ErrorInfo::bad_request("RoutineError", msg.clone())
             }
             ApiError::Routine(_) => ErrorInfo::internal("RoutineError"),
-            ApiError::WebRtc(err) => match err {
+            ApiError::WebRtc(err) => match err.as_ref() {
                 WebRtcError::SessionNotFound { .. } => {
                     ErrorInfo::not_found("WebRtcError", err.to_string())
                 }
@@ -572,30 +573,32 @@ impl From<TrustedKeyAuthError> for ApiError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use axum::response::IntoResponse;
-
-    use super::*;
-
-    #[test]
-    fn in_progress_stop_response_is_protocol_distinct_from_rejection() {
-        assert_eq!(
-            ApiError::TooEarly("still running".into())
-                .into_response()
-                .status(),
-            StatusCode::TOO_EARLY
-        );
+impl From<WebRtcError> for ApiError {
+    fn from(err: WebRtcError) -> Self {
+        ApiError::WebRtc(Box::new(err))
     }
-
-    #[test]
-    fn interrupted_stop_response_is_protocol_distinct_from_rejection_and_pending() {
-        assert_eq!(
-            ApiError::StopInterrupted("owner exited".into())
-                .into_response()
-                .status(),
-            StatusCode::FAILED_DEPENDENCY
-        );
+}
+impl From<RelayPairingClientError> for ApiError {
+    fn from(err: RelayPairingClientError) -> Self {
+        match err {
+            RelayPairingClientError::NotConfigured => ApiError::BadRequest(err.to_string()),
+            RelayPairingClientError::RemoteClient(ref inner) => {
+                tracing::warn!(%inner, "Relay host pairing authentication failed");
+                ApiError::Unauthorized
+            }
+            RelayPairingClientError::Pairing(ref detail) => {
+                tracing::warn!(%detail, "Relay host pairing failed");
+                ApiError::BadRequest(err.to_string())
+            }
+            RelayPairingClientError::StoreSerialization(ref detail) => {
+                tracing::error!(%detail, "Failed to serialize relay host credentials");
+                ApiError::BadGateway(err.to_string())
+            }
+            RelayPairingClientError::Store(ref detail) => {
+                tracing::error!(%detail, "Failed to persist paired relay host credentials");
+                ApiError::BadGateway(err.to_string())
+            }
+        }
     }
 }
 
@@ -650,26 +653,29 @@ impl From<RelayApiError> for ApiError {
     }
 }
 
-impl From<RelayPairingClientError> for ApiError {
-    fn from(err: RelayPairingClientError) -> Self {
-        match err {
-            RelayPairingClientError::NotConfigured => ApiError::BadRequest(err.to_string()),
-            RelayPairingClientError::RemoteClient(ref inner) => {
-                tracing::warn!(%inner, "Relay host pairing authentication failed");
-                ApiError::Unauthorized
-            }
-            RelayPairingClientError::Pairing(ref detail) => {
-                tracing::warn!(%detail, "Relay host pairing failed");
-                ApiError::BadRequest(err.to_string())
-            }
-            RelayPairingClientError::StoreSerialization(ref detail) => {
-                tracing::error!(%detail, "Failed to serialize relay host credentials");
-                ApiError::BadGateway(err.to_string())
-            }
-            RelayPairingClientError::Store(ref detail) => {
-                tracing::error!(%detail, "Failed to persist paired relay host credentials");
-                ApiError::BadGateway(err.to_string())
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    #[test]
+    fn in_progress_stop_response_is_protocol_distinct_from_rejection() {
+        assert_eq!(
+            ApiError::TooEarly("still running".into())
+                .into_response()
+                .status(),
+            StatusCode::TOO_EARLY
+        );
+    }
+
+    #[test]
+    fn interrupted_stop_response_is_protocol_distinct_from_rejection_and_pending() {
+        assert_eq!(
+            ApiError::StopInterrupted("owner exited".into())
+                .into_response()
+                .status(),
+            StatusCode::FAILED_DEPENDENCY
+        );
     }
 }

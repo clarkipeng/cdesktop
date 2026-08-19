@@ -1228,6 +1228,7 @@ mod opencode_injection_tests {
 
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn provider_with_opencode(
         kind: AiProviderKind,
         api_key: Option<&str>,

@@ -388,17 +388,16 @@ pub async fn create_and_start_workspace(
         let git = deployment.git();
         let current = git.get_current_branch(&first_repo.repo.path).ok();
         let already_on_branch = current.as_deref() == Some(first_repo.target_branch.as_str());
-        if !already_on_branch {
-            if let Err(e) =
+        if !already_on_branch
+            && let Err(e) =
                 git.checkout_branch(&first_repo.repo.path, &first_repo.target_branch, false)
-            {
-                return cleanup_failed_workspace_start_and_return(
-                    &deployment,
-                    workspace_id,
-                    ApiError::Workspace(WorkspaceError::ValidationError(e.to_string())),
-                )
-                .await;
-            }
+        {
+            return cleanup_failed_workspace_start_and_return(
+                &deployment,
+                workspace_id,
+                ApiError::Workspace(WorkspaceError::ValidationError(e.to_string())),
+            )
+            .await;
         }
     }
 
@@ -448,15 +447,15 @@ pub async fn create_and_start_workspace(
         managed_workspace.workspace.branch = String::new();
     }
 
-    if let Some(ids) = &attachment_ids {
-        if let Err(e) = managed_workspace.associate_attachments(ids).await {
-            return cleanup_failed_workspace_start_and_return(
-                &deployment,
-                workspace_id,
-                ApiError::from(e),
-            )
-            .await;
-        }
+    if let Some(ids) = &attachment_ids
+        && let Err(e) = managed_workspace.associate_attachments(ids).await
+    {
+        return cleanup_failed_workspace_start_and_return(
+            &deployment,
+            workspace_id,
+            ApiError::from(e),
+        )
+        .await;
     }
 
     if let Some(linked_issue) = &linked_issue
@@ -510,8 +509,7 @@ pub async fn create_and_start_workspace(
             &workspace,
             executor_config.clone(),
             workspace_prompt,
-            injection.env,
-            injection.codex,
+            injection,
             selected_provider_id_str,
             selected_model_id_str,
         )

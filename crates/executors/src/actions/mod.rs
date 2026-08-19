@@ -171,6 +171,18 @@ pub trait Executable {
     ) -> Result<SpawnedChild, ExecutorError>;
 }
 
+#[async_trait]
+impl Executable for ExecutorAction {
+    async fn spawn(
+        &self,
+        current_dir: &Path,
+        approvals: Arc<dyn ExecutorApprovalService>,
+        env: &ExecutionEnv,
+    ) -> Result<SpawnedChild, ExecutorError> {
+        self.typ.spawn(current_dir, approvals, env).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -260,17 +272,5 @@ mod tests {
         let debugged = format!("{action:?}");
         assert!(debugged.contains("ANTHROPIC_AUTH_TOKEN"));
         assert!(!debugged.contains("sk-live-secret"));
-    }
-}
-
-#[async_trait]
-impl Executable for ExecutorAction {
-    async fn spawn(
-        &self,
-        current_dir: &Path,
-        approvals: Arc<dyn ExecutorApprovalService>,
-        env: &ExecutionEnv,
-    ) -> Result<SpawnedChild, ExecutorError> {
-        self.typ.spawn(current_dir, approvals, env).await
     }
 }
