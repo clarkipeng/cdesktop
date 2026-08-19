@@ -366,7 +366,12 @@ create_new_branch?: boolean,
  * Provider to route this message through. `None` = inherit from the
  * recipient's last execution (same fallback as `executor_config`).
  */
-selected_provider_id?: string, dedupe_key?: string, intent?: SessionCommandIntent, };
+selected_provider_id?: string, dedupe_key?: string, intent?: SessionCommandIntent, 
+/**
+ * Persist the command without claiming it. A recovery controller can
+ * dispatch it later after its provider-reachability gate passes.
+ */
+defer_dispatch?: boolean, };
 
 export type SpawnTeammateRequest = { 
 /**
@@ -643,9 +648,9 @@ export type QueuedMessage = { session_id: string, data: DraftFollowUpData, queue
 
 export type QueueStatus = { "status": "empty" } | { "status": "queued", message: QueuedMessage, };
 
-export type SessionCommand = { id: string, session_id: string, dedupe_key: string | null, intent: SessionCommandIntent, body: string, config: SessionCommandConfig, state: SessionCommandState, execution_process_id: string | null, created_at: string, finished_at: string | null, };
+export type SessionCommand = { id: string, session_id: string, dedupe_key: string | null, intent: SessionCommandIntent, body: string, config: SessionCommandConfig, state: SessionCommandState, execution_process_id: string | null, attempt_number: bigint, created_at: string, finished_at: string | null, };
 
-export type SessionCommandConfig = { executor_config: ExecutorConfig, selected_provider_id?: string, };
+export type SessionCommandConfig = { executor_config: ExecutorConfig, selected_provider_id?: string, auth_binding_id?: string, };
 
 export enum SessionCommandIntent { continue = "continue", replace = "replace" }
 

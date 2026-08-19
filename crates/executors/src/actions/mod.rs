@@ -146,16 +146,15 @@ pub trait Executable {
 mod tests {
     use serde_json::json;
 
+    use super::*;
     use crate::{
         actions::{
-            coding_agent_initial::CodingAgentInitialRequest, script::ScriptContext,
-            script::ScriptRequest, script::ScriptRequestLanguage,
+            coding_agent_initial::CodingAgentInitialRequest,
+            script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
         },
         env::CodexProviderInjection,
         profile::ExecutorConfig,
     };
-
-    use super::*;
 
     #[test]
     fn storage_action_keeps_opaque_provider_ref_without_runtime_bindings() {

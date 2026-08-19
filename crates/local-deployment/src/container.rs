@@ -1573,9 +1573,8 @@ impl ContainerService for LocalContainerService {
 }
 #[cfg(test)]
 mod tests {
-    use tokio::sync::oneshot;
-
     use executors::actions::script::{ScriptContext, ScriptRequest, ScriptRequestLanguage};
+    use tokio::sync::oneshot;
 
     use super::*;
 

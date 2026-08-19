@@ -414,6 +414,7 @@ pub trait ContainerService {
         let SessionCommandConfig {
             mut executor_config,
             selected_provider_id,
+            auth_binding_id: _,
         } = first.config.0.clone();
         let prompt = commands
             .iter()
@@ -1456,11 +1457,8 @@ pub trait ContainerService {
         .await?;
         if *run_reason == ExecutionProcessRunReason::CodingAgent {
             if claim_pending_commands
-                && !SessionCommand::has_claimed_execution(
-                    &self.db().pool,
-                    execution_process.id,
-                )
-                .await?
+                && !SessionCommand::has_claimed_execution(&self.db().pool, execution_process.id)
+                    .await?
             {
                 ExecutionProcess::update_completion(
                     &self.db().pool,
@@ -1496,6 +1494,10 @@ pub trait ContainerService {
                     SessionCommandConfig {
                         executor_config,
                         selected_provider_id: executor_action
+                            .selected_provider_id
+                            .as_deref()
+                            .and_then(|id| id.parse().ok()),
+                        auth_binding_id: executor_action
                             .selected_provider_id
                             .as_deref()
                             .and_then(|id| id.parse().ok()),

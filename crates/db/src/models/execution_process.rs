@@ -39,14 +39,13 @@ pub enum ExecutionProcessError {
 #[cfg(test)]
 mod tests {
     use executors::actions::{
-        script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
         ExecutorAction, ExecutorActionType,
+        script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use uuid::Uuid;
 
-    use super::ExecutorActionField;
-    use super::{ExecutionProcess, ExecutionProcessStatus};
+    use super::{ExecutionProcess, ExecutionProcessStatus, ExecutorActionField};
 
     #[test]
     fn boxed_executor_action_preserves_json_shape() {
