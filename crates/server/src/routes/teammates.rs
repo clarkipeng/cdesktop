@@ -218,12 +218,12 @@ async fn spawn_teammate_core(
         ExecutionProcess::latest_executor_profile_for_session(pool, inherit_from.id)
             .await?
             .map(|p| p.executor);
-    let is_cross_executor = prior_executor.is_some_and(|prev| prev != executor_config.executor);
-    if is_cross_executor
-        && (executor_config.model_id.is_none() || payload.selected_provider_id.is_none())
-    {
-        return Err(ApiError::from(TeammateError::ExecutorRequiresProvider));
-    }
+    validate_cross_executor_spawn(
+        prior_executor,
+        executor_config.executor,
+        executor_config.model_id.is_some(),
+        payload.selected_provider_id.is_some(),
+    )?;
 
     // Provider: explicit > inherited.
     let provider_uuid: Option<Uuid> = match payload.selected_provider_id {
@@ -339,6 +339,19 @@ async fn spawn_teammate_core(
     Ok(new_session.id)
 }
 
+fn validate_cross_executor_spawn(
+    prior_executor: Option<executors::executors::BaseCodingAgent>,
+    requested_executor: executors::executors::BaseCodingAgent,
+    has_model: bool,
+    has_provider: bool,
+) -> Result<(), TeammateError> {
+    let is_cross_executor = prior_executor.is_some_and(|prev| prev != requested_executor);
+    if is_cross_executor && (!has_model || !has_provider) {
+        return Err(TeammateError::ExecutorRequiresProvider);
+    }
+    Ok(())
+}
+
 fn validate_name(name: &str) -> Result<(), TeammateError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -449,6 +462,54 @@ mod tests {
             TeammateError::WorkspaceArchived.status(),
             StatusCode::CONFLICT
         );
+    }
+
+    #[test]
+    fn rejected_cross_executor_spawn_has_no_session_or_process_side_effects() {
+        use executors::{executors::BaseCodingAgent, profile::ExecutorConfig};
+
+        let request = SpawnTeammateRequest {
+            name: "reviewer".into(),
+            prompt: None,
+            executor_config: Some(ExecutorConfig {
+                executor: BaseCodingAgent::Codex,
+                variant: None,
+                model_id: Some("gpt-5".into()),
+                agent_id: None,
+                reasoning_id: None,
+                permission_policy: None,
+            }),
+            selected_provider_id: None,
+        };
+
+        let mut created_session = false;
+        let mut created_process = false;
+        let result = validate_cross_executor_spawn(
+            Some(BaseCodingAgent::ClaudeCode),
+            request
+                .executor_config
+                .as_ref()
+                .expect("test request has executor config")
+                .executor,
+            request
+                .executor_config
+                .as_ref()
+                .and_then(|config| config.model_id.as_ref())
+                .is_some(),
+            request.selected_provider_id.is_some(),
+        )
+        .and_then(|()| {
+            created_session = true;
+            created_process = true;
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(TeammateError::ExecutorRequiresProvider)
+        ));
+        assert!(!created_session, "rejected request created a session");
+        assert!(!created_process, "rejected request created a process");
     }
 
     fn make_test_workspace(name: &str) -> Workspace {
