@@ -238,6 +238,7 @@
   },
   "turnNavigation": {
     "title": "내 메시지",
+    "count_one": "{{count}}턴",
     "count_other": "{{count}}턴"
   },
   "commandBar": {
@@ -598,10 +599,7 @@
       "prFilterLabel": "PR",
       "prFilterAll": "All",
       "prFilterHasPr": "Has PR",
-      "prFilterNoPr": "No PR",
-      "noProject": "No project",
-      "sortButtonTitle": "Sort 세션",
-      "filterButtonTitle": "Filter 세션"
+      "prFilterNoPr": "No PR"
     },
     "sortAscending": "Ascending",
     "sortDescending": "Descending",

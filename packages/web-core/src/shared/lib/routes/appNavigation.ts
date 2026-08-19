@@ -38,7 +38,14 @@ export type NavigationTransition = {
   replace?: boolean;
 };
 
+export interface RoutineNavigation {
+  goToRoutines(): void;
+  goToRoutine(routineId: string): void;
+  goToNewRoutine(): void;
+}
+
 export interface AppNavigation {
+  routines?: RoutineNavigation;
   resolveFromPath(path: string): AppDestination | null;
   goToRoot(transition?: NavigationTransition): void;
   goToOnboarding(transition?: NavigationTransition): void;

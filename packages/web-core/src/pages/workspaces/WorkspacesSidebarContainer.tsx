@@ -4,7 +4,7 @@ import {
   useDraggingWorkspaceId,
 } from '@/shared/stores/usePillDragStore';
 import { useSessionGridStore } from '@/shared/stores/useSessionGridStore';
-import { useLocation, useNavigate, useParams } from '@tanstack/react-router';
+import { useLocation, useParams } from '@tanstack/react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { workspacesApi } from '@/shared/lib/api';
 import { workspaceSummaryKeys } from '@/shared/hooks/workspaceSummaryKeys';
@@ -12,6 +12,7 @@ import { workspaceRecordKeys } from '@/shared/hooks/useWorkspaceRecord';
 import { useTranslation } from 'react-i18next';
 import { ThemeMode } from 'shared/types';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
+import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { useUserContext } from '@/shared/hooks/useUserContext';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
 import { useScratch } from '@/shared/hooks/useScratch';
@@ -329,7 +330,7 @@ export function WorkspacesSidebarContainer({
   const isMobile = useIsMobile();
   const { hosts: remoteCloudHosts } = useRemoteCloudHostsAppBarModel();
   const { hostId: routeHostId } = useParams({ strict: false });
-  const routerNavigate = useNavigate();
+  const appNavigation = useAppNavigation();
   const location = useLocation();
   const isRoutinesActive = location.pathname.startsWith('/routines');
   const setMobileActiveTab = useUiPreferencesStore((s) => s.setMobileActiveTab);
@@ -653,14 +654,11 @@ export function WorkspacesSidebarContainer({
   }, [navigateToCreate, isMobile, setMobileActiveTab]);
 
   const handleOpenRoutines = useCallback(() => {
-    // web-core is shared between local-web and remote-web; remote-web's
-    // routeTree doesn't include /routines, so we widen `to` to break the
-    // typed-router strict check. Local-web ignores this on its own routeTree.
-    routerNavigate({ to: '/routines' as unknown as '/' });
+    appNavigation.routines?.goToRoutines();
     if (isMobile) {
       setMobileActiveTab('chat');
     }
-  }, [routerNavigate, isMobile, setMobileActiveTab]);
+  }, [appNavigation, isMobile, setMobileActiveTab]);
 
   const setPendingFolderSeed = useFolderSeedStore((s) => s.setPending);
   const handleCreateInFolder = useCallback(
@@ -913,7 +911,7 @@ export function WorkspacesSidebarContainer({
         onSelectWorkspace={handleSelectWorkspace}
         onAddWorkspace={handleAddWorkspace}
         onCreateInFolder={handleCreateInFolder}
-        onOpenRoutines={handleOpenRoutines}
+        onOpenRoutines={appNavigation.routines ? handleOpenRoutines : undefined}
         isRoutinesActive={isRoutinesActive}
         isCreateMode={isCreateMode}
         draftTitle={persistedDraftTitle}

@@ -334,6 +334,15 @@ export function createLocalAppNavigation(): AppNavigation {
   };
 
   const navigation: AppNavigation = {
+    routines: {
+      goToRoutines: () => void router.navigate({ to: '/routines' }),
+      goToRoutine: (routineId) =>
+        void router.navigate({
+          to: '/routines/$routineId',
+          params: { routineId },
+        }),
+      goToNewRoutine: () => void router.navigate({ to: '/routines/new' }),
+    },
     resolveFromPath: (path) => resolveLocalDestinationFromPath(path),
     goToRoot: (transition) => navigateTo({ kind: 'root' }, transition),
     goToOnboarding: (transition) =>

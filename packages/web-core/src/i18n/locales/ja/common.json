@@ -238,6 +238,7 @@
   },
   "turnNavigation": {
     "title": "あなたのメッセージ",
+    "count_one": "{{count}} ターン",
     "count_other": "{{count}} ターン"
   },
   "commandBar": {
@@ -598,10 +599,7 @@
       "prFilterLabel": "PR",
       "prFilterAll": "All",
       "prFilterHasPr": "Has PR",
-      "prFilterNoPr": "No PR",
-      "noProject": "No project",
-      "sortButtonTitle": "Sort セッション",
-      "filterButtonTitle": "Filter セッション"
+      "prFilterNoPr": "No PR"
     },
     "sortAscending": "Ascending",
     "sortDescending": "Descending",

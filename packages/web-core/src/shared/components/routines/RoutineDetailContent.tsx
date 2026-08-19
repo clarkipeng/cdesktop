@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from '@tanstack/react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowClockwiseIcon,
@@ -23,6 +22,10 @@ import { IconButton } from '@vibe/ui/components/IconButton';
 import { Switch } from '@vibe/ui/components/Switch';
 import { ConfirmDialog } from '@/shared/dialogs/shared/ConfirmDialog';
 import { useSessionGridStore } from '@/shared/stores/useSessionGridStore';
+import {
+  useAppNavigation,
+  useRoutineNavigation,
+} from '@/shared/hooks/useAppNavigation';
 import { formatScheduleSummary } from './scheduleFormat';
 import { RoutineFormModal } from './RoutineFormModal';
 import type { RoutineFormValues } from './RoutineForm';
@@ -71,7 +74,8 @@ interface RoutineDetailContentProps {
  */
 export function RoutineDetailContent({ routineId }: RoutineDetailContentProps) {
   const { t } = useTranslation('common');
-  const navigate = useNavigate();
+  const appNavigation = useAppNavigation();
+  const routineNavigation = useRoutineNavigation();
   const queryClient = useQueryClient();
   const [isEditOpen, setIsEditOpen] = useState(false);
 
@@ -187,7 +191,7 @@ export function RoutineDetailContent({ routineId }: RoutineDetailContentProps) {
     mutationFn: () => routinesApi.delete(routineId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['routines'] });
-      navigate({ to: '/routines' });
+      routineNavigation.goToRoutines();
     },
   });
 
@@ -262,7 +266,7 @@ export function RoutineDetailContent({ routineId }: RoutineDetailContentProps) {
         <div className="flex items-center gap-half text-base text-low min-w-0">
           <button
             type="button"
-            onClick={() => navigate({ to: '/routines' })}
+            onClick={routineNavigation.goToRoutines}
             className="flex items-center gap-half hover:text-normal transition-colors"
           >
             <LightningIcon className="size-icon-xs" />
@@ -392,10 +396,7 @@ export function RoutineDetailContent({ routineId }: RoutineDetailContentProps) {
                             // cmd/ctrl-click → navigate away (full-page);
                             // plain click → open in cell 1 next to routines.
                             if (event.metaKey || event.ctrlKey) {
-                              navigate({
-                                to: '/workspaces/$workspaceId',
-                                params: { workspaceId: run.workspace_id },
-                              });
+                              appNavigation.goToWorkspace(run.workspace_id);
                               return;
                             }
                             openWorkspaceInSecondCell(run.workspace_id);
