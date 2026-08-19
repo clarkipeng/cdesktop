@@ -333,6 +333,7 @@ export function WorkspacesSidebarContainer({
   const appNavigation = useAppNavigation();
   const location = useLocation();
   const isRoutinesActive = location.pathname.startsWith('/routines');
+  const isAgentsActive = location.pathname.startsWith('/agents');
   const setMobileActiveTab = useUiPreferencesStore((s) => s.setMobileActiveTab);
   const searchQuery = useUiPreferencesStore((s) => s.sidebarSearchQuery);
   const [showArchive, setShowArchive] = usePersistedExpanded(
@@ -660,6 +661,13 @@ export function WorkspacesSidebarContainer({
     }
   }, [appNavigation, isMobile, setMobileActiveTab]);
 
+  const handleOpenAgents = useCallback(() => {
+    appNavigation.goToAgents();
+    if (isMobile) {
+      setMobileActiveTab('chat');
+    }
+  }, [appNavigation, isMobile, setMobileActiveTab]);
+
   const setPendingFolderSeed = useFolderSeedStore((s) => s.setPending);
   const handleCreateInFolder = useCallback(
     (repoId: string) => {
@@ -775,7 +783,7 @@ export function WorkspacesSidebarContainer({
   // When the anchor cell is hosting a slot (create-mode composer or routines
   // pages) instead of its workspace, exclude the anchor cell's workspace from
   // the active/focused pill sets — the workspace isn't on screen.
-  const anchorSlotActive = isCreateMode || isRoutinesActive;
+  const anchorSlotActive = isCreateMode || isRoutinesActive || isAgentsActive;
   const openInGridWorkspaceIds = useMemo(() => {
     const anchorId = grid.groups[0]?.cells[0]?.id;
     return new Set(
@@ -913,6 +921,8 @@ export function WorkspacesSidebarContainer({
         onCreateInFolder={handleCreateInFolder}
         onOpenRoutines={appNavigation.routines ? handleOpenRoutines : undefined}
         isRoutinesActive={isRoutinesActive}
+        onOpenAgents={handleOpenAgents}
+        isAgentsActive={isAgentsActive}
         isCreateMode={isCreateMode}
         draftTitle={persistedDraftTitle}
         onSelectCreate={navigateToCreate}
