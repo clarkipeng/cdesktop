@@ -300,149 +300,149 @@ export function RoutineDetailContent({ routineId }: RoutineDetailContentProps) {
       {/* Centered body */}
       <div className="flex justify-center">
         <div className="w-chat max-w-full px-[35px] pt-[6vh] pb-[6vh] flex flex-col gap-double">
-        {/* Two-column body */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-double">
-          {/* Left column */}
-          <div className="flex flex-col gap-double">
-            <section>
-              <h2 className="text-sm uppercase tracking-wide text-low mb-half">
-                {t('routines.sections.description')}
-              </h2>
-              <p className="text-base text-normal whitespace-pre-wrap">
-                {routine.description}
-              </p>
-            </section>
-
-            <section>
-              <h2 className="text-sm uppercase tracking-wide text-low mb-half">
-                {t('routines.sections.status')}
-              </h2>
-              <div className="flex items-center gap-base">
-                <Switch
-                  checked={routine.enabled}
-                  onCheckedChange={handleToggleEnabled}
-                  disabled={updateMutation.isPending}
-                />
-                <span className="text-base text-normal">
-                  {routine.enabled
-                    ? t('routines.enabled')
-                    : t('routines.disabled')}
-                </span>
-              </div>
-              {routine.enabled && (
-                <p className="mt-half text-base text-low">
-                  {t('routines.nextRun', { when: nextRunStr })}
-                </p>
-              )}
-            </section>
-
-            <section>
-              <h2 className="text-sm uppercase tracking-wide text-low mb-half">
-                {t('routines.sections.folder')}
-              </h2>
-              <p className="text-base text-normal">{folderLabel}</p>
-            </section>
-
-            <section>
-              <h2 className="text-sm uppercase tracking-wide text-low mb-half">
-                {t('routines.sections.repeats')}
-              </h2>
-              <p className="text-base text-normal">
-                {formatScheduleSummary(routine, t)}
-              </p>
-            </section>
-          </div>
-
-          {/* Right column */}
-          <div className="flex flex-col gap-double">
-            <section>
-              <h2 className="text-sm uppercase tracking-wide text-low mb-half">
-                {t('routines.sections.instructions')}
-              </h2>
-              <pre className="rounded-sm bg-secondary p-base text-base text-normal whitespace-pre-wrap font-sans">
-                {routine.instructions}
-              </pre>
-            </section>
-
-            <section>
-              <div className="flex items-center justify-between mb-half">
-                <h2 className="text-sm uppercase tracking-wide text-low">
-                  {t('routines.history.title')}
+          {/* Two-column body */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-double">
+            {/* Left column */}
+            <div className="flex flex-col gap-double">
+              <section>
+                <h2 className="text-sm uppercase tracking-wide text-low mb-half">
+                  {t('routines.sections.description')}
                 </h2>
-                {runNowMutation.isPending && (
-                  <ArrowClockwiseIcon
-                    className="size-icon-xs text-low animate-spin"
-                    weight="bold"
-                  />
-                )}
-              </div>
-              {runs.length === 0 ? (
-                <p className="text-base text-low">
-                  {t('routines.history.empty')}
+                <p className="text-base text-normal whitespace-pre-wrap">
+                  {routine.description}
                 </p>
-              ) : (
-                <ul className="flex flex-col gap-half">
-                  {runs.map((run) => (
-                    <li key={run.id}>
-                      <button
-                        type="button"
-                        disabled={!run.workspace_id}
-                        onClick={(event) => {
-                          if (!run.workspace_id) return;
-                          // cmd/ctrl-click → navigate away (full-page);
-                          // plain click → open in cell 1 next to routines.
-                          if (event.metaKey || event.ctrlKey) {
-                            navigate({
-                              to: '/workspaces/$workspaceId',
-                              params: { workspaceId: run.workspace_id },
-                            });
-                            return;
-                          }
-                          openWorkspaceInSecondCell(run.workspace_id);
-                        }}
-                        className="w-full flex items-center justify-between gap-base rounded-sm bg-secondary px-base py-half text-left hover:bg-panel transition-colors disabled:cursor-default disabled:hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-brand"
-                      >
-                        <div className="flex flex-col min-w-0">
-                          <span className="text-base text-normal truncate">
-                            {formatTimestamp(run.scheduled_at)}
-                          </span>
-                          {run.skip_reason && (
-                            <span className="text-xs text-low">
-                              {t(
-                                `routines.skipReason.${
-                                  run.skip_reason === 'app_offline'
-                                    ? 'appOffline'
-                                    : run.skip_reason === 'prev_still_running'
-                                      ? 'prevStillRunning'
-                                      : 'appOffline'
-                                }`
-                              )}
-                            </span>
-                          )}
-                        </div>
-                        <span
-                          className={`text-xs px-base py-[2px] rounded-sm ${statusBadgeClass(
-                            run.status
-                          )}`}
-                        >
-                          {statusLabel(run.status, t)}
-                        </span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </section>
-          </div>
-        </div>
+              </section>
 
-        <RoutineFormModal
-          open={isEditOpen}
-          onOpenChange={setIsEditOpen}
-          initial={routine}
-          submitting={updateMutation.isPending}
-          onSubmit={handleEditSubmit}
-        />
+              <section>
+                <h2 className="text-sm uppercase tracking-wide text-low mb-half">
+                  {t('routines.sections.status')}
+                </h2>
+                <div className="flex items-center gap-base">
+                  <Switch
+                    checked={routine.enabled}
+                    onCheckedChange={handleToggleEnabled}
+                    disabled={updateMutation.isPending}
+                  />
+                  <span className="text-base text-normal">
+                    {routine.enabled
+                      ? t('routines.enabled')
+                      : t('routines.disabled')}
+                  </span>
+                </div>
+                {routine.enabled && (
+                  <p className="mt-half text-base text-low">
+                    {t('routines.nextRun', { when: nextRunStr })}
+                  </p>
+                )}
+              </section>
+
+              <section>
+                <h2 className="text-sm uppercase tracking-wide text-low mb-half">
+                  {t('routines.sections.folder')}
+                </h2>
+                <p className="text-base text-normal">{folderLabel}</p>
+              </section>
+
+              <section>
+                <h2 className="text-sm uppercase tracking-wide text-low mb-half">
+                  {t('routines.sections.repeats')}
+                </h2>
+                <p className="text-base text-normal">
+                  {formatScheduleSummary(routine, t)}
+                </p>
+              </section>
+            </div>
+
+            {/* Right column */}
+            <div className="flex flex-col gap-double">
+              <section>
+                <h2 className="text-sm uppercase tracking-wide text-low mb-half">
+                  {t('routines.sections.instructions')}
+                </h2>
+                <pre className="rounded-sm bg-secondary p-base text-base text-normal whitespace-pre-wrap font-sans">
+                  {routine.instructions}
+                </pre>
+              </section>
+
+              <section>
+                <div className="flex items-center justify-between mb-half">
+                  <h2 className="text-sm uppercase tracking-wide text-low">
+                    {t('routines.history.title')}
+                  </h2>
+                  {runNowMutation.isPending && (
+                    <ArrowClockwiseIcon
+                      className="size-icon-xs text-low animate-spin"
+                      weight="bold"
+                    />
+                  )}
+                </div>
+                {runs.length === 0 ? (
+                  <p className="text-base text-low">
+                    {t('routines.history.empty')}
+                  </p>
+                ) : (
+                  <ul className="flex flex-col gap-half">
+                    {runs.map((run) => (
+                      <li key={run.id}>
+                        <button
+                          type="button"
+                          disabled={!run.workspace_id}
+                          onClick={(event) => {
+                            if (!run.workspace_id) return;
+                            // cmd/ctrl-click → navigate away (full-page);
+                            // plain click → open in cell 1 next to routines.
+                            if (event.metaKey || event.ctrlKey) {
+                              navigate({
+                                to: '/workspaces/$workspaceId',
+                                params: { workspaceId: run.workspace_id },
+                              });
+                              return;
+                            }
+                            openWorkspaceInSecondCell(run.workspace_id);
+                          }}
+                          className="w-full flex items-center justify-between gap-base rounded-sm bg-secondary px-base py-half text-left hover:bg-panel transition-colors disabled:cursor-default disabled:hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-brand"
+                        >
+                          <div className="flex flex-col min-w-0">
+                            <span className="text-base text-normal truncate">
+                              {formatTimestamp(run.scheduled_at)}
+                            </span>
+                            {run.skip_reason && (
+                              <span className="text-xs text-low">
+                                {t(
+                                  `routines.skipReason.${
+                                    run.skip_reason === 'app_offline'
+                                      ? 'appOffline'
+                                      : run.skip_reason === 'prev_still_running'
+                                        ? 'prevStillRunning'
+                                        : 'appOffline'
+                                  }`
+                                )}
+                              </span>
+                            )}
+                          </div>
+                          <span
+                            className={`text-xs px-base py-[2px] rounded-sm ${statusBadgeClass(
+                              run.status
+                            )}`}
+                          >
+                            {statusLabel(run.status, t)}
+                          </span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+            </div>
+          </div>
+
+          <RoutineFormModal
+            open={isEditOpen}
+            onOpenChange={setIsEditOpen}
+            initial={routine}
+            submitting={updateMutation.isPending}
+            onSubmit={handleEditSubmit}
+          />
         </div>
       </div>
     </div>

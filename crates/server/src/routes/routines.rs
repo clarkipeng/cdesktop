@@ -354,8 +354,7 @@ pub(crate) async fn spawn_routine_run(
         .map(Uuid::parse_str)
         .transpose()
         .map_err(|_| ApiError::BadRequest("Routine has invalid provider id".into()))?;
-    let injection =
-        build_injection_for_provider(pool, provider_uuid, &mut executor_config).await?;
+    let injection = build_injection_for_provider(pool, provider_uuid, &mut executor_config).await?;
     let selected_model_id = executor_config.model_id.clone().or(selected_model_id);
 
     let workspace =

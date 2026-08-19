@@ -353,9 +353,7 @@ function RoutinesNavRow({
       )}
     >
       <LightningIcon className="size-icon-sm" />
-      <span>
-        {t('routines.sidebar.nav', { defaultValue: 'Routines' })}
-      </span>
+      <span>{t('routines.sidebar.nav', { defaultValue: 'Routines' })}</span>
     </button>
   );
 }

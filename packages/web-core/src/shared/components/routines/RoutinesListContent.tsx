@@ -1,7 +1,11 @@
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
-import { LightningIcon, PauseCircleIcon, PlusIcon } from '@phosphor-icons/react';
+import {
+  LightningIcon,
+  PauseCircleIcon,
+  PlusIcon,
+} from '@phosphor-icons/react';
 import type { Routine } from 'shared/types';
 import { routinesApi } from '@/shared/lib/api';
 import { Button } from '@vibe/ui/components/Button';
@@ -40,7 +44,10 @@ export function RoutinesListContent() {
             </h1>
             <p className="text-base text-low">{t('routines.subtitle')}</p>
           </div>
-          <Button type="button" onClick={() => navigate({ to: '/routines/new' })}>
+          <Button
+            type="button"
+            onClick={() => navigate({ to: '/routines/new' })}
+          >
             <PlusIcon className="size-icon-xs mr-half" weight="bold" />
             {t('routines.newButton')}
           </Button>
@@ -89,7 +96,10 @@ export function RoutinesListContent() {
                       </div>
                       {!routine.enabled && (
                         <div className="shrink-0 self-center flex items-center gap-half text-sm text-low">
-                          <PauseCircleIcon className="size-icon-xs" weight="bold" />
+                          <PauseCircleIcon
+                            className="size-icon-xs"
+                            weight="bold"
+                          />
                           {t('routines.disabled')}
                         </div>
                       )}
