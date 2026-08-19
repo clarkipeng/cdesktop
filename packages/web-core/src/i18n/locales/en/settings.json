@@ -25,6 +25,8 @@
         "reposDesc": "Folder scripts and configuration",
         "agents": "Agents",
         "agentsDesc": "Coding agent configurations",
+        "execution-routing": "Execution Routing",
+        "execution-routingDesc": "Subscription-first route policy",
         "providers": "Providers",
         "providersDesc": "AI provider routing and model selection",
         "mcp": "MCP Servers",

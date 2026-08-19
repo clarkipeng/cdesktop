@@ -6,6 +6,7 @@ import {
   SpinnerIcon,
   CaretDownIcon,
   LightningIcon,
+  RobotIcon,
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../lib/cn';
@@ -157,6 +158,10 @@ export interface WorkspacesSidebarProps {
   onOpenRoutines?: () => void;
   /** Whether the Routines nav row should render as active. */
   isRoutinesActive?: boolean;
+  /** Open the Agents page (rendered as a top-level nav row). */
+  onOpenAgents?: () => void;
+  /** Whether the Agents nav row should render as active. */
+  isAgentsActive?: boolean;
 }
 
 export interface WorkspacesSidebarReopenTagProps {
@@ -354,6 +359,29 @@ function RoutinesNavRow({
     >
       <LightningIcon className="size-icon-sm" />
       <span>{t('routines.sidebar.nav', { defaultValue: 'Routines' })}</span>
+    </button>
+  );
+}
+
+function AgentsNavRow({
+  onOpenAgents,
+  isActive,
+}: {
+  onOpenAgents?: () => void;
+  isActive?: boolean;
+}) {
+  const { t } = useTranslation('common');
+  return (
+    <button
+      type="button"
+      onClick={onOpenAgents}
+      className={cn(
+        'w-full flex items-center gap-base px-double py-half text-base text-normal hover:bg-tertiary/60 transition-colors',
+        isActive && 'bg-tertiary/60'
+      )}
+    >
+      <RobotIcon className="size-icon-sm" />
+      <span>{t('agents.sidebar.nav', { defaultValue: 'Agents' })}</span>
     </button>
   );
 }
@@ -611,6 +639,8 @@ export function WorkspacesSidebar({
   bottomActions,
   onOpenRoutines,
   isRoutinesActive,
+  onOpenAgents,
+  isAgentsActive,
 }: WorkspacesSidebarProps) {
   const { t } = useTranslation(['tasks', 'common']);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -699,6 +729,11 @@ export function WorkspacesSidebar({
           onOpenRoutines={onOpenRoutines}
           isActive={isRoutinesActive}
         />
+      )}
+
+      {/* Agents nav row */}
+      {!isLoading && !showArchive && onOpenAgents && (
+        <AgentsNavRow onOpenAgents={onOpenAgents} isActive={isAgentsActive} />
       )}
 
       {activeRemoteHost && (

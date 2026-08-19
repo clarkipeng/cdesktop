@@ -109,6 +109,10 @@ import {
   UpdateRoutine,
   RunNowResponse,
 } from 'shared/types';
+import type {
+  MeteredApproval,
+  MeteredApprovalResponseRequest,
+} from './execution-routing/apiTypes';
 import type { Project as RemoteProject } from 'shared/remote-types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
@@ -1271,6 +1275,30 @@ export const approvalsApi = {
     });
 
     return handleApiResponse<ApprovalStatus>(res);
+  },
+};
+
+// Durable metered-fallback approvals. Keep this separate from tool approvals:
+// the server persists these rows and resolves each decision exactly once.
+export const meteredApprovalsApi = {
+  listPending: async (): Promise<MeteredApproval[]> => {
+    const response = await makeRequest('/api/metered-approvals');
+    return handleApiResponse<MeteredApproval[]>(response);
+  },
+
+  respond: async (
+    approvalId: string,
+    payload: MeteredApprovalResponseRequest
+  ): Promise<MeteredApproval> => {
+    const response = await makeRequest(
+      `/api/metered-approvals/${approvalId}/respond`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+    return handleApiResponse<MeteredApproval>(response);
   },
 };
 
