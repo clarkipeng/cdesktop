@@ -51,11 +51,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::io::ReaderStream;
-use utils::{
-    log_msg::LogMsg,
-    msg_store::MsgStore,
-    text::{git_branch_id, short_uuid, truncate_to_char_boundary},
-};
+use utils::{log_msg::LogMsg, msg_store::MsgStore, text::truncate_to_char_boundary};
 use uuid::Uuid;
 use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 
@@ -260,10 +256,9 @@ impl LocalContainerService {
         if !workspace.use_worktree {
             return;
         }
-        let Some(container_ref) = &workspace.container_ref else {
+        let Some(workspace_dir) = WorkspaceManager::workspace_dir_for(workspace) else {
             return;
         };
-        let workspace_dir = PathBuf::from(container_ref);
 
         let repositories = WorkspaceRepo::find_repos_for_workspace(&self.db.pool, workspace.id)
             .await
@@ -764,11 +759,6 @@ impl LocalContainerService {
         rx
     }
 
-    fn dir_name_from_workspace(workspace_id: &Uuid, task_title: &str) -> String {
-        let task_title_id = git_branch_id(task_title);
-        format!("{}-{}", short_uuid(workspace_id), task_title_id)
-    }
-
     async fn track_child_msgs_in_store(
         &self,
         id: Uuid,
@@ -1062,8 +1052,7 @@ impl ContainerService for LocalContainerService {
         }
 
         let label = workspace.name.as_deref().unwrap_or("workspace");
-        let workspace_dir_name =
-            LocalContainerService::dir_name_from_workspace(&workspace.id, label);
+        let workspace_dir_name = WorkspaceManager::dir_name_from_workspace(&workspace.id, label);
         let workspace_dir = WorkspaceManager::get_workspace_base_dir().join(&workspace_dir_name);
 
         let (repositories, workspace_inputs) = self.workspace_repo_inputs(workspace.id).await?;
@@ -1121,7 +1110,7 @@ impl ContainerService for LocalContainerService {
         } else {
             let label = workspace.name.as_deref().unwrap_or("workspace");
             let workspace_dir_name =
-                LocalContainerService::dir_name_from_workspace(&workspace.id, label);
+                WorkspaceManager::dir_name_from_workspace(&workspace.id, label);
             WorkspaceManager::get_workspace_base_dir().join(&workspace_dir_name)
         };
 
