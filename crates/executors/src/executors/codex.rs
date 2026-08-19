@@ -77,6 +77,7 @@ use crate::{
     },
     logs::utils::patch,
     model_selector::{ModelInfo, ModelSelectorConfig, PermissionPolicy, ReasoningOption},
+    outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
     profile::ExecutorConfig,
     stdout_dup::create_stdout_pipe_writer,
 };
@@ -731,7 +732,10 @@ impl Codex {
                             .await
                             .ok();
                         exit_signal_tx
-                            .send_exit_signal(ExecutorExitResult::Failure)
+                            .send_exit_signal(ExecutorExitResult::Failure(Some(
+                                NormalizedExecutionOutcome::new(ExecutionOutcomeClass::AuthExpired)
+                                    .with_provider_code("auth_required"),
+                            )))
                             .await;
                         return;
                     }
@@ -744,7 +748,7 @@ impl Codex {
                     }
                 }
                 exit_signal_tx
-                    .send_exit_signal(ExecutorExitResult::Failure)
+                    .send_exit_signal(ExecutorExitResult::Failure(None))
                     .await;
             }
         });

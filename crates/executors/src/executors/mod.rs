@@ -308,12 +308,14 @@ pub trait StandardCodingAgentExecutor {
 }
 
 /// Result communicated through the exit signal
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ExecutorExitResult {
     /// Process completed successfully (exit code 0)
     Success,
-    /// Process should be marked as failed (non-zero exit)
-    Failure,
+    /// Process should be marked as failed (non-zero exit). Carries the
+    /// normalized outcome when the executor observed a stable provider
+    /// signal; `None` means unclassified.
+    Failure(Option<crate::outcome::NormalizedExecutionOutcome>),
 }
 
 /// Optional exit notification from an executor.

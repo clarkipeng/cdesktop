@@ -213,7 +213,7 @@ impl Opencode {
                     let _ = log_writer
                         .log_error(format!("OpenCode startup error: {err}"))
                         .await;
-                    let _ = exit_signal_tx.send(ExecutorExitResult::Failure);
+                    let _ = exit_signal_tx.send(ExecutorExitResult::Failure(None));
                     return;
                 }
             };
@@ -247,7 +247,7 @@ impl Opencode {
                     let _ = log_writer
                         .log_error(format!("OpenCode executor error: {err}"))
                         .await;
-                    ExecutorExitResult::Failure
+                    ExecutorExitResult::Failure(None)
                 }
             };
             let _ = exit_signal_tx.send(exit_result);
