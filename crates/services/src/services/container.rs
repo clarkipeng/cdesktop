@@ -17,7 +17,7 @@ use db::{
         execution_process_repo_state::{
             CreateExecutionProcessRepoState, ExecutionProcessRepoState,
         },
-        provider::{AgentInjection, Provider},
+        metered_approval::{MeteredApproval, MeteredApprovalPolicy, MeteredGateDecision},
         repo::Repo,
         routine_run::RoutineRun,
         session::{CreateSession, Session, SessionError},
@@ -64,7 +64,7 @@ use utils::{
 use uuid::Uuid;
 use worktree_manager::WorktreeError;
 
-use crate::services::{execution_process, notification::NotificationService};
+use crate::services::{auth_binding, execution_process, notification::NotificationService};
 pub type ContainerRef = String;
 
 fn max_running_agents() -> i64 {
@@ -400,22 +400,67 @@ pub trait ContainerService {
             return Ok(None);
         }
 
+        // Metered approval gate (plan §12): consult the durable policy for
+        // the head of the queue before claiming. `ask` creates/awaits its
+        // durable approval, `never` blocks with a routes_exhausted record —
+        // in both held cases nothing is claimed and no attempt is spent.
+        let pending = SessionCommand::pending(pool, session_id).await?;
+        if let Some(head) = pending.first() {
+            match MeteredApproval::gate(pool, head).await? {
+                MeteredGateDecision::Proceed => {}
+                MeteredGateDecision::AwaitApproval | MeteredGateDecision::Blocked => {
+                    return Ok(None);
+                }
+            }
+        }
+
         let execution_id = Uuid::new_v4();
         let commands = SessionCommand::claim_pending(pool, session_id, execution_id).await?;
         let Some(first) = commands.first() else {
             return Ok(None);
         };
+        // The queue can change between the gate peek and the claim (e.g. a
+        // replace command). Re-verify the claimed head and release the claim
+        // if its gate is not open, so a metered command can never launch
+        // without its durable authorization.
+        match MeteredApproval::gate(pool, first).await? {
+            MeteredGateDecision::Proceed => {}
+            MeteredGateDecision::AwaitApproval | MeteredGateDecision::Blocked => {
+                SessionCommand::release_execution(pool, execution_id).await?;
+                return Ok(None);
+            }
+        }
+        // Metered bookkeeping for the winning claim: consume the approval
+        // (allow-once) or durably record the auto-start notification.
+        if let Some(metered) = &first.config.0.metered {
+            match metered.policy {
+                MeteredApprovalPolicy::Ask => {
+                    MeteredApproval::consume_approval(pool, first.id, execution_id).await?;
+                }
+                MeteredApprovalPolicy::Auto => {
+                    MeteredApproval::record_auto_start(
+                        pool,
+                        first.id,
+                        execution_id,
+                        metered.account_alias.as_deref(),
+                    )
+                    .await?;
+                }
+                MeteredApprovalPolicy::Never => {
+                    SessionCommand::release_execution(pool, execution_id).await?;
+                    return Ok(None);
+                }
+            }
+        }
         let first_config = first.config.clone();
         let commands = commands
             .into_iter()
             .take_while(|command| command.config == first_config)
             .collect::<Vec<_>>();
         let first = &commands[0];
-        let SessionCommandConfig {
-            mut executor_config,
-            selected_provider_id,
-            auth_binding_id: _,
-        } = first.config.0.clone();
+        let command_config = first.config.0.clone();
+        let mut executor_config = command_config.executor_config.clone();
+        let selected_provider_id = command_config.selected_provider_id;
         let prompt = commands
             .iter()
             .map(|command| command.body.as_str())
@@ -446,24 +491,14 @@ pub trait ContainerService {
                 Session::update_executor(pool, session.id, &profile.executor.to_string()).await?;
             }
 
-            let provider = if let Some(provider_id) = selected_provider_id {
-                let provider = Provider::find_by_id(pool, provider_id)
+            // Resolve the auth binding to credential material immediately
+            // before launch. The resolved injection stays in memory only:
+            // the persisted action is stripped via `without_provider_bindings`
+            // and the runtime fields are non-serializable by construction.
+            let resolved =
+                auth_binding::resolve_for_launch(pool, &command_config, &mut executor_config)
                     .await
                     .map_err(|error| ContainerError::Other(error.into()))?;
-                if !provider.enabled {
-                    return Err(ContainerError::Other(anyhow!(
-                        "Provider '{}' is disabled",
-                        provider.name
-                    )));
-                }
-                if let Some(model) = executor_config.model_id.as_deref() {
-                    executor_config.model_id =
-                        Some(provider.prefix_opencode_model_id(executor_config.executor, model));
-                }
-                Some(provider)
-            } else {
-                None
-            };
 
             let working_dir = session
                 .agent_working_dir
@@ -488,16 +523,7 @@ pub trait ContainerService {
                     working_dir,
                 }),
             };
-            let injection = if let Some(provider) = provider {
-                provider
-                    .build_agent_injection(
-                        executor_config.executor,
-                        executor_config.model_id.as_deref().unwrap_or(""),
-                    )
-                    .map_err(|error| ContainerError::Other(error.into()))?
-            } else {
-                AgentInjection::default()
-            };
+            let injection = resolved.injection;
             let mut action = ExecutorAction::new(action_type, None);
             if let Some(env) = injection.env {
                 action = action.with_provider_env(env);
@@ -1501,6 +1527,7 @@ pub trait ContainerService {
                             .selected_provider_id
                             .as_deref()
                             .and_then(|id| id.parse().ok()),
+                        metered: None,
                     },
                 )
                 .await

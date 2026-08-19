@@ -6,6 +6,7 @@ pub mod execution_process_repo_state;
 pub mod execution_process_stop_operation;
 pub mod file;
 pub mod merge;
+pub mod metered_approval;
 pub mod project;
 pub mod provider;
 pub mod pull_request;

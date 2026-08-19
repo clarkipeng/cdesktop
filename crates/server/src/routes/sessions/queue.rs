@@ -47,6 +47,7 @@ async fn queue_message(
                 executor_config: data.executor_config,
                 selected_provider_id: None,
                 auth_binding_id: None,
+                metered: None,
             },
         },
     )

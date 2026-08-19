@@ -371,7 +371,13 @@ selected_provider_id?: string, dedupe_key?: string, intent?: SessionCommandInten
  * Persist the command without claiming it. A recovery controller can
  * dispatch it later after its provider-reachability gate passes.
  */
-defer_dispatch?: boolean, };
+defer_dispatch?: boolean, 
+/**
+ * Declares this command as metered execution with the operator's
+ * `auto`/`ask`/`never` fallback policy. Enforced durably by the
+ * dispatcher gate before any claim.
+ */
+metered?: MeteredExecution, };
 
 export type SpawnTeammateRequest = { 
 /**
@@ -650,11 +656,50 @@ export type QueueStatus = { "status": "empty" } | { "status": "queued", message:
 
 export type SessionCommand = { id: string, session_id: string, dedupe_key: string | null, intent: SessionCommandIntent, body: string, config: SessionCommandConfig, state: SessionCommandState, execution_process_id: string | null, attempt_number: bigint, created_at: string, finished_at: string | null, };
 
-export type SessionCommandConfig = { executor_config: ExecutorConfig, selected_provider_id?: string, auth_binding_id?: string, };
+export type SessionCommandConfig = { executor_config: ExecutorConfig, selected_provider_id?: string, auth_binding_id?: string, 
+/**
+ * Declares this command as metered execution and carries the operator's
+ * `auto`/`ask`/`never` fallback policy; `None` means unmetered. Enforced
+ * durably by the dispatcher gate (`MeteredApproval::gate`).
+ */
+metered?: MeteredExecution, };
 
 export enum SessionCommandIntent { continue = "continue", replace = "replace" }
 
 export enum SessionCommandState { pending = "pending", claimed = "claimed", done = "done", failed = "failed", cancelled = "cancelled" }
+
+export type MeteredApproval = { id: string, session_command_id: string, policy: MeteredApprovalPolicy, state: MeteredApprovalState, account_alias: string | null, reason: string | null, 
+/**
+ * Set when an approval (or auto start) was consumed by a claimed
+ * attempt — the allow-once linkage.
+ */
+execution_process_id: string | null, created_at: string, resolved_at: string | null, };
+
+export enum MeteredApprovalPolicy { auto = "auto", ask = "ask", never = "never" }
+
+export enum MeteredApprovalState { pending = "pending", approved = "approved", denied = "denied", auto_started = "auto_started", blocked = "blocked" }
+
+export type MeteredExecution = { policy: MeteredApprovalPolicy, account_alias?: string, };
+
+export type ExecutionProcessOutcome = { execution_process_id: string, outcome: NormalizedExecutionOutcome, created_at: string, };
+
+export enum ExecutionOutcomeClass { quota_exhausted = "quota_exhausted", auth_expired = "auth_expired", auth_invalid = "auth_invalid", model_unavailable = "model_unavailable", rate_limited_transient = "rate_limited_transient", network_transient = "network_transient", user_stopped = "user_stopped", task_failed = "task_failed", unknown = "unknown" }
+
+export enum OutcomeBindingScope { account = "account", route = "route", task = "task" }
+
+export type NormalizedExecutionOutcome = { class: ExecutionOutcomeClass, 
+/**
+ * Stable provider error code (e.g. `usage_limit_exceeded`), never raw
+ * provider message text.
+ */
+provider_code?: string, retry_after_seconds?: bigint, resets_at?: string, binding_scope?: OutcomeBindingScope, 
+/**
+ * Fixed, cdesktop-owned description. Never contains provider text,
+ * credentials, headers, or account identifiers.
+ */
+safe_message: string, };
+
+export type MeteredApprovalResponseRequest = { approved: boolean, reason?: string, };
 
 export type ConflictOp = "rebase" | "merge" | "cherry_pick" | "revert";
 

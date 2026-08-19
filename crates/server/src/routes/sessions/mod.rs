@@ -12,6 +12,7 @@ use axum::{
 use db::models::{
     coding_agent_turn::{CodingAgentTurn, TurnSelection},
     execution_process::{ExecutionProcess, ExecutionProcessRunReason},
+    metered_approval::MeteredExecution,
     provider::Provider,
     requests::UpdateSession,
     scratch::{Scratch, ScratchType},
@@ -162,6 +163,12 @@ pub struct CreateFollowUpAttempt {
     #[serde(default)]
     #[ts(optional)]
     pub defer_dispatch: Option<bool>,
+    /// Declares this command as metered execution with the operator's
+    /// `auto`/`ask`/`never` fallback policy. Enforced durably by the
+    /// dispatcher gate before any claim.
+    #[serde(default)]
+    #[ts(optional)]
+    pub metered: Option<MeteredExecution>,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -333,6 +340,7 @@ pub async fn follow_up(
                 executor_config,
                 selected_provider_id: payload.selected_provider_id,
                 auth_binding_id: payload.selected_provider_id,
+                metered: payload.metered,
             },
         },
     )
