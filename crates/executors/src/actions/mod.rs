@@ -36,8 +36,8 @@ pub enum ExecutorActionType {
 pub struct ExecutorAction {
     pub typ: ExecutorActionType,
     pub next_action: Option<Box<ExecutorAction>>,
-    /// Provider-resolved env vars to inject at spawn. Stored in DB so
-    /// next-action chains and queued messages preserve the provider selection.
+    /// Provider-resolved env vars to inject at spawn. These are runtime-only:
+    /// durable records must keep only opaque provider/model identifiers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(skip)]
     pub provider_env: Option<HashMap<String, String>>,
@@ -90,6 +90,18 @@ impl ExecutorAction {
         self.selected_model_id = model_id;
         self
     }
+
+    pub fn without_provider_bindings(&self) -> Self {
+        let mut action = self.clone();
+        action.provider_env = None;
+        action.provider_codex = None;
+        action.next_action = action
+            .next_action
+            .as_ref()
+            .map(|next| Box::new(next.without_provider_bindings()));
+        action
+    }
+
     pub fn append_action(mut self, action: ExecutorAction) -> Self {
         if let Some(next) = self.next_action {
             self.next_action = Some(Box::new(next.append_action(action)));
@@ -128,6 +140,73 @@ pub trait Executable {
         approvals: Arc<dyn ExecutorApprovalService>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::{
+        actions::{
+            coding_agent_initial::CodingAgentInitialRequest, script::ScriptContext,
+            script::ScriptRequest, script::ScriptRequestLanguage,
+        },
+        env::CodexProviderInjection,
+        profile::ExecutorConfig,
+    };
+
+    use super::*;
+
+    #[test]
+    fn storage_action_keeps_opaque_provider_ref_without_runtime_bindings() {
+        let action = ExecutorAction::new(
+            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                prompt: "ship it".to_string(),
+                executor_config: ExecutorConfig::new(BaseCodingAgent::Codex),
+                working_dir: None,
+            }),
+            Some(Box::new(ExecutorAction::new(
+                ExecutorActionType::ScriptRequest(ScriptRequest {
+                    script: "echo done".to_string(),
+                    language: ScriptRequestLanguage::Bash,
+                    context: ScriptContext::CleanupScript,
+                    working_dir: None,
+                }),
+                None,
+            ))),
+        )
+        .with_provider_env(HashMap::from([(
+            "OPENAI_API_KEY".to_string(),
+            "secret".to_string(),
+        )]))
+        .with_provider_codex(CodexProviderInjection {
+            model_provider_id: "cdt".to_string(),
+            config_overrides: HashMap::from([(
+                "model_providers.cdt.env_key".to_string(),
+                json!("OPENAI_API_KEY"),
+            )]),
+        })
+        .with_provider_selection(
+            Some("2f6dd8b2-5ce0-42c6-9e23-c8ecab684716".to_string()),
+            Some("gpt-5.1".to_string()),
+        );
+
+        let storage = action.without_provider_bindings();
+
+        assert!(storage.provider_env.is_none());
+        assert!(storage.provider_codex.is_none());
+        assert_eq!(
+            storage.selected_provider_id.as_deref(),
+            Some("2f6dd8b2-5ce0-42c6-9e23-c8ecab684716")
+        );
+        let serialized = serde_json::to_value(storage).unwrap();
+        assert_eq!(
+            serialized["selected_provider_id"],
+            "2f6dd8b2-5ce0-42c6-9e23-c8ecab684716"
+        );
+        assert!(serialized.get("provider_env").is_none());
+        assert!(serialized.get("provider_codex").is_none());
+    }
 }
 
 #[async_trait]

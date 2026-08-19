@@ -140,6 +140,18 @@ impl SessionCommand {
         execution_process_id: Uuid,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let mut transaction = pool.begin().await?;
+        let has_active_attempt: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM session_commands \
+             WHERE session_id = ? AND state = 'claimed')",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_active_attempt != 0 {
+            transaction.commit().await?;
+            return Ok(Vec::new());
+        }
+
         let pending = sqlx::query_as::<_, Self>(
             r#"SELECT * FROM session_commands
                WHERE session_id = ? AND state = 'pending'
@@ -179,6 +191,20 @@ impl SessionCommand {
         .await?;
         transaction.commit().await?;
         Ok(claimed)
+    }
+
+    pub async fn has_claimed_execution(
+        pool: &SqlitePool,
+        execution_process_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM session_commands \
+             WHERE execution_process_id = ? AND state = 'claimed')",
+        )
+        .bind(execution_process_id)
+        .fetch_one(pool)
+        .await?;
+        Ok(exists != 0)
     }
 
     pub async fn pending_session_ids(pool: &SqlitePool) -> Result<Vec<Uuid>, sqlx::Error> {
@@ -457,6 +483,46 @@ mod tests {
         assert_eq!(
             SessionCommand::pending(&pool, session_id).await.unwrap()[0].body,
             "codex"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_fails_closed_when_session_has_active_attempt() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        SessionCommand::enqueue(&pool, command(session_id, "active", None))
+            .await
+            .unwrap();
+        let active_execution_id = Uuid::new_v4();
+        SessionCommand::claim_pending(&pool, session_id, active_execution_id)
+            .await
+            .unwrap();
+        SessionCommand::enqueue(&pool, command(session_id, "later", None))
+            .await
+            .unwrap();
+
+        let stale_execution_id = Uuid::new_v4();
+        let claimed = SessionCommand::claim_pending(&pool, session_id, stale_execution_id)
+            .await
+            .unwrap();
+
+        assert!(claimed.is_empty());
+        assert!(
+            SessionCommand::has_claimed_execution(&pool, active_execution_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !SessionCommand::has_claimed_execution(&pool, stale_execution_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            SessionCommand::pending(&pool, session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
