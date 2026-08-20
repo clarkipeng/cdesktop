@@ -218,21 +218,6 @@ async fn main() -> Result<(), VibeKanbanError> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::browser_launch_enabled;
-
-    #[test]
-    fn managed_service_can_disable_browser_launch() {
-        assert!(!browser_launch_enabled(false, true));
-    }
-
-    #[test]
-    fn interactive_release_still_opens_browser() {
-        assert!(browser_launch_enabled(false, false));
-    }
-}
-
 pub async fn shutdown_signal() {
     // Always wait for Ctrl+C
     let ctrl_c = async {
@@ -275,4 +260,19 @@ pub async fn perform_cleanup_actions(deployment: &DeploymentImpl) {
         .kill_all_running_processes()
         .await
         .expect("Failed to cleanly kill running execution processes");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::browser_launch_enabled;
+
+    #[test]
+    fn managed_service_can_disable_browser_launch() {
+        assert!(!browser_launch_enabled(false, true));
+    }
+
+    #[test]
+    fn interactive_release_still_opens_browser() {
+        assert!(browser_launch_enabled(false, false));
+    }
 }

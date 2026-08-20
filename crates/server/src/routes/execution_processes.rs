@@ -318,10 +318,7 @@ async fn stop_execution_process(
     State(deployment): State<DeploymentImpl>,
     payload: Option<axum::Json<StopExecutionProcessRequest>>,
 ) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
-    let Some(dedupe_key) = payload
-        .map(|axum::Json(request)| request.dedupe_key)
-        .flatten()
-    else {
+    let Some(dedupe_key) = payload.and_then(|axum::Json(request)| request.dedupe_key) else {
         deployment
             .container()
             .stop_execution(&execution_process, ExecutionProcessStatus::Killed)
