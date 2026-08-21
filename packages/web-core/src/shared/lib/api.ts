@@ -12,6 +12,7 @@ import {
   DirectoryListResponse,
   DirectoryEntry,
   ExecutionProcess,
+  ExecutionProcessOutcome,
   ExecutionProcessRepoState,
   GitBranch,
   Repo,
@@ -828,6 +829,13 @@ export const workspacesApi = {
 
 // Execution Process APIs
 export const executionProcessesApi = {
+  listOutcomes: async (
+    sessionId: string
+  ): Promise<ExecutionProcessOutcome[]> => {
+    const response = await makeRequest(`/api/sessions/${sessionId}/outcomes`);
+    return handleApiResponse<ExecutionProcessOutcome[]>(response);
+  },
+
   getDetails: async (processId: string): Promise<ExecutionProcess> => {
     const response = await makeRequest(`/api/execution-processes/${processId}`);
     return handleApiResponse<ExecutionProcess>(response);

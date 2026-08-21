@@ -12,6 +12,7 @@ use axum::{
 use db::models::{
     coding_agent_turn::{CodingAgentTurn, TurnSelection},
     execution_process::{ExecutionProcess, ExecutionProcessRunReason},
+    execution_process_outcome::ExecutionProcessOutcome,
     metered_approval::MeteredExecution,
     provider::Provider,
     requests::UpdateSession,
@@ -63,6 +64,15 @@ pub async fn get_session(
     Extension(session): Extension<Session>,
 ) -> Result<ResponseJson<ApiResponse<Session>>, ApiError> {
     Ok(ResponseJson(ApiResponse::success(session)))
+}
+
+async fn list_outcomes(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<Vec<ExecutionProcessOutcome>>>, ApiError> {
+    let outcomes =
+        ExecutionProcessOutcome::find_by_session_id(&deployment.db().pool, session.id).await?;
+    Ok(ResponseJson(ApiResponse::success(outcomes)))
 }
 
 pub async fn create_session(
@@ -575,6 +585,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
             get(get_session).put(update_session).delete(delete_session),
         )
         .route("/follow-up", post(follow_up))
+        .route("/outcomes", get(list_outcomes))
         .route("/commands", get(list_commands))
         .route("/commands/requeue", post(requeue_commands))
         .route("/commands/dispatch", post(dispatch_commands))
