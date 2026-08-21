@@ -8,7 +8,9 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { cn } from '@/shared/lib/utils';
-import { meteredApprovalsApi } from '@/shared/lib/api';
+import { executionProcessesApi, meteredApprovalsApi } from '@/shared/lib/api';
+import { useFirstCellSessionId } from '@/shared/stores/useSessionGridStore';
+import type { ExecutionProcessOutcome } from 'shared/types';
 import type {
   MeteredApproval,
   MeteredApprovalState,
@@ -193,6 +195,29 @@ function approvalLabel(state: MeteredApprovalState) {
   return state.replaceAll('_', ' ');
 }
 
+function OutcomeRow({ outcome }: { outcome: ExecutionProcessOutcome }) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-base border-b border-border px-base py-base last:border-b-0">
+      <div className="min-w-0">
+        <p className="truncate text-sm font-medium text-high">
+          {outcome.outcome.safe_message}
+        </p>
+        <p className="mt-half truncate text-xs text-low">
+          {new Date(outcome.created_at).toLocaleString()}
+          {outcome.outcome.provider_code
+            ? ` · ${outcome.outcome.provider_code}`
+            : ''}
+        </p>
+      </div>
+      <RoutingBadge
+        tone={outcome.outcome.class === 'user_stopped' ? 'default' : 'error'}
+      >
+        {outcome.outcome.class.replaceAll('_', ' ')}
+      </RoutingBadge>
+    </div>
+  );
+}
+
 export function MeteredApprovalCard({
   approval,
   onRespond,
@@ -258,6 +283,7 @@ export function MeteredApprovalCard({
 export function ExecutionRoutingOverview() {
   const { settings, selection } = executionRoutingFixture;
   const selectedRoute = getExecutionRoutingRouteById(selection.selectedRouteId);
+  const sessionId = useFirstCellSessionId();
   const queryClient = useQueryClient();
   const [resolvedApprovals, setResolvedApprovals] = useState<MeteredApproval[]>(
     []
@@ -283,6 +309,13 @@ export function ExecutionRoutingOverview() {
     },
   });
   const pendingApprovals = approvalsQuery.data ?? [];
+  const outcomesQuery = useQuery({
+    queryKey: ['execution-outcomes', sessionId],
+    queryFn: () => executionProcessesApi.listOutcomes(sessionId),
+    enabled: Boolean(sessionId),
+    refetchInterval: 5_000,
+  });
+  const outcomes = outcomesQuery.data ?? [];
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-primary">
@@ -308,6 +341,38 @@ export function ExecutionRoutingOverview() {
       <div className="min-h-0 flex-1 overflow-y-auto p-double">
         <div className="grid gap-double xl:grid-cols-[minmax(0,1fr)_360px]">
           <div className="min-w-0 space-y-base">
+            <div className="rounded-sm border border-border bg-panel">
+              <div className="border-b border-border px-base py-base">
+                <h2 className="text-base font-medium text-high">
+                  Execution outcomes
+                </h2>
+                <p className="mt-half text-sm text-low">
+                  Normalized outcomes for the active session.
+                </p>
+              </div>
+              {!sessionId ? (
+                <p className="px-base py-base text-sm text-low">
+                  Select a session to view its outcomes.
+                </p>
+              ) : outcomesQuery.isError ? (
+                <p className="px-base py-base text-sm text-error">
+                  Unable to load execution outcomes.
+                </p>
+              ) : outcomes.length === 0 ? (
+                <p className="px-base py-base text-sm text-low">
+                  No normalized outcomes recorded for this session.
+                </p>
+              ) : (
+                <div>
+                  {outcomes.map((outcome) => (
+                    <OutcomeRow
+                      key={outcome.execution_process_id}
+                      outcome={outcome}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
             {(pendingApprovals.length > 0 ||
               resolvedApprovals.length > 0 ||
               approvalsQuery.isError) && (

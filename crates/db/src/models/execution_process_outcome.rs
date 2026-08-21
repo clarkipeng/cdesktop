@@ -50,6 +50,23 @@ impl ExecutionProcessOutcome {
             .await
     }
 
+    /// Lists the normalized outcomes recorded for executions in one session.
+    /// The outcome record deliberately contains only the display-safe
+    /// normalized contract, never the execution command configuration.
+    pub async fn find_by_session_id(
+        pool: &SqlitePool,
+        session_id: Uuid,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT epo.* FROM execution_process_outcomes epo \
+             JOIN execution_processes ep ON ep.id = epo.execution_process_id \
+             WHERE ep.session_id = ? ORDER BY epo.created_at DESC",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+    }
+
     /// Effective outcome for an attempt: the stored adapter classification
     /// when present, otherwise derived from the terminal status so callers
     /// always observe a normalized class without a second write path.
@@ -96,6 +113,17 @@ mod tests {
         pool
     }
 
+    async fn outcomes_pool() -> SqlitePool {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE execution_processes (id BLOB PRIMARY KEY NOT NULL, session_id BLOB NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
     #[tokio::test]
     async fn record_is_first_writer_wins() {
         let pool = pool().await;
@@ -130,6 +158,55 @@ mod tests {
         assert_eq!(
             stored.outcome.0.binding_scope,
             Some(OutcomeBindingScope::Account)
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_only_outcomes_for_the_requested_session() {
+        let pool = outcomes_pool().await;
+        let session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
+        let execution_process_id = Uuid::new_v4();
+        let other_execution_process_id = Uuid::new_v4();
+
+        for (id, session_id) in [
+            (execution_process_id, session_id),
+            (other_execution_process_id, other_session_id),
+        ] {
+            sqlx::query("INSERT INTO execution_processes (id, session_id) VALUES (?, ?)")
+                .bind(id)
+                .bind(session_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        ExecutionProcessOutcome::record(
+            &pool,
+            execution_process_id,
+            &NormalizedExecutionOutcome::new(ExecutionOutcomeClass::QuotaExhausted),
+        )
+        .await
+        .unwrap();
+        ExecutionProcessOutcome::record(
+            &pool,
+            other_execution_process_id,
+            &NormalizedExecutionOutcome::new(ExecutionOutcomeClass::AuthExpired),
+        )
+        .await
+        .unwrap();
+
+        let outcomes = ExecutionProcessOutcome::find_by_session_id(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].execution_process_id, execution_process_id);
+
+        assert!(
+            ExecutionProcessOutcome::find_by_session_id(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
