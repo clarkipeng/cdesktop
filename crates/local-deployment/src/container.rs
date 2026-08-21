@@ -1361,12 +1361,29 @@ impl ContainerService for LocalContainerService {
         execution_process: &ExecutionProcess,
         status: ExecutionProcessStatus,
     ) -> Result<(), ContainerError> {
-        let child = self
-            .get_child_from_store(&execution_process.id)
-            .await
-            .ok_or_else(|| {
-                ContainerError::Other(anyhow!("Child process not found for execution"))
-            })?;
+        let Some(child) = self.get_child_from_store(&execution_process.id).await else {
+            // No child in this server's store means the row is an orphan
+            // (previous process, or the child was already reaped). The stop
+            // must still reach a terminal state instead of erroring and
+            // leaving the row running forever.
+            tracing::warn!(
+                execution_process_id = %execution_process.id,
+                "stopping execution with no live child; terminalizing the orphan row"
+            );
+            let requeue = status == ExecutionProcessStatus::Killed;
+            ExecutionProcess::update_completion(
+                &self.db().pool,
+                execution_process.id,
+                status,
+                None,
+            )
+            .await?;
+            if requeue {
+                SessionCommand::requeue_killed_execution(&self.db().pool, execution_process.id)
+                    .await?;
+            }
+            return Ok(());
+        };
         let exit_code = if status == ExecutionProcessStatus::Completed {
             Some(0)
         } else {

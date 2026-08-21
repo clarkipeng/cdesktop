@@ -559,6 +559,34 @@ pub trait ContainerService {
         result.map(Some)
     }
 
+    /// A freshly started server owns no child processes, so every execution
+    /// still marked running at boot is an orphan from a previous process.
+    /// Terminalize them and return their claimed commands to the queue so the
+    /// four-slot coding-agent cap can never be filled by ghosts (the durable
+    /// queue froze fleet-wide this way once).
+    async fn terminalize_inherited_executions(&self) -> Result<(), ContainerError> {
+        let pool = &self.db().pool;
+        for process in ExecutionProcess::find_running(pool).await? {
+            if process.run_reason != ExecutionProcessRunReason::CodingAgent {
+                continue;
+            }
+            tracing::warn!(
+                execution_process_id = %process.id,
+                session_id = %process.session_id,
+                "terminalizing execution inherited as running from a previous server process"
+            );
+            ExecutionProcess::update_completion(
+                pool,
+                process.id,
+                ExecutionProcessStatus::Killed,
+                None,
+            )
+            .await?;
+            SessionCommand::requeue_killed_execution(pool, process.id).await?;
+        }
+        Ok(())
+    }
+
     async fn dispatch_all_pending_commands(&self) -> Result<(), ContainerError> {
         for session_id in SessionCommand::pending_session_ids(&self.db().pool).await? {
             match self.dispatch_pending_commands(session_id).await {
