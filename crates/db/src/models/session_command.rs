@@ -147,7 +147,6 @@ impl SessionCommand {
     pub async fn claim_pending(
         pool: &SqlitePool,
         session_id: Uuid,
-        execution_process_id: Uuid,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let mut transaction = pool.begin().await?;
         let has_active_attempt: i64 = sqlx::query_scalar(
@@ -179,12 +178,13 @@ impl SessionCommand {
             .take_while(|command| command.config == first.config)
             .map(|command| command.id)
             .collect();
+        // The execution row does not exist yet, so the claim leaves the
+        // FK column NULL; `bind_execution` stamps it right after the row is
+        // created and before the child can produce a completion callback.
         let mut update = QueryBuilder::<Sqlite>::new(
-            "UPDATE session_commands SET state = 'claimed', attempt_number = attempt_number + 1, execution_process_id = ",
+            "UPDATE session_commands SET state = 'claimed', attempt_number = attempt_number + 1",
         );
-        update
-            .push_bind(execution_process_id)
-            .push(" WHERE id IN (");
+        update.push(" WHERE id IN (");
         let mut separated = update.separated(", ");
         for id in &ids {
             separated.push_bind(id);
@@ -193,10 +193,11 @@ impl SessionCommand {
         update.build().execute(&mut *transaction).await?;
         let claimed = sqlx::query_as::<_, Self>(
             r#"SELECT * FROM session_commands
-               WHERE execution_process_id = ? AND state = 'claimed'
+               WHERE session_id = ? AND state = 'claimed'
+                 AND execution_process_id IS NULL
                ORDER BY rowid"#,
         )
-        .bind(execution_process_id)
+        .bind(session_id)
         .fetch_all(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -238,6 +239,40 @@ impl SessionCommand {
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    /// Stamp a freshly created execution row onto the session's claimed
+    /// batch. Claiming cannot reference the row up front: the FK on
+    /// `execution_process_id` requires the execution to exist first.
+    pub async fn bind_execution(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        execution_process_id: Uuid,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE session_commands SET execution_process_id = ? \
+             WHERE session_id = ? AND state = 'claimed' AND execution_process_id IS NULL",
+        )
+        .bind(execution_process_id)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Release a claimed batch that was never bound to an execution row -
+    /// the pre-bind failure paths (gate re-check, blocked metered policy)
+    /// and crash-window recovery. Safe because a session has at most one
+    /// claimed batch and binding happens under the dispatch scheduler lock.
+    pub async fn release_unbound(pool: &SqlitePool, session_id: Uuid) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE session_commands SET state = 'pending' \
+             WHERE session_id = ? AND state = 'claimed' AND execution_process_id IS NULL",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Return commands from an interrupted terminal execution to the native
@@ -358,6 +393,17 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        // Mirror the real migration's FK semantics: the production dispatch
+        // bug (claim stamping a not-yet-created execution row) was invisible
+        // here precisely because this schema used to omit the constraint.
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE execution_processes (id BLOB PRIMARY KEY NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             r#"CREATE TABLE session_commands (
                 id BLOB PRIMARY KEY NOT NULL,
@@ -370,7 +416,9 @@ mod tests {
                execution_process_id BLOB,
                 attempt_number INTEGER NOT NULL DEFAULT 0,
                created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec')),
-               finished_at TEXT
+               finished_at TEXT,
+               FOREIGN KEY (execution_process_id)
+                   REFERENCES execution_processes(id) ON DELETE SET NULL
             )"#,
         )
         .execute(&pool)
@@ -384,6 +432,16 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    async fn execution_row(pool: &SqlitePool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_processes (id) VALUES (?)")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
     }
 
     fn command(session_id: Uuid, body: &str, dedupe_key: Option<&str>) -> NewSessionCommand {
@@ -450,8 +508,7 @@ mod tests {
             .await
             .unwrap();
 
-        let execution_id = Uuid::new_v4();
-        let claimed = SessionCommand::claim_pending(&pool, session_id, execution_id)
+        let claimed = SessionCommand::claim_pending(&pool, session_id)
             .await
             .unwrap();
 
@@ -462,10 +519,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
+        // Claiming precedes the execution row, so the FK column stays NULL
+        // until bind_execution stamps the batch (production dispatch order).
         assert!(
             claimed
                 .iter()
-                .all(|item| item.execution_process_id == Some(execution_id))
+                .all(|item| item.execution_process_id.is_none())
+        );
+        let execution_id = execution_row(&pool).await;
+        assert_eq!(
+            SessionCommand::bind_execution(&pool, session_id, execution_id)
+                .await
+                .unwrap(),
+            2
         );
         assert!(
             SessionCommand::pending(&pool, session_id)
@@ -487,7 +553,7 @@ mod tests {
             ExecutorConfig::new(executors::executors::BaseCodingAgent::Codex);
         SessionCommand::enqueue(&pool, codex).await.unwrap();
 
-        let claimed = SessionCommand::claim_pending(&pool, session_id, Uuid::new_v4())
+        let claimed = SessionCommand::claim_pending(&pool, session_id)
             .await
             .unwrap();
 
@@ -506,16 +572,19 @@ mod tests {
         SessionCommand::enqueue(&pool, command(session_id, "active", None))
             .await
             .unwrap();
-        let active_execution_id = Uuid::new_v4();
-        SessionCommand::claim_pending(&pool, session_id, active_execution_id)
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let active_execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, active_execution_id)
             .await
             .unwrap();
         SessionCommand::enqueue(&pool, command(session_id, "later", None))
             .await
             .unwrap();
 
-        let stale_execution_id = Uuid::new_v4();
-        let claimed = SessionCommand::claim_pending(&pool, session_id, stale_execution_id)
+        let stale_execution_id = execution_row(&pool).await;
+        let claimed = SessionCommand::claim_pending(&pool, session_id)
             .await
             .unwrap();
 
@@ -546,8 +615,11 @@ mod tests {
         SessionCommand::enqueue(&pool, command(session_id, "recover", None))
             .await
             .unwrap();
-        let execution_id = Uuid::new_v4();
-        SessionCommand::claim_pending(&pool, session_id, execution_id)
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, execution_id)
             .await
             .unwrap();
 
@@ -569,8 +641,11 @@ mod tests {
         let (command, _) = SessionCommand::enqueue(&pool, command(session_id, "retry", Some("k")))
             .await
             .unwrap();
-        let first_execution_id = Uuid::new_v4();
-        let first = SessionCommand::claim_pending(&pool, session_id, first_execution_id)
+        let first = SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let first_execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, first_execution_id)
             .await
             .unwrap();
 
@@ -580,14 +655,20 @@ mod tests {
         SessionCommand::release_execution(&pool, first_execution_id)
             .await
             .unwrap();
-        let second_execution_id = Uuid::new_v4();
-        let second = SessionCommand::claim_pending(&pool, session_id, second_execution_id)
+        let second = SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let second_execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, second_execution_id)
             .await
             .unwrap();
 
         assert_eq!(second[0].id, command.id);
-        assert_eq!(second[0].execution_process_id, Some(second_execution_id));
         assert_eq!(second[0].attempt_number, 2);
+        let rebound = SessionCommand::for_session(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(rebound[0].execution_process_id, Some(second_execution_id));
     }
 
     #[tokio::test]
@@ -597,15 +678,21 @@ mod tests {
         SessionCommand::enqueue(&pool, command(session_id, "retry", None))
             .await
             .unwrap();
-        let predecessor_id = Uuid::new_v4();
-        SessionCommand::claim_pending(&pool, session_id, predecessor_id)
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let predecessor_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, predecessor_id)
             .await
             .unwrap();
         SessionCommand::release_execution(&pool, predecessor_id)
             .await
             .unwrap();
-        let retry_id = Uuid::new_v4();
-        SessionCommand::claim_pending(&pool, session_id, retry_id)
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let retry_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, retry_id)
             .await
             .unwrap();
 
@@ -628,26 +715,79 @@ mod tests {
         SessionCommand::enqueue(&pool, command(session_id, "one", None))
             .await
             .unwrap();
-        let first_execution_id = Uuid::new_v4();
-        let second_execution_id = Uuid::new_v4();
-
         let (first, second) = tokio::join!(
-            SessionCommand::claim_pending(&pool, session_id, first_execution_id),
-            SessionCommand::claim_pending(&pool, session_id, second_execution_id),
+            SessionCommand::claim_pending(&pool, session_id),
+            SessionCommand::claim_pending(&pool, session_id),
         );
         let first = first.unwrap();
         let second = second.unwrap();
 
         assert_eq!(first.len() + second.len(), 1);
-        let winner = if first.is_empty() {
-            second_execution_id
-        } else {
-            first_execution_id
-        };
+        let winner_execution = execution_row(&pool).await;
+        assert_eq!(
+            SessionCommand::bind_execution(&pool, session_id, winner_execution)
+                .await
+                .unwrap(),
+            1
+        );
         assert!(
-            SessionCommand::has_claimed_execution(&pool, winner)
+            SessionCommand::has_claimed_execution(&pool, winner_execution)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_then_bind_matches_production_dispatch_order_under_fk() {
+        // Regression for the released dispatch bug: claiming used to stamp a
+        // not-yet-created execution id, violating the execution_process_id
+        // FK on every real dispatch while FK-less test schemas stayed green.
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        SessionCommand::enqueue(&pool, command(session_id, "wake", Some("w")))
+            .await
+            .unwrap();
+
+        let claimed = SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(claimed[0].execution_process_id.is_none());
+
+        // Binding an id with no execution row must fail under real FKs.
+        assert!(
+            SessionCommand::bind_execution(&pool, session_id, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+
+        // A crash before bind leaves an unbound claim; recovery returns it.
+        assert_eq!(
+            SessionCommand::release_unbound(&pool, session_id)
+                .await
+                .unwrap(),
+            1
+        );
+        let reclaimed = SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+
+        let execution_id = execution_row(&pool).await;
+        assert_eq!(
+            SessionCommand::bind_execution(&pool, session_id, execution_id)
+                .await
+                .unwrap(),
+            1
+        );
+        SessionCommand::finish_execution(&pool, execution_id, true)
+            .await
+            .unwrap();
+        assert!(
+            SessionCommand::pending(&pool, session_id)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -659,8 +799,11 @@ mod tests {
             SessionCommand::enqueue(&pool, command(session_id, "recover", Some("k")))
                 .await
                 .unwrap();
-        let execution_id = Uuid::new_v4();
-        SessionCommand::claim_pending(&pool, session_id, execution_id)
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, execution_id)
             .await
             .unwrap();
         SessionCommand::finish_execution(&pool, execution_id, false)
@@ -689,12 +832,18 @@ mod tests {
         SessionCommand::enqueue(&pool, command(other_session_id, "other", Some("b")))
             .await
             .unwrap();
-        let process_id = Uuid::new_v4();
-        let other_process_id = Uuid::new_v4();
-        SessionCommand::claim_pending(&pool, session_id, process_id)
+        SessionCommand::claim_pending(&pool, session_id)
             .await
             .unwrap();
-        SessionCommand::claim_pending(&pool, other_session_id, other_process_id)
+        let process_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, process_id)
+            .await
+            .unwrap();
+        SessionCommand::claim_pending(&pool, other_session_id)
+            .await
+            .unwrap();
+        let other_process_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, other_session_id, other_process_id)
             .await
             .unwrap();
 

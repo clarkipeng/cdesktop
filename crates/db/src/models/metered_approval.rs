@@ -598,7 +598,7 @@ mod tests {
             MeteredGateDecision::Proceed
         );
         let execution_id = Uuid::new_v4();
-        let claimed = SessionCommand::claim_pending(&pool, command.session_id, execution_id)
+        let claimed = SessionCommand::claim_pending(&pool, command.session_id)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
