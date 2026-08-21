@@ -98,6 +98,11 @@ async fn main() -> Result<(), VibeKanbanError> {
         .map_err(DeploymentError::from)?;
     deployment
         .container()
+        .terminalize_inherited_executions()
+        .await
+        .map_err(DeploymentError::from)?;
+    deployment
+        .container()
         .dispatch_all_pending_commands()
         .await
         .map_err(DeploymentError::from)?;
