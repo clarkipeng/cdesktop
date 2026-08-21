@@ -415,8 +415,13 @@ pub trait ContainerService {
             }
         }
 
+        // A crash between claim and bind leaves a claimed batch with no
+        // execution row. Claims and binds only happen under this scheduler
+        // lock, so any unbound claim seen here is a leftover - return it to
+        // the queue before claiming again.
+        SessionCommand::release_unbound(pool, session_id).await?;
         let execution_id = Uuid::new_v4();
-        let commands = SessionCommand::claim_pending(pool, session_id, execution_id).await?;
+        let commands = SessionCommand::claim_pending(pool, session_id).await?;
         let Some(first) = commands.first() else {
             return Ok(None);
         };
@@ -427,7 +432,7 @@ pub trait ContainerService {
         match MeteredApproval::gate(pool, first).await? {
             MeteredGateDecision::Proceed => {}
             MeteredGateDecision::AwaitApproval | MeteredGateDecision::Blocked => {
-                SessionCommand::release_execution(pool, execution_id).await?;
+                SessionCommand::release_unbound(pool, session_id).await?;
                 return Ok(None);
             }
         }
@@ -448,7 +453,7 @@ pub trait ContainerService {
                     .await?;
                 }
                 MeteredApprovalPolicy::Never => {
-                    SessionCommand::release_execution(pool, execution_id).await?;
+                    SessionCommand::release_unbound(pool, session_id).await?;
                     return Ok(None);
                 }
             }
@@ -1482,9 +1487,13 @@ pub trait ContainerService {
         )
         .await?;
         if *run_reason == ExecutionProcessRunReason::CodingAgent {
+            // Stamp the claimed batch now that the execution row exists (the
+            // FK forbids stamping at claim time) and before the child spawns,
+            // so completion callbacks always find their commands.
             if claim_pending_commands
-                && !SessionCommand::has_claimed_execution(&self.db().pool, execution_process.id)
+                && SessionCommand::bind_execution(&self.db().pool, session.id, execution_process.id)
                     .await?
+                    == 0
             {
                 ExecutionProcess::update_completion(
                     &self.db().pool,
