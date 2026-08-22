@@ -27,7 +27,13 @@ use super::{
 use crate::{
     approvals::{ExecutorApprovalError, ExecutorApprovalService},
     env::RepoContext,
-    executors::{ExecutorError, opencode::models::maybe_emit_token_usage},
+    executors::{
+        ExecutorError,
+        opencode::{
+            models::maybe_emit_token_usage,
+            outcome::{OutcomeSink, normalized_session_failure, transport_failure},
+        },
+    },
 };
 
 #[derive(Clone)]
@@ -94,6 +100,8 @@ pub(super) struct RunConfig {
     pub commit_reminder: bool,
     pub commit_reminder_prompt: String,
     pub repo_context: RepoContext,
+    /// Terminal outcome observed by the event listener, read by the spawn task.
+    pub outcome: OutcomeSink,
 }
 
 /// Generate a cryptographically secure random password for OpenCode server auth.
@@ -310,6 +318,7 @@ async fn run_session_inner(
             pending_approvals: pending_approvals.clone(),
             models_cache_key: config.models_cache_key.clone(),
             cancel: cancel.clone(),
+            outcome: config.outcome.clone(),
         },
         event_resp,
     ));
@@ -1144,6 +1153,7 @@ pub(super) struct EventListenerConfig {
     pub pending_approvals: PendingApprovals,
     pub models_cache_key: String,
     pub cancel: CancellationToken,
+    pub outcome: OutcomeSink,
 }
 
 pub(super) async fn spawn_event_listener(
@@ -1162,6 +1172,7 @@ pub(super) async fn spawn_event_listener(
         pending_approvals,
         models_cache_key,
         cancel,
+        outcome,
     } = config;
 
     let mut seen_permissions: HashSet<String> = HashSet::new();
@@ -1191,6 +1202,7 @@ pub(super) async fn spawn_event_listener(
                             .await;
                         attempt += 1;
                         if attempt >= max_attempts {
+                            outcome.record(transport_failure());
                             let _ = control_tx.send(ControlEvent::Disconnected);
                             return;
                         }
@@ -1202,7 +1214,7 @@ pub(super) async fn spawn_event_listener(
             }
         };
 
-        let outcome = process_event_stream(
+        let stream_outcome = process_event_stream(
             EventStreamContext {
                 seen_permissions: &mut seen_permissions,
                 client: &client,
@@ -1218,12 +1230,13 @@ pub(super) async fn spawn_event_listener(
                 last_event_id: &mut last_event_id,
                 models_cache_key: &models_cache_key,
                 cancel: cancel.clone(),
+                outcome: &outcome,
             },
             current_resp,
         )
         .await;
 
-        match outcome {
+        match stream_outcome {
             Ok(EventStreamOutcome::Idle) => {
                 // Keep listening - there may be more prompts (e.g., commit reminder)
                 // The task will be aborted by event_handle.abort() when done
@@ -1234,6 +1247,7 @@ pub(super) async fn spawn_event_listener(
             Ok(EventStreamOutcome::Disconnected) | Err(_) => {
                 attempt += 1;
                 if attempt >= max_attempts {
+                    outcome.record(transport_failure());
                     let _ = control_tx.send(ControlEvent::Disconnected);
                     return;
                 }
@@ -1276,6 +1290,7 @@ pub(super) struct EventStreamContext<'a> {
     /// Cache key for model context windows, derived from config that affects available models.
     pub models_cache_key: &'a str,
     cancel: CancellationToken,
+    outcome: &'a OutcomeSink,
 }
 
 async fn process_event_stream(
@@ -1354,6 +1369,10 @@ async fn process_event_stream(
                 return Ok(EventStreamOutcome::Idle);
             }
             "session.error" => {
+                ctx.outcome.record(normalized_session_failure(
+                    data.pointer("/properties/error"),
+                ));
+
                 let error_type = data
                     .pointer("/properties/error/name")
                     .or_else(|| data.pointer("/properties/error/type"))

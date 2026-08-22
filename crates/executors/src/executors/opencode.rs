@@ -29,10 +29,12 @@ use crate::{
 
 mod models;
 mod normalize_logs;
+mod outcome;
 pub(crate) mod sdk;
 mod slash_commands;
 pub(crate) mod types;
 
+use outcome::OutcomeSink;
 use sdk::{
     AgentInfo as SDKAgentInfo, LogWriter, RunConfig, build_authenticated_client,
     generate_server_password, list_agents, list_commands, list_providers, run_session,
@@ -203,6 +205,7 @@ impl Opencode {
         let commit_reminder = env.commit_reminder;
         let commit_reminder_prompt = env.commit_reminder_prompt.clone();
         let repo_context = env.repo_context.clone();
+        let outcome_for_task = OutcomeSink::default();
 
         tokio::spawn(async move {
             // Wait for server to print listening URL
@@ -213,7 +216,9 @@ impl Opencode {
                     let _ = log_writer
                         .log_error(format!("OpenCode startup error: {err}"))
                         .await;
-                    let _ = exit_signal_tx.send(ExecutorExitResult::Failure(None));
+                    outcome_for_task.record(outcome::startup_failure());
+                    let _ =
+                        exit_signal_tx.send(ExecutorExitResult::Failure(outcome_for_task.take()));
                     return;
                 }
             };
@@ -233,6 +238,7 @@ impl Opencode {
                 commit_reminder,
                 commit_reminder_prompt,
                 repo_context,
+                outcome: outcome_for_task.clone(),
             };
 
             let result = match slash_command {
@@ -247,7 +253,7 @@ impl Opencode {
                     let _ = log_writer
                         .log_error(format!("OpenCode executor error: {err}"))
                         .await;
-                    ExecutorExitResult::Failure(None)
+                    ExecutorExitResult::Failure(outcome_for_task.take())
                 }
             };
             let _ = exit_signal_tx.send(exit_result);
@@ -432,7 +438,8 @@ impl StandardCodingAgentExecutor for Opencode {
         prompt: &str,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
-        let env = setup_permissions_env(self.auto_approve, env);
+        let env = setup_database_env(env);
+        let env = setup_permissions_env(self.auto_approve, &env);
         let env = setup_compaction_env(self.auto_compact, &env);
         self.spawn_inner(current_dir, prompt, None, &env).await
     }
@@ -445,7 +452,8 @@ impl StandardCodingAgentExecutor for Opencode {
         _reset_to_message_id: Option<&str>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
-        let env = setup_permissions_env(self.auto_approve, env);
+        let env = setup_database_env(env);
+        let env = setup_permissions_env(self.auto_approve, &env);
         let env = setup_compaction_env(self.auto_compact, &env);
         self.spawn_inner(current_dir, prompt, Some(session_id), &env)
             .await
@@ -788,6 +796,43 @@ fn default_to_true() -> bool {
     true
 }
 
+/// Pin OpenCode's session database to a cdesktop-owned path.
+///
+/// OpenCode resolves its database from the ambient XDG data dir, which cdesktop
+/// shares with whatever else launched it - a database another tool has left
+/// mid-migration takes down every spawn that touches it. Owning the path makes
+/// that unreachable.
+///
+/// The path is per-installation, not per-spawn: a follow-up starts a *new*
+/// server and resumes by session id, so the session must still be there. An
+/// explicit `OPENCODE_DB` still wins, which is what makes the behaviour
+/// testable and lets an operator relocate it.
+fn setup_database_env(env: &ExecutionEnv) -> ExecutionEnv {
+    if env.get("OPENCODE_DB").is_some() {
+        return env.clone();
+    }
+
+    let database_path = workspace_utils::assets::asset_dir()
+        .join("opencode")
+        .join("opencode.db");
+
+    if let Some(parent) = database_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        // Leaving OPENCODE_DB unset falls back to the ambient database, which
+        // still works whenever it is healthy.
+        tracing::warn!(
+            path = %parent.display(),
+            "Could not create the OpenCode database directory: {err}"
+        );
+        return env.clone();
+    }
+
+    let mut env = env.clone();
+    env.insert("OPENCODE_DB", database_path.to_string_lossy().as_ref());
+    env
+}
+
 fn setup_permissions_env(auto_approve: bool, env: &ExecutionEnv) -> ExecutionEnv {
     let mut env = env.clone();
 
@@ -847,4 +892,51 @@ fn merge_compaction_config(existing_json: Option<&str>) -> String {
     config.insert("compaction".to_string(), Value::Object(compaction));
 
     serde_json::to_string(&config).unwrap_or_else(|_| r#"{"compaction":{"auto":true}}"#.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::RepoContext;
+
+    fn env() -> ExecutionEnv {
+        ExecutionEnv::new(RepoContext::default(), false, String::new())
+    }
+
+    #[test]
+    fn spawns_own_the_opencode_database_by_default() {
+        let pinned = setup_database_env(&env());
+
+        let path = std::path::PathBuf::from(
+            pinned
+                .get("OPENCODE_DB")
+                .expect("spawns must not inherit the ambient database"),
+        );
+        assert!(path.starts_with(workspace_utils::assets::asset_dir()));
+        assert!(
+            path.parent().is_some_and(std::path::Path::is_dir),
+            "the database directory must exist before OpenCode opens it"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_resumes_against_the_same_database() {
+        // Resume starts a fresh server and asks it for an existing session, so
+        // the two spawns have to agree on where sessions live.
+        assert_eq!(
+            setup_database_env(&env()).get("OPENCODE_DB"),
+            setup_database_env(&env()).get("OPENCODE_DB")
+        );
+    }
+
+    #[test]
+    fn an_explicit_database_is_left_alone() {
+        let mut configured = env();
+        configured.insert("OPENCODE_DB", "/tmp/operator-chosen/opencode.db");
+
+        assert_eq!(
+            setup_database_env(&configured).get("OPENCODE_DB").unwrap(),
+            "/tmp/operator-chosen/opencode.db"
+        );
+    }
 }
