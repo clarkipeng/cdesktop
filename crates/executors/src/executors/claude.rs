@@ -54,6 +54,7 @@ use crate::{
     },
     model_selector::PermissionPolicy,
     profile::ExecutorConfig,
+    provider::{ProviderContext, ProviderInjection},
     stdout_dup::create_stdout_pipe_writer,
 };
 
@@ -376,6 +377,10 @@ impl StandardCodingAgentExecutor for ClaudeCode {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals_service = Some(approvals);
+    }
+
+    fn brokers_approvals(&self) -> bool {
+        true
     }
 
     async fn spawn(
@@ -2816,6 +2821,57 @@ impl ClaudeToolData {
                 .unwrap_or("unknown"),
         }
     }
+}
+
+/// The Anthropic-compatible spawn env for a provider record.
+///
+/// `ANTHROPIC_BASE_URL` comes from the slot's `baseUrl`, the credential is
+/// named by `apiKeyField` (default `ANTHROPIC_AUTH_TOKEN`),
+/// `ANTHROPIC_DEFAULT_HAIKU_MODEL` from `haikuModel` or, unset, the picked
+/// model, and the picked model also routes sub-agents through
+/// `CLAUDE_CODE_SUBAGENT_MODEL`. `ANTHROPIC_MODEL` and the Sonnet/Opus/Haiku
+/// defaults are stripped from the slot's own `env`: they conflict with the
+/// `--model` flag the executor passes for the main model.
+///
+/// This is also the default applier for every harness that has not declared
+/// its own, so it stays free of anything Claude-CLI-specific.
+pub(crate) fn anthropic_env_injection(ctx: &ProviderContext) -> ProviderInjection {
+    let mut env = ctx.payload.env.clone();
+    // Ensure no stray conflicting keys leaked into the slot's env.
+    env.remove("ANTHROPIC_MODEL");
+    env.remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
+    env.remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
+    env.remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
+
+    if let Some(base_url) = &ctx.payload.base_url {
+        env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.clone());
+    }
+
+    let api_key_field = ctx
+        .payload
+        .extra_str("apiKeyField")
+        .unwrap_or("ANTHROPIC_AUTH_TOKEN");
+    if let Some(key) = &ctx.api_key {
+        env.insert(api_key_field.to_string(), key.clone());
+    }
+
+    if !ctx.model_id.is_empty() {
+        env.insert(
+            "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
+            ctx.model_id.clone(),
+        );
+    }
+
+    let haiku = ctx
+        .payload
+        .extra_str("haikuModel")
+        .map(str::to_string)
+        .or_else(|| (!ctx.model_id.is_empty()).then(|| ctx.model_id.clone()));
+    if let Some(haiku) = haiku {
+        env.insert("ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(), haiku);
+    }
+
+    ProviderInjection::from_env(env)
 }
 
 #[cfg(test)]

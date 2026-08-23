@@ -79,8 +79,37 @@ use crate::{
     model_selector::{ModelInfo, ModelSelectorConfig, PermissionPolicy, ReasoningOption},
     outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
     profile::ExecutorConfig,
+    provider::{ProviderContext, ProviderInjection, ProviderInjectionError},
     stdout_dup::create_stdout_pipe_writer,
 };
+
+/// Hardcoded `model_providers.<id>` slug for the cdesktop-injected provider.
+/// Fixing it keeps the emitted keys identical for every record, so the applier
+/// never has to derive them from user-supplied naming.
+const INJECTED_PROVIDER_ID: &str = "cdt";
+
+/// Env var carrying the user's API key into Codex's `env_key`-driven auth
+/// path, wired once as `model_providers.cdt.env_key`.
+const INJECTED_API_KEY_ENV: &str = "CDT_API_KEY";
+
+/// Codex spawn injection beyond plain env vars.
+///
+/// Codex's `app-server` JSON-RPC subcommand accepts arbitrary
+/// `model_providers.<id>.<key>` overrides via `ThreadStartParams.config`
+/// (a free-form map the server feeds to the same dotted-path applier the
+/// `-c key=value` CLI flag uses; see
+/// `related/codex/.../apply_single_override`). The `model_provider` field on
+/// `ThreadStartParams` is a separate typesafe knob picking which
+/// `model_providers.<id>` block to use.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CodexProviderInjection {
+    /// Dotted-path keys merged into `ThreadStartParams.config`:
+    /// `model_providers.cdt.{name,base_url,env_key,wire_api}`.
+    #[serde(default)]
+    pub config_overrides: HashMap<String, serde_json::Value>,
+    /// Value for `ThreadStartParams.model_provider`.
+    pub model_provider_id: String,
+}
 
 /// Sandbox policy modes for Codex
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, JsonSchema, AsRefStr)]
@@ -229,6 +258,61 @@ impl StandardCodingAgentExecutor for Codex {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals = Some(approvals);
+    }
+
+    fn brokers_approvals(&self) -> bool {
+        true
+    }
+
+    fn provider_slot(&self) -> &'static str {
+        "codex"
+    }
+
+    /// Emit the `model_providers.cdt.*` overrides plus the `CDT_API_KEY` env
+    /// var they name.
+    ///
+    /// `requires_openai_auth` is left at its default (false), so codex's auth
+    /// path reads only `env_key` and never consults `~/.codex/auth.json` for
+    /// our provider — the user's home dir stays read-only from cdesktop.
+    /// The slot's own `env` is overlaid first so a vendor-quirk entry cannot
+    /// silently clobber the credential we set last.
+    fn build_provider_injection(
+        &self,
+        ctx: &ProviderContext,
+    ) -> Result<ProviderInjection, ProviderInjectionError> {
+        let api_key = ctx.require_api_key(BaseCodingAgent::Codex)?;
+        let base_url = ctx.require_base_url(BaseCodingAgent::Codex)?;
+
+        let mut env = ctx.payload.env.clone();
+        env.insert(INJECTED_API_KEY_ENV.to_string(), api_key.to_string());
+
+        let prefix = format!("model_providers.{INJECTED_PROVIDER_ID}");
+        let config_overrides = HashMap::from([
+            (
+                format!("{prefix}.name"),
+                Value::String(ctx.record_name.clone()),
+            ),
+            (
+                format!("{prefix}.base_url"),
+                Value::String(base_url.to_string()),
+            ),
+            (
+                format!("{prefix}.env_key"),
+                Value::String(INJECTED_API_KEY_ENV.to_string()),
+            ),
+            (
+                format!("{prefix}.wire_api"),
+                Value::String("responses".to_string()),
+            ),
+        ]);
+
+        Ok(ProviderInjection::from_env(env).with_structured(
+            BaseCodingAgent::Codex,
+            CodexProviderInjection {
+                config_overrides,
+                model_provider_id: INJECTED_PROVIDER_ID.to_string(),
+            },
+        ))
     }
 
     async fn spawn(
@@ -494,7 +578,7 @@ impl Codex {
         };
 
         // Per-message Codex provider injection. When the user picks a non-Default
-        // provider record for this message, `Provider::build_codex_injection`
+        // provider record for this message, `Codex::build_provider_injection`
         // emits dotted-path overrides (`model_providers.cdt.{name,base_url,
         // env_key,wire_api}`) that get merged into Codex's free-form `config`
         // map and a `model_provider` id ("cdt") that selects them. The
@@ -503,7 +587,7 @@ impl Codex {
         // `config.toml` on disk are never touched (plan §3.2 / Phase C
         // verification target).
         let mut model_provider = self.model_provider.clone();
-        if let Some(injection) = env.provider_codex.as_ref() {
+        if let Some(injection) = env.structured::<CodexProviderInjection>(BaseCodingAgent::Codex) {
             let map = config.get_or_insert_with(HashMap::new);
             for (k, v) in &injection.config_overrides {
                 map.insert(k.clone(), v.clone());

@@ -9,10 +9,10 @@
 //! `serde(skip)` provider fields and the redacting `Debug` impls).
 
 use db::models::{
-    provider::{AgentInjection, Provider, ProviderError},
+    provider::{Provider, ProviderError},
     session_command::SessionCommandConfig,
 };
-use executors::profile::ExecutorConfig;
+use executors::{profile::ExecutorConfig, provider::ProviderInjection};
 use sqlx::SqlitePool;
 use thiserror::Error;
 use utils::redact::redact_text;
@@ -40,7 +40,7 @@ pub struct ResolvedAuthBinding {
     /// Loaded provider record backing the binding (`None` for ambient auth).
     pub provider: Option<Provider>,
     /// Spawn-time credential injection. In-memory only.
-    pub injection: AgentInjection,
+    pub injection: ProviderInjection,
 }
 
 impl std::fmt::Debug for ResolvedAuthBinding {
@@ -57,8 +57,8 @@ impl std::fmt::Debug for ResolvedAuthBinding {
 /// `selected_provider_id` is the compatibility fallback for configs enqueued
 /// before bindings existed. No binding means ambient executor auth.
 ///
-/// Mutates `executor_config.model_id` to apply the provider's OpenCode
-/// prefix (no-op for other agents), mirroring the route-side resolution.
+/// Mutates `executor_config.model_id` to the id form the target harness
+/// addresses models by, mirroring the route-side resolution.
 pub async fn resolve_for_launch(
     pool: &SqlitePool,
     config: &SessionCommandConfig,
@@ -69,7 +69,7 @@ pub async fn resolve_for_launch(
         return Ok(ResolvedAuthBinding {
             binding_id: None,
             provider: None,
-            injection: AgentInjection::default(),
+            injection: ProviderInjection::default(),
         });
     };
 
@@ -83,27 +83,26 @@ pub async fn resolve_for_launch(
         return Err(AuthBindingError::Disabled(provider.name.clone()));
     }
 
-    if let Some(model) = executor_config.model_id.as_deref() {
-        executor_config.model_id =
-            Some(provider.prefix_opencode_model_id(executor_config.executor, model));
-    }
-
-    let injection = provider
-        .build_agent_injection(
+    let (model_id, injection) = provider
+        .resolve_injection(
             executor_config.executor,
             executor_config.model_id.as_deref().unwrap_or(""),
         )
         .map_err(|error| {
             // ProviderError messages carry no credential values today; the
             // scrub keeps that true even if a future variant embeds one.
+            let resolved = provider.resolved_api_key(executor_config.executor);
             let secrets: Vec<&str> = provider
                 .api_key
                 .as_deref()
                 .into_iter()
-                .chain(provider.resolved_api_key(executor_config.executor))
+                .chain(resolved.as_deref())
                 .collect();
             AuthBindingError::Resolution(redact_text(&error.to_string(), secrets))
         })?;
+    if executor_config.model_id.is_some() {
+        executor_config.model_id = Some(model_id);
+    }
 
     Ok(ResolvedAuthBinding {
         binding_id: Some(id),
@@ -190,7 +189,7 @@ mod tests {
         assert_eq!(resolved.binding_id, None);
         assert!(resolved.provider.is_none());
         assert!(resolved.injection.env.is_none());
-        assert!(resolved.injection.codex.is_none());
+        assert!(resolved.injection.structured.is_none());
     }
 
     #[tokio::test]

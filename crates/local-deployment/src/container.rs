@@ -29,7 +29,10 @@ use executors::{
     actions::{Executable, ExecutorAction, ExecutorActionType},
     approvals::{ExecutorApprovalService, NoopExecutorApprovalService},
     env::{ExecutionEnv, RepoContext},
-    executors::{BaseCodingAgent, CancellationToken, ExecutorExitResult, ExecutorExitSignal},
+    executors::{
+        CancellationToken, CodingAgent, ExecutorExitResult, ExecutorExitSignal,
+        StandardCodingAgentExecutor,
+    },
     logs::{NormalizedEntryType, utils::patch::extract_normalized_entry_from_patch},
     outcome::NormalizedExecutionOutcome,
 };
@@ -1249,22 +1252,22 @@ impl ContainerService for LocalContainerService {
             executor_action,
         );
 
-        let approvals_service: Arc<dyn ExecutorApprovalService> =
-            match executor_action.base_executor() {
-                Some(
-                    BaseCodingAgent::Codex
-                    | BaseCodingAgent::ClaudeCode
-                    | BaseCodingAgent::Gemini
-                    | BaseCodingAgent::QwenCode
-                    | BaseCodingAgent::Opencode,
-                ) => ExecutorApprovalBridge::new(
-                    self.approvals.clone(),
-                    self.db.clone(),
-                    self.notification_service.clone(),
-                    execution_process.id,
-                ),
-                _ => Arc::new(NoopExecutorApprovalService {}),
-            };
+        // The adapter decides whether it brokers approvals; an executor this
+        // file has never heard of cannot end up silently unable to ask.
+        let brokers_approvals = executor_action
+            .base_executor()
+            .and_then(CodingAgent::registered)
+            .is_some_and(|agent| agent.brokers_approvals());
+        let approvals_service: Arc<dyn ExecutorApprovalService> = if brokers_approvals {
+            ExecutorApprovalBridge::new(
+                self.approvals.clone(),
+                self.db.clone(),
+                self.notification_service.clone(),
+                execution_process.id,
+            )
+        } else {
+            Arc::new(NoopExecutorApprovalService {})
+        };
 
         let repo_names: Vec<String> = repos.iter().map(|r| r.name.clone()).collect();
         // Absolute on-disk paths for every repo in order. Direct-mode repos
@@ -1308,16 +1311,11 @@ impl ContainerService for LocalContainerService {
             tracing::debug!(keys = ?provider_env.keys().collect::<Vec<_>>(), "injecting provider env");
             env.provider_vars = provider_env.clone();
         }
-        // Codex-specific spawn injection (config overrides + model_provider id).
-        // Read by `Codex::build_thread_start_params` and merged into the
-        // app-server's ThreadStartParams.
-        if let Some(provider_codex) = &executor_action.provider_codex {
-            tracing::debug!(
-                keys = ?provider_codex.config_overrides.keys().collect::<Vec<_>>(),
-                model_provider = %provider_codex.model_provider_id,
-                "injecting codex provider overrides"
-            );
-            env.provider_codex = Some(provider_codex.clone());
+        // Structured injection travels opaquely; only the harness that
+        // emitted it can read it back out of the spawn env.
+        if let Some(structured) = &executor_action.provider_structured {
+            tracing::debug!(?structured, "injecting structured provider payload");
+            env.provider_structured = Some(structured.clone());
         }
 
         // Create the child and stream, add to execution tracker with timeout

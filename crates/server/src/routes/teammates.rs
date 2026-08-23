@@ -8,7 +8,7 @@
 use axum::{Extension, Json, http::StatusCode, response::Json as ResponseJson};
 use db::models::{
     execution_process::{ExecutionProcess, ExecutionProcessRunReason},
-    provider::{AgentInjection, Provider},
+    provider::Provider,
     session::{CreateSession, Session},
     workspace::Workspace,
 };
@@ -18,6 +18,7 @@ use executors::{
         ExecutorAction, ExecutorActionType, coding_agent_initial::CodingAgentInitialRequest,
     },
     profile::ExecutorConfig,
+    provider::ProviderInjection,
 };
 use serde::{Deserialize, Serialize};
 use services::services::container::ContainerService;
@@ -242,10 +243,6 @@ async fn spawn_teammate_core(
                 provider.name.clone(),
             )));
         }
-        if let Some(m) = executor_config.model_id.as_deref() {
-            executor_config.model_id =
-                Some(provider.prefix_opencode_model_id(executor_config.executor, m));
-        }
         Some(provider)
     } else {
         None
@@ -289,12 +286,18 @@ async fn spawn_teammate_core(
     });
 
     let injection = if let Some(provider) = resolved_provider {
-        let model_id = executor_config.model_id.as_deref().unwrap_or("");
-        provider
-            .build_agent_injection(executor_config.executor, model_id)
-            .map_err(|e| ApiError::from(TeammateError::SpawnFailed(e.to_string())))?
+        let (model_id, injection) = provider
+            .resolve_injection(
+                executor_config.executor,
+                executor_config.model_id.as_deref().unwrap_or(""),
+            )
+            .map_err(|e| ApiError::from(TeammateError::SpawnFailed(e.to_string())))?;
+        if executor_config.model_id.is_some() {
+            executor_config.model_id = Some(model_id);
+        }
+        injection
     } else {
-        AgentInjection::default()
+        ProviderInjection::default()
     };
 
     let selected_provider_id_str = provider_uuid.map(|id| id.to_string());
@@ -302,12 +305,7 @@ async fn spawn_teammate_core(
 
     let action = {
         let mut a = ExecutorAction::new(action_type, None);
-        if let Some(env) = injection.env {
-            a = a.with_provider_env(env);
-        }
-        if let Some(codex) = injection.codex {
-            a = a.with_provider_codex(codex);
-        }
+        a = a.with_provider_injection(injection);
         a.with_provider_selection(selected_provider_id_str, selected_model_id_str)
     };
 

@@ -314,9 +314,8 @@ pub async fn follow_up(
     let prompt = payload.prompt;
     let prompt_byte_count = prompt.len();
 
-    // Resolve the provider up front so we can both prefix the OpenCode model
-    // id (see `Provider::prefix_opencode_model_id`) before the action_type is
-    // built AND reuse the loaded record to build the spawn injection.
+    // Resolve the provider up front so the model id reaches the enqueued
+    // config in the form the target harness addresses models by.
     // TODO(phase-G): map ProviderError variants to a structured ApiError code
     // (e.g. PROVIDER_MISSING_API_KEY) so the picker can render a "configure
     // API key for this provider" CTA instead of a generic 400.
@@ -333,8 +332,11 @@ pub async fn follow_up(
         }
 
         if let Some(m) = executor_config.model_id.as_deref() {
-            executor_config.model_id =
-                Some(provider.prefix_opencode_model_id(executor_config.executor, m));
+            executor_config.model_id = Some(
+                provider
+                    .provider_model_id(executor_config.executor, m)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+            );
         }
     }
 
