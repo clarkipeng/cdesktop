@@ -21,7 +21,7 @@ A tool decision is an `ApprovalOutcome`, and an approval carries an `ApprovalSco
 - `once` - authorize this request only.
 - `session` - authorize it and ask the harness to remember, bounded by what the operator was shown.
 
-Every harness cdesktop brokers approvals for has a native "and stop asking" form, so `session` is one request that reaches all of them.
+Each harness cdesktop brokers approvals for has some native "and stop asking" form, so `session` is one request they can all be asked for - though not all of them offer it on every request.
 An adapter with nothing to persist for a given request degrades to `once`; never the reverse.
 The worst an operator can be surprised by is being asked again.
 

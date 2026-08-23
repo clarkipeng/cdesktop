@@ -7,10 +7,12 @@ pub const APPROVAL_TIMEOUT_SECONDS: i64 = 36000; // 10 hours
 
 /// How long an approved decision holds.
 ///
-/// Every harness cdesktop brokers approvals for has a native "and stop asking"
-/// form - OpenCode `reply: "always"`, Claude Code a session-destination
-/// permission update, Codex `acceptForSession`. `Session` is the one request
-/// that reaches all of them; see `docs/design/harness-approvals.md`.
+/// Each harness cdesktop brokers approvals for has some native "and stop
+/// asking" form - OpenCode `reply: "always"`, Claude Code a session-destination
+/// permission update, Codex `acceptForSession`, an ACP agent's `allow_always`
+/// option. `Session` is the one request they can all be asked for, though not
+/// all of them offer it on every request; see
+/// `docs/design/harness-approvals.md`.
 ///
 /// An adapter with nothing to persist for a given request degrades to
 /// [`ApprovalScope::Once`] and never the other way round, so the worst an
