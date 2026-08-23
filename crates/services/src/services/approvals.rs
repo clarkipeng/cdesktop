@@ -14,13 +14,14 @@ use thiserror::Error;
 use tokio::sync::{broadcast, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use ts_rs::TS;
-use utils::approvals::{ApprovalOutcome, ApprovalRequest, ApprovalResponse};
+use utils::approvals::{ApprovalOutcome, ApprovalPatterns, ApprovalRequest, ApprovalResponse};
 use uuid::Uuid;
 
 #[derive(Debug)]
 struct PendingApproval {
     execution_process_id: Uuid,
     tool_name: String,
+    patterns: ApprovalPatterns,
     is_question: bool,
     created_at: DateTime<Utc>,
     timeout_at: DateTime<Utc>,
@@ -41,6 +42,9 @@ pub struct ApprovalInfo {
     pub approval_id: String,
     pub tool_name: String,
     pub execution_process_id: Uuid,
+    /// What the operator is being asked to allow. An empty
+    /// [`ApprovalPatterns::session`] means only a one-shot approval is on offer.
+    pub patterns: ApprovalPatterns,
     pub is_question: bool,
     pub created_at: DateTime<Utc>,
     pub timeout_at: DateTime<Utc>,
@@ -102,6 +106,7 @@ impl Approvals {
             approval_id: req_id.clone(),
             tool_name: request.tool_name.clone(),
             execution_process_id: request.execution_process_id,
+            patterns: request.patterns.clone(),
             is_question,
             created_at: request.created_at,
             timeout_at: request.timeout_at,
@@ -110,6 +115,7 @@ impl Approvals {
         let pending_approval = PendingApproval {
             execution_process_id: request.execution_process_id,
             tool_name: request.tool_name.clone(),
+            patterns: request.patterns.clone(),
             is_question,
             created_at: request.created_at,
             timeout_at: request.timeout_at,
@@ -133,7 +139,7 @@ impl Approvals {
         is_question: bool,
     ) -> Result<(), ApprovalError> {
         match outcome {
-            ApprovalOutcome::Approved | ApprovalOutcome::Denied { .. } if is_question => {
+            ApprovalOutcome::Approved { .. } | ApprovalOutcome::Denied { .. } if is_question => {
                 Err(ApprovalError::InvalidStatus)
             }
             ApprovalOutcome::Answered { .. } if !is_question => Err(ApprovalError::InvalidStatus),
@@ -288,6 +294,7 @@ impl Approvals {
                     approval_id: entry.key().clone(),
                     tool_name: p.tool_name.clone(),
                     execution_process_id: p.execution_process_id,
+                    patterns: p.patterns.clone(),
                     is_question: p.is_question,
                     created_at: p.created_at,
                     timeout_at: p.timeout_at,
@@ -305,12 +312,18 @@ impl Approvals {
 
 #[cfg(test)]
 mod tests {
+    use utils::approvals::ApprovalScope;
+
     use super::*;
 
     #[tokio::test]
     async fn mismatched_execution_process_does_not_consume_approval() {
         let approvals = Approvals::new();
-        let request = ApprovalRequest::new("ExitPlanMode".to_string(), Uuid::new_v4());
+        let request = ApprovalRequest::new(
+            "ExitPlanMode".to_string(),
+            Uuid::new_v4(),
+            ApprovalPatterns::default(),
+        );
         let approval_id = request.id.clone();
         let execution_process_id = request.execution_process_id;
         let (_request, _waiter) = approvals
@@ -323,7 +336,9 @@ mod tests {
                 &approval_id,
                 ApprovalResponse {
                     execution_process_id: Uuid::new_v4(),
-                    status: ApprovalOutcome::Approved,
+                    status: ApprovalOutcome::Approved {
+                        scope: ApprovalScope::Once,
+                    },
                 },
             )
             .await
@@ -337,7 +352,9 @@ mod tests {
                 &approval_id,
                 ApprovalResponse {
                     execution_process_id,
-                    status: ApprovalOutcome::Approved,
+                    status: ApprovalOutcome::Approved {
+                        scope: ApprovalScope::Once,
+                    },
                 },
             )
             .await

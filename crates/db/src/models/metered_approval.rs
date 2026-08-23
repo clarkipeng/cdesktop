@@ -337,15 +337,25 @@ mod tests {
         session_id: Uuid,
         policy: Option<MeteredApprovalPolicy>,
     ) -> NewSessionCommand {
+        metered_command_for(
+            session_id,
+            policy,
+            executors::executors::BaseCodingAgent::ClaudeCode,
+        )
+    }
+
+    fn metered_command_for(
+        session_id: Uuid,
+        policy: Option<MeteredApprovalPolicy>,
+        executor: executors::executors::BaseCodingAgent,
+    ) -> NewSessionCommand {
         NewSessionCommand {
             session_id,
             dedupe_key: None,
             intent: SessionCommandIntent::Continue,
             body: "resume the task".to_owned(),
             config: SessionCommandConfig {
-                executor_config: ExecutorConfig::new(
-                    executors::executors::BaseCodingAgent::ClaudeCode,
-                ),
+                executor_config: ExecutorConfig::new(executor),
                 selected_provider_id: None,
                 auth_binding_id: None,
                 metered: policy.map(|policy| MeteredExecution {
@@ -361,6 +371,48 @@ mod tests {
             .await
             .unwrap();
         command
+    }
+
+    /// The metered gate reads the command's policy and nothing else. Tool
+    /// approvals are brokered per harness and differ widely between them; this
+    /// gate runs above the adapters, before any executor is spawned, so it has
+    /// to be blind to which harness the command names.
+    #[tokio::test]
+    async fn the_metered_gate_decides_the_same_way_for_every_harness() {
+        use executors::executors::BaseCodingAgent::{ClaudeCode, Codex, Opencode};
+
+        let pool = pool().await;
+
+        for (policy, expected) in [
+            (None, MeteredGateDecision::Proceed),
+            (
+                Some(MeteredApprovalPolicy::Auto),
+                MeteredGateDecision::Proceed,
+            ),
+            (
+                Some(MeteredApprovalPolicy::Ask),
+                MeteredGateDecision::AwaitApproval,
+            ),
+            (
+                Some(MeteredApprovalPolicy::Never),
+                MeteredGateDecision::Blocked,
+            ),
+        ] {
+            for executor in [ClaudeCode, Codex, Opencode] {
+                let (command, _) = SessionCommand::enqueue(
+                    &pool,
+                    metered_command_for(Uuid::new_v4(), policy, executor),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    MeteredApproval::gate(&pool, &command).await.unwrap(),
+                    expected,
+                    "policy {policy:?} decided differently for {executor:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

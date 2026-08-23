@@ -18,7 +18,9 @@ use tokio::{
     sync::{Mutex as AsyncMutex, mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use workspace_utils::approvals::{ApprovalStatus, QuestionAnswer, QuestionStatus};
+use workspace_utils::approvals::{
+    ApprovalPatterns, ApprovalScope, ApprovalStatus, QuestionAnswer, QuestionStatus,
+};
 
 use super::{
     slash_commands,
@@ -1555,6 +1557,8 @@ async fn process_event_stream(
                     .unwrap_or("tool")
                     .to_string();
 
+                let patterns = permission_patterns(&data);
+
                 let approvals = ctx.approvals.clone();
                 let client = ctx.client.clone();
                 let base_url = ctx.base_url.to_string();
@@ -1568,6 +1572,7 @@ async fn process_event_stream(
                         auto_approve,
                         approvals.clone(),
                         &permission,
+                        patterns,
                     )
                     .await
                     {
@@ -1577,7 +1582,9 @@ async fn process_event_stream(
                             log_approval_response(
                                 &log_writer,
                                 &tool_call_id,
-                                ApprovalStatus::Approved,
+                                ApprovalStatus::Approved {
+                                    scope: ApprovalScope::Once,
+                                },
                             )
                             .await;
 
@@ -1633,43 +1640,7 @@ async fn process_event_stream(
 
                     log_approval_response(&log_writer, &tool_call_id, status.clone()).await;
 
-                    let (reply, message) = match status {
-                        ApprovalStatus::Approved => ("once", None),
-                        ApprovalStatus::Denied { reason } => {
-                            let msg = reason
-                                .unwrap_or_else(|| "User denied this tool use request".to_string())
-                                .trim()
-                                .to_string();
-                            let msg = if msg.is_empty() {
-                                "User denied this tool use request".to_string()
-                            } else {
-                                msg
-                            };
-                            ("reject", Some(msg))
-                        }
-                        ApprovalStatus::TimedOut => (
-                            "reject",
-                            Some(
-                                "Approval request timed out; proceed without using this tool call."
-                                    .to_string(),
-                            ),
-                        ),
-                        ApprovalStatus::Pending => (
-                            "reject",
-                            Some(
-                                "Approval request could not be completed; proceed without using this tool call."
-                                    .to_string(),
-                            ),
-                        ),
-                    };
-
-                    // If we reject without a message, OpenCode treats it as a hard stop.
-                    // Provide a message so the agent can continue with guidance.
-                    let payload = if reply == "reject" {
-                        serde_json::json!({ "reply": reply, "message": message.unwrap_or_else(|| "User denied this tool use request".to_string()) })
-                    } else {
-                        serde_json::json!({ "reply": reply })
-                    };
+                    let payload = permission_reply_body(&status);
 
                     let _ = client
                         .post(format!("{base_url}/permission/{request_id}/reply"))
@@ -1764,6 +1735,73 @@ async fn log_question_response(log_writer: &LogWriter, tool_call_id: &str, statu
         .await;
 }
 
+/// Message sent back with a rejection. OpenCode treats a `reject` with no
+/// message as a hard stop, so every denial carries guidance the agent can act
+/// on instead of ending the turn.
+const DENIED_MESSAGE: &str = "User denied this tool use request";
+
+/// Read the scope out of a `permission.asked` event.
+///
+/// `patterns` is the command being asked about; `always` is the rule
+/// `reply: "always"` installs for the rest of the session. They are different
+/// widths - a `bash` ask for `echo w2-first` carries `always: ["echo *"]` - so
+/// both reach the operator rather than the narrower one standing in for both.
+fn permission_patterns(event: &Value) -> ApprovalPatterns {
+    ApprovalPatterns {
+        request: string_list(event, "/properties/patterns"),
+        session: string_list(event, "/properties/always"),
+    }
+}
+
+fn string_list(event: &Value, pointer: &str) -> Vec<String> {
+    event
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Map an operator decision onto the body of `POST /permission/{id}/reply`.
+///
+/// `always` is OpenCode's own session-scoped grant: it installs the request's
+/// `always` patterns as a rule, so nothing has to be echoed back with it. That
+/// rule is exactly as wide as what the operator was shown - verified live on
+/// 1.15.10: `always` on a `bash` ask carrying `always: ["echo *"]` let a later
+/// `echo` through untouched and still stopped a later `ls`.
+fn permission_reply_body(status: &ApprovalStatus) -> Value {
+    match status {
+        ApprovalStatus::Approved {
+            scope: ApprovalScope::Once,
+        } => serde_json::json!({ "reply": "once" }),
+        ApprovalStatus::Approved {
+            scope: ApprovalScope::Session,
+        } => serde_json::json!({ "reply": "always" }),
+        ApprovalStatus::Denied { reason } => {
+            reject_body(reason.as_deref().unwrap_or(DENIED_MESSAGE))
+        }
+        ApprovalStatus::TimedOut => {
+            reject_body("Approval request timed out; proceed without using this tool call.")
+        }
+        ApprovalStatus::Pending => reject_body(
+            "Approval request could not be completed; proceed without using this tool call.",
+        ),
+    }
+}
+
+fn reject_body(message: &str) -> Value {
+    let message = match message.trim() {
+        "" => DENIED_MESSAGE,
+        trimmed => trimmed,
+    };
+    serde_json::json!({ "reply": "reject", "message": message })
+}
+
 struct ApprovalCreated {
     approval_id: String,
 }
@@ -1772,6 +1810,7 @@ async fn create_permission_approval(
     auto_approve: bool,
     approvals: Option<Arc<dyn ExecutorApprovalService>>,
     tool_name: &str,
+    patterns: ApprovalPatterns,
 ) -> Result<Option<ApprovalCreated>, ExecutorApprovalError> {
     if auto_approve {
         return Ok(None);
@@ -1781,7 +1820,7 @@ async fn create_permission_approval(
         return Ok(None);
     };
 
-    match approvals.create_tool_approval(tool_name).await {
+    match approvals.create_tool_approval(tool_name, patterns).await {
         Ok(approval_id) => Ok(Some(ApprovalCreated { approval_id })),
         Err(
             ExecutorApprovalError::ServiceUnavailable | ExecutorApprovalError::SessionNotRegistered,
@@ -1796,7 +1835,9 @@ async fn wait_permission_approval(
     cancel: CancellationToken,
 ) -> Result<ApprovalStatus, ExecutorApprovalError> {
     let Some(approvals) = approvals else {
-        return Ok(ApprovalStatus::Approved);
+        return Ok(ApprovalStatus::Approved {
+            scope: ApprovalScope::Once,
+        });
     };
 
     approvals.wait_tool_approval(approval_id, cancel).await
@@ -1847,6 +1888,94 @@ fn answers_to_opencode_format(questions: &[Value], answers: &[QuestionAnswer]) -
                 })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use serde_json::json;
+    use workspace_utils::approvals::{ApprovalScope, ApprovalStatus};
+
+    use super::{permission_patterns, permission_reply_body};
+
+    /// Verbatim `permission.asked` frames from a live `opencode serve`
+    /// (1.15.10). See `fixtures/README.md`.
+    const ECHO_ASK: &str = include_str!("fixtures/permission_asked_bash_echo.json");
+    const LS_ASK: &str = include_str!("fixtures/permission_asked_bash_ls.json");
+
+    fn patterns_of(fixture: &str) -> workspace_utils::approvals::ApprovalPatterns {
+        permission_patterns(&serde_json::from_str(fixture).expect("fixture parses"))
+    }
+
+    #[test]
+    fn session_scope_is_wider_than_the_command_being_asked_about() {
+        let echo = patterns_of(ECHO_ASK);
+        assert_eq!(echo.request, vec!["echo w2-first".to_string()]);
+        assert_eq!(echo.session, vec!["echo *".to_string()]);
+
+        let ls = patterns_of(LS_ASK);
+        assert_eq!(ls.request, vec!["ls -la".to_string()]);
+        assert_eq!(ls.session, vec!["ls *".to_string()]);
+    }
+
+    #[test]
+    fn opencode_always_offers_a_session_scope_on_every_ask() {
+        for fixture in [ECHO_ASK, LS_ASK] {
+            assert!(!patterns_of(fixture).is_once_only());
+        }
+    }
+
+    #[test]
+    fn an_event_without_scope_degrades_to_once_only() {
+        let patterns = permission_patterns(&json!({"properties": {"permission": "bash"}}));
+        assert!(patterns.request.is_empty());
+        assert!(patterns.is_once_only());
+    }
+
+    #[test]
+    fn scope_selects_the_reply_verb() {
+        assert_eq!(
+            permission_reply_body(&ApprovalStatus::Approved {
+                scope: ApprovalScope::Once
+            }),
+            json!({"reply": "once"})
+        );
+        assert_eq!(
+            permission_reply_body(&ApprovalStatus::Approved {
+                scope: ApprovalScope::Session
+            }),
+            json!({"reply": "always"})
+        );
+    }
+
+    #[test]
+    fn every_refusal_carries_a_message() {
+        let refusals = [
+            ApprovalStatus::Denied {
+                reason: Some("not this one".to_string()),
+            },
+            ApprovalStatus::Denied {
+                reason: Some("   ".to_string()),
+            },
+            ApprovalStatus::Denied { reason: None },
+            ApprovalStatus::TimedOut,
+            ApprovalStatus::Pending,
+        ];
+
+        for status in refusals {
+            let body = permission_reply_body(&status);
+            assert_eq!(body["reply"], "reject");
+            let message = body["message"].as_str().expect("reject carries a message");
+            assert!(!message.trim().is_empty(), "empty message for {status:?}");
+        }
+    }
+
+    #[test]
+    fn a_denial_reason_reaches_the_agent_verbatim() {
+        let body = permission_reply_body(&ApprovalStatus::Denied {
+            reason: Some("  use the test fixture instead  ".to_string()),
+        });
+        assert_eq!(body["message"], "use the test fixture instead");
+    }
 }
 
 #[cfg(test)]
