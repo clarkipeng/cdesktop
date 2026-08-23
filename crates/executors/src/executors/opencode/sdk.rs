@@ -427,22 +427,38 @@ pub(super) fn build_authenticated_client(
     build_opencode_client(directory, password)
 }
 
+/// Bounds the short control requests only; anything model-paced opts out with
+/// `OPENCODE_LONG_REQUEST_TIMEOUT`.
+const OPENCODE_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+
 fn build_opencode_client(
     directory: &str,
     password: &str,
 ) -> Result<reqwest::Client, ExecutorError> {
-    const OPENCODE_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+    build_opencode_client_with_timeout(directory, password, OPENCODE_HTTP_TIMEOUT)
+}
+
+fn build_opencode_client_with_timeout(
+    directory: &str,
+    password: &str,
+    request_timeout: Duration,
+) -> Result<reqwest::Client, ExecutorError> {
     const OPENCODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
     reqwest::Client::builder()
         .default_headers(build_default_headers(directory, password))
         .connect_timeout(OPENCODE_CONNECT_TIMEOUT)
-        .timeout(OPENCODE_HTTP_TIMEOUT)
+        .timeout(request_timeout)
         .build()
         .map_err(|err| ExecutorError::Io(io::Error::other(err)))
 }
 
-const OPENCODE_PROMPT_TIMEOUT: Duration = Duration::from_hours(24 * 7);
+/// Applied to requests whose duration is bounded by the model rather than by
+/// the network: a prompt, and the event stream that carries its result. The
+/// client-wide timeout below is a *total* request timeout in reqwest, so
+/// leaving it in force would cut a long turn's event stream mid-flight and
+/// strand the run waiting for a `session.idle` it can no longer receive.
+const OPENCODE_LONG_REQUEST_TIMEOUT: Duration = Duration::from_hours(24 * 7);
 
 fn append_session_error(session_error: &mut Option<String>, message: String) {
     match session_error {
@@ -651,7 +667,7 @@ async fn prompt(
     let resp = client
         .post(format!("{base_url}/session/{session_id}/message"))
         .query(&[("directory", directory)])
-        .timeout(OPENCODE_PROMPT_TIMEOUT)
+        .timeout(OPENCODE_LONG_REQUEST_TIMEOUT)
         .json(&req)
         .send()
         .await
@@ -746,7 +762,7 @@ pub(super) async fn session_command(
     let resp = client
         .post(format!("{base_url}/session/{session_id}/command"))
         .query(&[("directory", directory)])
-        .timeout(OPENCODE_PROMPT_TIMEOUT)
+        .timeout(OPENCODE_LONG_REQUEST_TIMEOUT)
         .json(&req)
         .send()
         .await
@@ -825,7 +841,7 @@ pub(super) async fn session_summarize(
     let resp = client
         .post(format!("{base_url}/session/{session_id}/summarize"))
         .query(&[("directory", directory)])
-        .timeout(OPENCODE_PROMPT_TIMEOUT)
+        .timeout(OPENCODE_LONG_REQUEST_TIMEOUT)
         .json(&req)
         .send()
         .await
@@ -1116,6 +1132,7 @@ pub(super) async fn connect_event_stream(
     let mut req = client
         .get(format!("{base_url}/event"))
         .header(reqwest::header::ACCEPT, "text/event-stream")
+        .timeout(OPENCODE_LONG_REQUEST_TIMEOUT)
         .query(&[("directory", directory)]);
 
     if let Some(last_event_id) = last_event_id {
@@ -1830,4 +1847,96 @@ fn answers_to_opencode_format(questions: &[Value], answers: &[QuestionAnswer]) -
                 })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::{build_opencode_client_with_timeout, connect_event_stream};
+
+    /// An OpenCode server that accepts an SSE subscription and then says nothing
+    /// for `quiet`, the way it does while a model is thinking.
+    async fn quiet_sse_server(quiet: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = socket.read(&mut [0u8; 2048]).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Type: text/event-stream\r\n\
+                              Transfer-Encoding: chunked\r\n\r\n",
+                        )
+                        .await;
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(quiet).await;
+                    let event = "data: {\"type\":\"session.idle\"}\n\n";
+                    let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+                    let _ = socket.write_all(chunk.as_bytes()).await;
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_outlives_the_client_request_timeout() {
+        // A turn is paced by the model, not the network. reqwest's client
+        // timeout is a *total* request timeout, so left in force it severs the
+        // stream mid-turn and the run waits forever for a `session.idle` it can
+        // no longer receive. Scaled down here: a client that gives up after
+        // 300ms, against a server quiet for 900ms.
+        let quiet = Duration::from_millis(900);
+        let base_url = quiet_sse_server(quiet).await;
+        let client =
+            build_opencode_client_with_timeout("/tmp", "password", Duration::from_millis(300))
+                .expect("client builds");
+
+        let mut response = connect_event_stream(&client, &base_url, "/tmp", None)
+            .await
+            .expect("subscribing to the event stream");
+
+        let event = tokio::time::timeout(quiet * 3, response.chunk())
+            .await
+            .expect("the stream must not be cut by the client timeout")
+            .expect("reading the event that arrived after the timeout would have fired")
+            .expect("the stream ended without delivering the event");
+
+        assert!(
+            String::from_utf8_lossy(&event).contains("session.idle"),
+            "the event published after the client timeout never arrived"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_request_still_honours_the_client_timeout() {
+        // The exemption is scoped to the stream: control requests stay bounded,
+        // so a wedged server cannot stall the executor indefinitely.
+        let base_url = quiet_sse_server(Duration::from_secs(30)).await;
+        let client =
+            build_opencode_client_with_timeout("/tmp", "password", Duration::from_millis(300))
+                .expect("client builds");
+
+        let result = client.get(format!("{base_url}/config")).send().await;
+
+        match result {
+            Err(err) => assert!(err.is_timeout(), "expected a timeout, got {err}"),
+            Ok(response) => {
+                let body = response.bytes().await;
+                assert!(body.is_err(), "a quiet control request must time out");
+            }
+        }
+    }
 }
