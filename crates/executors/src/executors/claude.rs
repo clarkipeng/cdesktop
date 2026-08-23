@@ -1937,7 +1937,7 @@ impl ClaudeLogProcessor {
                 }
 
                 let entry_opt = match approval_status {
-                    ApprovalStatus::Pending | ApprovalStatus::Approved => None,
+                    ApprovalStatus::Pending | ApprovalStatus::Approved { .. } => None,
                     ApprovalStatus::Denied { reason } => Some(NormalizedEntry {
                         timestamp: None,
                         entry_type: NormalizedEntryType::UserFeedback {

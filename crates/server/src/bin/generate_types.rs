@@ -64,6 +64,8 @@ fn generate_types_content() -> String {
         db::models::merge::MergeStatus::decl(),
         db::models::merge::PullRequestInfo::decl(),
         services::services::approvals::ApprovalInfo::decl(),
+        utils::approvals::ApprovalPatterns::decl(),
+        utils::approvals::ApprovalScope::decl(),
         utils::approvals::ApprovalStatus::decl(),
         utils::approvals::QuestionAnswer::decl(),
         utils::approvals::QuestionStatus::decl(),
