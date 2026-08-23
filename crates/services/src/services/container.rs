@@ -18,7 +18,6 @@ use db::{
             CreateExecutionProcessRepoState, ExecutionProcessRepoState,
         },
         metered_approval::{MeteredApproval, MeteredApprovalPolicy, MeteredGateDecision},
-        provider::AgentInjection,
         repo::Repo,
         routine_run::RoutineRun,
         session::{CreateSession, Session, SessionError},
@@ -47,6 +46,7 @@ use executors::{
         },
     },
     profile::{ExecutorConfig, ExecutorProfileId},
+    provider::ProviderInjection,
 };
 use futures::{StreamExt, future, stream::BoxStream};
 use git::{GitService, GitServiceError};
@@ -529,14 +529,8 @@ pub trait ContainerService {
                     working_dir,
                 }),
             };
-            let injection = resolved.injection;
             let mut action = ExecutorAction::new(action_type, None);
-            if let Some(env) = injection.env {
-                action = action.with_provider_env(env);
-            }
-            if let Some(codex) = injection.codex {
-                action = action.with_provider_codex(codex);
-            }
+            action = action.with_provider_injection(resolved.injection);
             action = action.with_provider_selection(
                 selected_provider_id.map(|id| id.to_string()),
                 executor_config.model_id.clone(),
@@ -1343,7 +1337,7 @@ pub trait ContainerService {
         workspace: &Workspace,
         executor_config: ExecutorConfig,
         prompt: String,
-        injection: AgentInjection,
+        injection: ProviderInjection,
         selected_provider_id: Option<String>,
         selected_model_id: Option<String>,
     ) -> Result<ExecutionProcess, ContainerError> {
@@ -1395,12 +1389,7 @@ pub trait ContainerService {
                 }),
                 None,
             );
-            if let Some(env) = injection.env {
-                a = a.with_provider_env(env);
-            }
-            if let Some(codex) = injection.codex {
-                a = a.with_provider_codex(codex);
-            }
+            a = a.with_provider_injection(injection);
             a.with_provider_selection(selected_provider_id, selected_model_id)
         };
 

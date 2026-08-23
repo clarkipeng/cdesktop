@@ -24,6 +24,7 @@ use crate::{
     logs::utils::patch,
     model_selector::{AgentInfo, ModelInfo, ModelProvider, PermissionPolicy, ReasoningOption},
     profile::ExecutorConfig,
+    provider::{ProviderContext, ProviderInjection, ProviderInjectionError},
     stdout_dup::create_stdout_pipe_writer,
 };
 
@@ -430,6 +431,80 @@ impl StandardCodingAgentExecutor for Opencode {
 
     fn use_approvals(&mut self, approvals: Arc<dyn ExecutorApprovalService>) {
         self.approvals = Some(approvals);
+    }
+
+    fn brokers_approvals(&self) -> bool {
+        true
+    }
+
+    fn provider_slot(&self) -> &'static str {
+        "opencode"
+    }
+
+    /// OpenCode's session API takes `(provider_id, model_id)` and its only
+    /// signal for the split is the first `/`. A record's enabled models are
+    /// stored as raw vendor ids (`openai/gpt-5.4-mini` for OpenRouter), which
+    /// would split to the wrong provider, so prefix the record slug — the same
+    /// key [`Self::build_provider_injection`] registers the provider under.
+    ///
+    /// No-op for ambient records, whose ids already come prefixed out of
+    /// executor discovery, and for ids that already carry the slug.
+    fn provider_model_id(&self, ctx: &ProviderContext) -> String {
+        let prefix = format!("{}/", ctx.slug);
+        if ctx.ambient || ctx.model_id.starts_with(&prefix) {
+            return ctx.model_id.clone();
+        }
+        format!("{prefix}{}", ctx.model_id)
+    }
+
+    /// Ship the provider/model config through `OPENCODE_CONFIG_CONTENT`, which
+    /// OpenCode loads after the user's global and project configs — so our
+    /// keys win without touching `~/.config/opencode/`.
+    ///
+    /// `enabled_models` must be non-empty: OpenCode's runtime deletes any
+    /// provider whose `models` map is empty (`provider.ts:1393`), silently
+    /// breaking the agent.
+    ///
+    /// `baseURL` and `apiKey` are inserted after the slot's own `options`, and
+    /// `OPENCODE_CONFIG_CONTENT` after its own `env`, so a vendor-quirk entry
+    /// can never shadow the endpoint or the credential.
+    fn build_provider_injection(
+        &self,
+        ctx: &ProviderContext,
+    ) -> Result<ProviderInjection, ProviderInjectionError> {
+        let api_key = ctx.require_api_key(BaseCodingAgent::Opencode)?;
+        let base_url = ctx.require_base_url(BaseCodingAgent::Opencode)?;
+        if ctx.enabled_models.is_empty() {
+            return Err(ProviderInjectionError::EmptyEnabledModels);
+        }
+
+        let mut options = ctx.payload.extra_object("options");
+        options.insert("baseURL".to_string(), Value::String(base_url.to_string()));
+        options.insert("apiKey".to_string(), Value::String(api_key.to_string()));
+
+        let models: Map<String, Value> = ctx
+            .enabled_models
+            .iter()
+            .map(|id| (id.clone(), Value::Object(Map::new())))
+            .collect();
+
+        let mut provider = Map::new();
+        if let Some(npm) = ctx.payload.extra_str("npm") {
+            provider.insert("npm".to_string(), Value::String(npm.to_string()));
+        }
+        provider.insert("name".to_string(), Value::String(ctx.record_name.clone()));
+        provider.insert("options".to_string(), Value::Object(options));
+        provider.insert("models".to_string(), Value::Object(models));
+
+        let providers = Map::from_iter([(ctx.slug.clone(), Value::Object(provider))]);
+        let config = Map::from_iter([("provider".to_string(), Value::Object(providers))]);
+
+        let mut env = ctx.payload.env.clone();
+        env.insert(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            serde_json::to_string(&Value::Object(config))?,
+        );
+        Ok(ProviderInjection::from_env(env))
     }
 
     async fn spawn(
@@ -896,11 +971,72 @@ fn merge_compaction_config(existing_json: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
-    use crate::env::RepoContext;
+    use crate::{env::RepoContext, provider::ProviderPayload};
 
     fn env() -> ExecutionEnv {
         ExecutionEnv::new(RepoContext::default(), false, String::new())
+    }
+
+    fn context(ambient: bool, slug: &str, model_id: &str) -> ProviderContext {
+        ProviderContext {
+            ambient,
+            record_name: "Test Provider".to_string(),
+            slug: slug.to_string(),
+            api_key: Some("sk-real".to_string()),
+            payload: ProviderPayload::from_slot(Some(&json!({
+                "baseUrl": "https://openrouter.ai/api/v1",
+            }))),
+            enabled_models: vec![model_id.to_string()],
+            model_id: model_id.to_string(),
+        }
+    }
+
+    /// The slug/model split OpenCode's session API needs is this adapter's
+    /// business. It has to agree with the key the same adapter registers the
+    /// provider under, which is why both live here.
+    #[test]
+    fn model_ids_carry_the_slug_opencode_splits_on() {
+        let agent = serde_json::from_value::<Opencode>(json!({})).unwrap();
+
+        let ctx = context(false, "openrouter", "openai/gpt-5.4-mini");
+        assert_eq!(
+            agent.provider_model_id(&ctx),
+            "openrouter/openai/gpt-5.4-mini"
+        );
+
+        // Already prefixed: idempotent, not double-prefixed.
+        let ctx = context(false, "openrouter", "openrouter/openai/gpt-5.4-mini");
+        assert_eq!(
+            agent.provider_model_id(&ctx),
+            "openrouter/openai/gpt-5.4-mini"
+        );
+
+        // Ambient ids already come prefixed out of executor discovery.
+        let ctx = context(true, "openrouter", "anthropic/claude-opus-4-5");
+        assert_eq!(agent.provider_model_id(&ctx), "anthropic/claude-opus-4-5");
+    }
+
+    /// The registered provider key and the model-id prefix are the same slug —
+    /// if they drifted, every session would ask a provider that does not exist.
+    #[test]
+    fn registered_provider_key_matches_the_model_id_prefix() {
+        let agent = serde_json::from_value::<Opencode>(json!({})).unwrap();
+        let ctx = context(false, "custom", "gpt-4");
+
+        let env = agent
+            .build_provider_injection(&ctx)
+            .expect("injection builds")
+            .env
+            .expect("non-ambient record emits env");
+        let config: Value =
+            serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("config is JSON");
+
+        let model_id = agent.provider_model_id(&ctx);
+        let (slug, _) = model_id.split_once('/').expect("id carries a slug");
+        assert!(config["provider"][slug].is_object());
     }
 
     #[test]

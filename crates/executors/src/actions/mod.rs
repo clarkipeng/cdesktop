@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use enum_dispatch::enum_dispatch;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
-use workspace_utils::redact::REDACTED_PLACEHOLDER;
 
 use crate::{
     actions::{
@@ -13,8 +12,9 @@ use crate::{
         script::ScriptRequest,
     },
     approvals::ExecutorApprovalService,
-    env::{CodexProviderInjection, ExecutionEnv},
+    env::ExecutionEnv,
     executors::{BaseCodingAgent, ExecutorError, SpawnedChild},
+    provider::{ProviderInjection, StructuredInjection},
 };
 pub mod coding_agent_follow_up;
 pub mod coding_agent_initial;
@@ -44,14 +44,12 @@ pub struct ExecutorAction {
     #[serde(skip)]
     #[ts(skip)]
     pub provider_env: Option<HashMap<String, String>>,
-    /// Codex-specific spawn injection (config overrides + model_provider id),
-    /// populated alongside `provider_env` when the active agent is Codex and
-    /// the user picked a non-Default provider record. See
-    /// `crates/executors/src/env.rs::CodexProviderInjection` for shape.
-    /// `serde(skip)` for the same reason as `provider_env`.
+    /// Structured spawn injection owned by the harness that emitted it,
+    /// populated alongside `provider_env` from the same adapter. Runtime-only
+    /// and `serde(skip)` for the same reason as `provider_env`.
     #[serde(skip)]
     #[ts(skip)]
-    pub provider_codex: Option<CodexProviderInjection>,
+    pub provider_structured: Option<StructuredInjection>,
     /// Provider ID selected for this message; persisted to coding_agent_turns
     /// for recents query and transcript markers (§4/§6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,10 +76,7 @@ impl fmt::Debug for ExecutorAction {
                     .as_ref()
                     .map(|env| env.keys().map(String::as_str).collect::<Vec<_>>()),
             )
-            .field(
-                "provider_codex",
-                &self.provider_codex.as_ref().map(|_| REDACTED_PLACEHOLDER),
-            )
+            .field("provider_structured", &self.provider_structured)
             .field("selected_provider_id", &self.selected_provider_id)
             .field("selected_model_id", &self.selected_model_id)
             .finish()
@@ -94,19 +89,17 @@ impl ExecutorAction {
             typ,
             next_action,
             provider_env: None,
-            provider_codex: None,
+            provider_structured: None,
             selected_provider_id: None,
             selected_model_id: None,
         }
     }
 
-    pub fn with_provider_env(mut self, env: HashMap<String, String>) -> Self {
-        self.provider_env = Some(env);
-        self
-    }
-
-    pub fn with_provider_codex(mut self, injection: CodexProviderInjection) -> Self {
-        self.provider_codex = Some(injection);
+    /// Carry an adapter's spawn injection onto the action, whatever shape it
+    /// took. Call sites never learn which harness produced it.
+    pub fn with_provider_injection(mut self, injection: ProviderInjection) -> Self {
+        self.provider_env = injection.env;
+        self.provider_structured = injection.structured;
         self
     }
 
@@ -123,7 +116,7 @@ impl ExecutorAction {
     pub fn without_provider_bindings(&self) -> Self {
         let mut action = self.clone();
         action.provider_env = None;
-        action.provider_codex = None;
+        action.provider_structured = None;
         action.next_action = action
             .next_action
             .as_ref()
@@ -193,7 +186,7 @@ mod tests {
             coding_agent_initial::CodingAgentInitialRequest,
             script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
         },
-        env::CodexProviderInjection,
+        executors::codex::CodexProviderInjection,
         profile::ExecutorConfig,
     };
 
@@ -215,17 +208,22 @@ mod tests {
                 None,
             ))),
         )
-        .with_provider_env(HashMap::from([(
-            "OPENAI_API_KEY".to_string(),
-            "secret".to_string(),
-        )]))
-        .with_provider_codex(CodexProviderInjection {
-            model_provider_id: "cdt".to_string(),
-            config_overrides: HashMap::from([(
-                "model_providers.cdt.env_key".to_string(),
-                json!("OPENAI_API_KEY"),
-            )]),
-        })
+        .with_provider_injection(
+            ProviderInjection::from_env(HashMap::from([(
+                "OPENAI_API_KEY".to_string(),
+                "secret".to_string(),
+            )]))
+            .with_structured(
+                BaseCodingAgent::Codex,
+                CodexProviderInjection {
+                    model_provider_id: "cdt".to_string(),
+                    config_overrides: HashMap::from([(
+                        "model_providers.cdt.env_key".to_string(),
+                        json!("OPENAI_API_KEY"),
+                    )]),
+                },
+            ),
+        )
         .with_provider_selection(
             Some("2f6dd8b2-5ce0-42c6-9e23-c8ecab684716".to_string()),
             Some("gpt-5.1".to_string()),
@@ -234,7 +232,7 @@ mod tests {
         let storage = action.without_provider_bindings();
 
         assert!(storage.provider_env.is_none());
-        assert!(storage.provider_codex.is_none());
+        assert!(storage.provider_structured.is_none());
         assert_eq!(
             storage.selected_provider_id.as_deref(),
             Some("2f6dd8b2-5ce0-42c6-9e23-c8ecab684716")
@@ -245,7 +243,7 @@ mod tests {
             "2f6dd8b2-5ce0-42c6-9e23-c8ecab684716"
         );
         assert!(serialized.get("provider_env").is_none());
-        assert!(serialized.get("provider_codex").is_none());
+        assert!(serialized.get("provider_structured").is_none());
     }
 
     #[test]
@@ -258,10 +256,10 @@ mod tests {
             }),
             None,
         )
-        .with_provider_env(HashMap::from([(
+        .with_provider_injection(ProviderInjection::from_env(HashMap::from([(
             "ANTHROPIC_AUTH_TOKEN".to_string(),
             "sk-live-secret".to_string(),
-        )]));
+        )])));
 
         // Even the unstripped runtime action must not serialize secrets.
         let serialized = serde_json::to_string(&action).unwrap();
