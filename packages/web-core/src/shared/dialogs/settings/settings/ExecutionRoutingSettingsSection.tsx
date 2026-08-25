@@ -4,14 +4,18 @@ import {
   ClockCounterClockwiseIcon,
   LockKeyIcon,
 } from '@phosphor-icons/react';
+import { useQuery } from '@tanstack/react-query';
 import { Switch } from '@vibe/ui/components/Switch';
 import { cn } from '@/shared/lib/utils';
+import { executionRoutingApi } from '@/shared/lib/api';
+import type { ExecutionRoutingSettings } from 'shared/types';
 import {
   RouteCard,
   RoutingBadge,
 } from '@/shared/components/execution-routing/ExecutionRoutingSummary';
 import {
   executionRoutingFixture,
+  type ExecutionRoutingRouteFixture,
   type MeteredFallbackPolicy,
 } from '@/shared/lib/execution-routing/fixtures';
 import { SettingsCard, SettingsField } from './SettingsComponents';
@@ -38,15 +42,78 @@ const fallbackOptions: {
   },
 ];
 
+/// A live route carries only what sightmesh persists. Its health, resolved
+/// provider and account alias are runtime state that the settings file does
+/// not hold, so they are shown as unavailable rather than invented.
+function LiveRouteRow({
+  route,
+  position,
+}: {
+  route: ExecutionRoutingSettings['routes'][number];
+  position: number;
+}) {
+  return (
+    <div className="grid gap-base md:grid-cols-[32px_minmax(0,1fr)]">
+      <div className="flex h-8 w-8 items-center justify-center rounded-sm border border-border bg-secondary text-sm font-medium text-low">
+        {position}
+      </div>
+      <div className="rounded-sm border border-border bg-panel p-base">
+        <div className="flex min-w-0 flex-wrap items-center gap-half">
+          <h3 className="truncate text-base font-medium text-high">
+            {route.id}
+          </h3>
+          <RoutingBadge
+            tone={route.billingClass === 'metered' ? 'brand' : 'success'}
+          >
+            {route.billingClass}
+          </RoutingBadge>
+        </div>
+        <p className="mt-half truncate text-sm text-low">
+          {route.executor} / {route.model}
+        </p>
+        {(route.accountPool ?? route.account) && (
+          <div className="mt-base text-sm text-normal">
+            <span className="text-low">
+              {route.accountPool ? 'Pool' : 'Account'}
+            </span>
+            <span className="ml-half font-medium">
+              {route.accountPool ?? route.account}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ExecutionRoutingSettingsSection() {
-  const [settings, setSettings] = useState(executionRoutingFixture.settings);
+  const settingsQuery = useQuery({
+    queryKey: ['execution-routing-settings'],
+    queryFn: executionRoutingApi.getSettings,
+  });
+  // `null` means sightmesh has not configured routing on this host.
+  const live = settingsQuery.data ?? null;
+  // cdesktop only reads these settings, so the controls stay interactive
+  // exclusively in fixture mode - a toggle that cannot persist would lie.
+  const [preview, setPreview] = useState(executionRoutingFixture.settings);
+  const source = live ?? preview;
+  const readOnly = live !== null;
 
   return (
     <div className="space-y-6">
       <SettingsCard
         title="Execution routing"
-        description="Fixture-only shell for subscription-first agent routing. Backend contracts, credential resolution, and persistence are intentionally not wired in this checkpoint."
+        description={
+          readOnly
+            ? 'Live routing settings owned by sightmesh. cdesktop reads them; changes are made through sightmesh.'
+            : 'Fixture-only shell for subscription-first agent routing. No routing settings are configured on this host.'
+        }
       >
+        {settingsQuery.isError && (
+          <p className="rounded-sm border border-error/40 bg-panel px-base py-base text-sm text-error">
+            Unable to read routing settings; showing fixtures instead.
+          </p>
+        )}
         <div className="grid gap-base md:grid-cols-3">
           <div className="rounded-sm border border-border bg-panel p-base">
             <div className="flex items-center gap-half text-sm font-medium text-high">
@@ -54,7 +121,8 @@ export function ExecutionRoutingSettingsSection() {
               Ordered routes
             </div>
             <p className="mt-half text-sm text-low">
-              {settings.routes.length} configured fixtures
+              {source.routes.length} configured{' '}
+              {readOnly ? 'routes' : 'fixtures'}
             </p>
           </div>
           <div className="rounded-sm border border-border bg-panel p-base">
@@ -62,9 +130,7 @@ export function ExecutionRoutingSettingsSection() {
               <LockKeyIcon className="size-icon-sm text-brand" />
               Metered fallback
             </div>
-            <p className="mt-half text-sm text-low">
-              {settings.meteredFallback}
-            </p>
+            <p className="mt-half text-sm text-low">{source.meteredFallback}</p>
           </div>
           <div className="rounded-sm border border-border bg-panel p-base">
             <div className="flex items-center gap-half text-sm font-medium text-high">
@@ -72,24 +138,29 @@ export function ExecutionRoutingSettingsSection() {
               Retry policy
             </div>
             <p className="mt-half text-sm text-low">
-              {settings.sameRouteRetries} retries /{' '}
-              {settings.transientBackoffSeconds.join(', ')}s
+              {source.sameRouteRetries} retries /{' '}
+              {source.transientBackoffSeconds.join(', ')}s
             </p>
           </div>
         </div>
 
         <SettingsField
           label="Routing enabled"
-          description="Local preview state only. The backend API seam must own the persisted value."
+          description={
+            readOnly
+              ? 'Persisted by sightmesh. This view is read-only.'
+              : 'Local preview state only. The backend API seam must own the persisted value.'
+          }
         >
           <div className="flex items-center justify-between rounded-sm border border-border bg-panel px-base py-base">
             <span className="text-sm text-normal">
               Resolve new sessions through ordered routes
             </span>
             <Switch
-              checked={settings.enabled}
+              checked={source.enabled}
+              disabled={readOnly}
               onCheckedChange={(enabled) =>
-                setSettings((current) => ({ ...current, enabled }))
+                setPreview((current) => ({ ...current, enabled }))
               }
             />
           </div>
@@ -97,17 +168,22 @@ export function ExecutionRoutingSettingsSection() {
 
         <SettingsField
           label="Metered fallback"
-          description="Mirrors the frozen contract values: auto, ask, never."
+          description={
+            readOnly
+              ? 'Persisted by sightmesh. This view is read-only.'
+              : 'Mirrors the frozen contract values: auto, ask, never.'
+          }
         >
           <div className="grid gap-base md:grid-cols-3">
             {fallbackOptions.map((option) => {
-              const selected = settings.meteredFallback === option.value;
+              const selected = source.meteredFallback === option.value;
               return (
                 <button
                   key={option.value}
                   type="button"
+                  disabled={readOnly}
                   onClick={() =>
-                    setSettings((current) => ({
+                    setPreview((current) => ({
                       ...current,
                       meteredFallback: option.value,
                     }))
@@ -116,7 +192,9 @@ export function ExecutionRoutingSettingsSection() {
                     'rounded-sm border p-base text-left transition-colors',
                     selected
                       ? 'border-brand bg-brand/10'
-                      : 'border-border bg-panel hover:bg-secondary'
+                      : 'border-border bg-panel',
+                    readOnly ? 'cursor-default' : 'hover:bg-secondary',
+                    readOnly && !selected && 'opacity-60'
                   )}
                 >
                   <span className="text-sm font-medium text-high">
@@ -134,20 +212,34 @@ export function ExecutionRoutingSettingsSection() {
 
       <SettingsCard
         title="Route order"
-        description="Routes are evaluated top to bottom; subscription routes can cross provider and model before metered fallback policy is applied."
+        description={
+          readOnly
+            ? 'Routes are evaluated top to bottom. Live route health is not part of the settings contract and is not shown.'
+            : 'Routes are evaluated top to bottom; subscription routes can cross provider and model before metered fallback policy is applied.'
+        }
       >
         <div className="space-y-base">
-          {settings.routes.map((route, index) => (
-            <div
-              key={route.id}
-              className="grid gap-base md:grid-cols-[32px_minmax(0,1fr)]"
-            >
-              <div className="flex h-8 w-8 items-center justify-center rounded-sm border border-border bg-secondary text-sm font-medium text-low">
-                {index + 1}
-              </div>
-              <RouteCard route={route} compact />
-            </div>
-          ))}
+          {live
+            ? live.routes.map((route, index) => (
+                <LiveRouteRow
+                  key={route.id}
+                  route={route}
+                  position={index + 1}
+                />
+              ))
+            : preview.routes.map(
+                (route: ExecutionRoutingRouteFixture, index: number) => (
+                  <div
+                    key={route.id}
+                    className="grid gap-base md:grid-cols-[32px_minmax(0,1fr)]"
+                  >
+                    <div className="flex h-8 w-8 items-center justify-center rounded-sm border border-border bg-secondary text-sm font-medium text-low">
+                      {index + 1}
+                    </div>
+                    <RouteCard route={route} compact />
+                  </div>
+                )
+              )}
         </div>
       </SettingsCard>
 

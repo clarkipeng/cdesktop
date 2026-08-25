@@ -75,11 +75,27 @@ impl SessionCommand {
             .await
     }
 
+    /// Durably queue one command.
+    ///
+    /// A `Replace` enqueue supersedes the session's other pending commands in
+    /// the *same* transaction as its own insert. Steering is therefore one
+    /// durable step: an observer either sees the replacement queued and the
+    /// superseded commands cancelled, or sees neither. Because the interrupt
+    /// that follows is only ever sent after this call returns, a crash can
+    /// never leave a session interrupted with its replacement prompt lost, nor
+    /// leave superseded prompts behind to dispatch alongside the replacement.
+    ///
+    /// Keeping the supersede here rather than at the call site is what makes
+    /// that hold for every caller: there is no way to queue a `Replace` and
+    /// forget to cancel what it replaces.
     pub async fn enqueue(
         pool: &SqlitePool,
         command: NewSessionCommand,
     ) -> Result<(Self, bool), sqlx::Error> {
         let id = Uuid::new_v4();
+        let session_id = command.session_id;
+        let replaces_pending = command.intent == SessionCommandIntent::Replace;
+        let mut transaction = pool.begin().await?;
         let inserted = sqlx::query_as::<_, Self>(
             r#"INSERT INTO session_commands (
                    id, session_id, dedupe_key, intent, body, config
@@ -88,25 +104,40 @@ impl SessionCommand {
                RETURNING *"#,
         )
         .bind(id)
-        .bind(command.session_id)
+        .bind(session_id)
         .bind(command.dedupe_key.as_deref())
         .bind(command.intent)
         .bind(command.body)
         .bind(Json(command.config))
-        .fetch_optional(pool)
+        .fetch_optional(&mut *transaction)
         .await?;
 
         if let Some(inserted) = inserted {
+            // Only a freshly inserted Replace supersedes. A deduped retry
+            // resolves to the existing row, whose supersede already ran.
+            if replaces_pending {
+                sqlx::query(
+                    "UPDATE session_commands \
+                     SET state = 'cancelled', finished_at = datetime('now', 'subsec') \
+                     WHERE session_id = ? AND id != ? AND state = 'pending'",
+                )
+                .bind(session_id)
+                .bind(inserted.id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
             return Ok((inserted, true));
         }
 
         let existing = sqlx::query_as::<_, Self>(
             "SELECT * FROM session_commands WHERE session_id = ? AND dedupe_key = ?",
         )
-        .bind(command.session_id)
+        .bind(session_id)
         .bind(command.dedupe_key)
-        .fetch_one(pool)
+        .fetch_one(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok((existing, false))
     }
 
@@ -359,22 +390,6 @@ impl SessionCommand {
              WHERE session_id = ? AND state = 'pending'",
         )
         .bind(session_id)
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn cancel_pending_except(
-        pool: &SqlitePool,
-        session_id: Uuid,
-        command_id: Uuid,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE session_commands SET state = 'cancelled', finished_at = datetime('now', 'subsec') \
-             WHERE session_id = ? AND id != ? AND state = 'pending'",
-        )
-        .bind(session_id)
-        .bind(command_id)
         .execute(pool)
         .await?;
         Ok(())
@@ -878,19 +893,79 @@ mod tests {
     async fn replace_cancels_only_older_pending_commands() {
         let pool = pool().await;
         let session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
         SessionCommand::enqueue(&pool, command(session_id, "older", None))
+            .await
+            .unwrap();
+        SessionCommand::enqueue(&pool, command(other_session_id, "untouched", None))
             .await
             .unwrap();
         let mut replacement = command(session_id, "replace", Some("replacement"));
         replacement.intent = SessionCommandIntent::Replace;
-        let (replacement, _) = SessionCommand::enqueue(&pool, replacement).await.unwrap();
 
-        SessionCommand::cancel_pending_except(&pool, session_id, replacement.id)
-            .await
-            .unwrap();
+        // Enqueue alone supersedes: the steer route no longer runs a second
+        // statement, so this asserts the whole durable step.
+        let (replacement, _) = SessionCommand::enqueue(&pool, replacement).await.unwrap();
 
         let pending = SessionCommand::pending(&pool, session_id).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, replacement.id);
+        // Superseding is scoped to the steered session.
+        assert_eq!(
+            SessionCommand::pending(&pool, other_session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_enqueue_leaves_pending_commands_alone() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        SessionCommand::enqueue(&pool, command(session_id, "first", None))
+            .await
+            .unwrap();
+        SessionCommand::enqueue(&pool, command(session_id, "second", None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SessionCommand::pending(&pool, session_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn deduped_replace_does_not_supersede_a_second_time() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let mut replacement = command(session_id, "replace", Some("steer-1"));
+        replacement.intent = SessionCommandIntent::Replace;
+        let (replacement, inserted) = SessionCommand::enqueue(&pool, replacement).await.unwrap();
+        assert!(inserted);
+
+        // A queued follow-up after the steer must survive a retried steer that
+        // dedupes to the same row - the supersede belongs to the first insert.
+        SessionCommand::enqueue(&pool, command(session_id, "after", None))
+            .await
+            .unwrap();
+        let mut retry = command(session_id, "replace", Some("steer-1"));
+        retry.intent = SessionCommandIntent::Replace;
+        let (deduped, inserted) = SessionCommand::enqueue(&pool, retry).await.unwrap();
+        assert!(!inserted);
+        assert_eq!(deduped.id, replacement.id);
+
+        assert_eq!(
+            SessionCommand::pending(&pool, session_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

@@ -719,6 +719,10 @@ safe_message: string, };
 
 export type MeteredApprovalResponseRequest = { approved: boolean, reason?: string, };
 
+export type ExecutionRoutingSettings = { enabled: boolean, routes: Array<ExecutionRoutingRoute>, meteredFallback: string, sameRouteRetries: number, transientBackoffSeconds: Array<number>, approvalTimeoutMinutes: number, allRoutesExhausted: string, notifyOnSwap: boolean, exposeAccountAlias: boolean, fallbackOnFreeFailure: boolean, };
+
+export type ExecutionRoutingRoute = { id: string, executor: string, model: string, billingClass: string, accountPool?: string | null, account?: string | null, };
+
 export type ConflictOp = "rebase" | "merge" | "cherry_pick" | "revert";
 
 export type ExecutorAction = { typ: ExecutorActionType, next_action: ExecutorAction | null, };
