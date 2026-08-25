@@ -87,7 +87,8 @@
     "emptyDescription": "La conversación de tu sesión aparecerá aquí cuando comience un nuevo turno.",
     "toolName": {
       "Skill": "Habilidad"
-    }
+    },
+    "spawnInstructions": "Instrucciones de creación"
   },
   "changesPanel": {
     "notGitRepo": "No es un repositorio Git — sin diff disponible"

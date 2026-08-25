@@ -71,7 +71,8 @@
     "emptyDescription": "新一轮开始后，会话内容将在此处显示。",
     "toolName": {
       "Skill": "技能"
-    }
+    },
+    "spawnInstructions": "启动指令"
   },
   "changesPanel": {
     "notGitRepo": "不是 Git 仓库 — 无可用 diff"

@@ -76,7 +76,8 @@
     "emptyDescription": "Your workspace conversation will appear here once a new turn starts.",
     "toolName": {
       "Skill": "Skill"
-    }
+    },
+    "spawnInstructions": "Spawn instructions"
   },
   "changesPanel": {
     "notGitRepo": "Not a Git repo — no diff available"

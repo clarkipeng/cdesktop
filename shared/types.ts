@@ -874,6 +874,11 @@ export type AppendPrompt = string | null;
 
 export type CodingAgentInitialRequest = { prompt: string, 
 /**
+ * Provenance of `prompt`. Defaults to `User` for back-compat with
+ * actions persisted before the marker existed.
+ */
+prompt_kind: PromptKind, 
+/**
  * Unified executor identity + overrides
  */
 executor_config: ExecutorConfig, 
@@ -882,6 +887,8 @@ executor_config: ExecutorConfig,
  * If None, uses the container_ref directory directly.
  */
 working_dir: string | null, };
+
+export type PromptKind = "user" | "spawn";
 
 export type CodingAgentFollowUpRequest = { prompt: string, session_id: string, reset_to_message_id: string | null, 
 /**
