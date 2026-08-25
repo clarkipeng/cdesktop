@@ -357,8 +357,10 @@ pub async fn follow_up(
         },
     )
     .await?;
+    // The replacement and the cancellation of what it supersedes are already
+    // committed by `enqueue`, so the interrupt below can only ever land on a
+    // queue that is durably correct.
     if inserted && intent == SessionCommandIntent::Replace {
-        SessionCommand::cancel_pending_except(pool, session.id, command.id).await?;
         for process in ExecutionProcess::find_by_session_id(pool, session.id, false).await? {
             if process.status == db::models::execution_process::ExecutionProcessStatus::Running
                 && process.run_reason == ExecutionProcessRunReason::CodingAgent

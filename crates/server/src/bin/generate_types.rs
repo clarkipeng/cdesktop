@@ -232,6 +232,8 @@ fn generate_types_content() -> String {
         executors::outcome::OutcomeBindingScope::decl(),
         executors::outcome::NormalizedExecutionOutcome::decl(),
         server::routes::metered_approvals::MeteredApprovalResponseRequest::decl(),
+        server::routes::execution_routing::ExecutionRoutingSettings::decl(),
+        server::routes::execution_routing::ExecutionRoutingRoute::decl(),
         git::ConflictOp::decl(),
         executors::actions::ExecutorAction::decl(),
         executors::mcp_config::McpConfig::decl(),

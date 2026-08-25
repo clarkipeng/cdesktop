@@ -13,6 +13,7 @@ import {
   DirectoryEntry,
   ExecutionProcess,
   ExecutionProcessOutcome,
+  ExecutionRoutingSettings,
   ExecutionProcessRepoState,
   GitBranch,
   Repo,
@@ -824,6 +825,16 @@ export const workspacesApi = {
       CreateWorkspaceFromPrResponse,
       CreateFromPrError
     >(response);
+  },
+};
+
+// Execution Routing APIs
+export const executionRoutingApi = {
+  // `null` means sightmesh has not configured routing on this host; the
+  // dashboard falls back to fixtures only in that case.
+  getSettings: async (): Promise<ExecutionRoutingSettings | null> => {
+    const response = await makeRequest('/api/execution-routing/settings');
+    return handleApiResponse<ExecutionRoutingSettings | null>(response);
   },
 };
 
