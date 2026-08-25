@@ -15,7 +15,8 @@ use db::models::{
 use deployment::Deployment;
 use executors::{
     actions::{
-        ExecutorAction, ExecutorActionType, coding_agent_initial::CodingAgentInitialRequest,
+        ExecutorAction, ExecutorActionType,
+        coding_agent_initial::{CodingAgentInitialRequest, PromptKind},
     },
     profile::ExecutorConfig,
     provider::ProviderInjection,
@@ -279,11 +280,11 @@ async fn spawn_teammate_core(
     // initial request so the teammate is never an empty-history session.
     let bootstrap_prompt = build_wrap_template(&payload.name, workspace, payload.prompt.as_deref());
 
-    let action_type = ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-        prompt: bootstrap_prompt,
-        executor_config: executor_config.clone(),
+    let action_type = ExecutorActionType::CodingAgentInitialRequest(build_spawn_request(
+        bootstrap_prompt,
+        executor_config.clone(),
         working_dir,
-    });
+    ));
 
     let injection = if let Some(provider) = resolved_provider {
         let (model_id, injection) = provider
@@ -384,6 +385,22 @@ fn build_wrap_template(name: &str, workspace: &Workspace, user_prompt: Option<&s
          Keep dependent or destructive actions sequential.\n\
          Do not assume your manager is reading this transcript in real time.]\n\n{user_section}",
     )
+}
+
+/// A teammate's first message is always bootstrap instructions, so the spawn
+/// path is the one place that can state so. The marker persists with the
+/// action; the transcript reads it back instead of inspecting prompt text.
+fn build_spawn_request(
+    prompt: String,
+    executor_config: ExecutorConfig,
+    working_dir: Option<String>,
+) -> CodingAgentInitialRequest {
+    CodingAgentInitialRequest {
+        prompt,
+        prompt_kind: PromptKind::Spawn,
+        executor_config,
+        working_dir,
+    }
 }
 
 fn workspace_label(workspace: &Workspace) -> String {
@@ -507,6 +524,26 @@ mod tests {
         ));
         assert!(!created_session, "rejected request created a session");
         assert!(!created_process, "rejected request created a process");
+    }
+
+    #[test]
+    fn spawn_marks_its_bootstrap_prompt_and_the_marker_persists() {
+        let ws = make_test_workspace("demo");
+        let bootstrap = build_wrap_template("reviewer", &ws, Some("audit the diff"));
+
+        let request = build_spawn_request(
+            bootstrap,
+            ExecutorConfig::new(executors::executors::BaseCodingAgent::ClaudeCode),
+            None,
+        );
+
+        assert_eq!(request.prompt_kind, PromptKind::Spawn);
+        assert!(request.prompt.contains("audit the diff"));
+
+        // The transcript reads the marker back off the stored executor action,
+        // so it has to survive serialization.
+        let persisted = serde_json::to_value(&request).unwrap();
+        assert_eq!(persisted["prompt_kind"], "spawn");
     }
 
     fn make_test_workspace(name: &str) -> Workspace {

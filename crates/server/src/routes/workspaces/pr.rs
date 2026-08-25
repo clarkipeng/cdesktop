@@ -19,8 +19,9 @@ use db::models::{
 };
 use deployment::Deployment;
 use executors::actions::{
-    ExecutorAction, ExecutorActionType, coding_agent_follow_up::CodingAgentFollowUpRequest,
-    coding_agent_initial::CodingAgentInitialRequest,
+    ExecutorAction, ExecutorActionType,
+    coding_agent_follow_up::CodingAgentFollowUpRequest,
+    coding_agent_initial::{CodingAgentInitialRequest, PromptKind},
 };
 use git::{GitCliError, GitRemote, GitServiceError};
 use git_host::{
@@ -168,6 +169,7 @@ async fn trigger_pr_description_follow_up(
     } else {
         ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
             prompt,
+            prompt_kind: PromptKind::User,
             executor_config: executors::profile::ExecutorConfig::from(executor_profile_id.clone()),
             working_dir,
         })

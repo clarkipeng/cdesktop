@@ -183,7 +183,7 @@ mod tests {
     use super::*;
     use crate::{
         actions::{
-            coding_agent_initial::CodingAgentInitialRequest,
+            coding_agent_initial::{CodingAgentInitialRequest, PromptKind},
             script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
         },
         executors::codex::CodexProviderInjection,
@@ -195,6 +195,7 @@ mod tests {
         let action = ExecutorAction::new(
             ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
                 prompt: "ship it".to_string(),
+                prompt_kind: PromptKind::User,
                 executor_config: ExecutorConfig::new(BaseCodingAgent::Codex),
                 working_dir: None,
             }),
@@ -251,6 +252,7 @@ mod tests {
         let action = ExecutorAction::new(
             ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
                 prompt: "ship it".to_string(),
+                prompt_kind: PromptKind::User,
                 executor_config: ExecutorConfig::new(BaseCodingAgent::ClaudeCode),
                 working_dir: None,
             }),

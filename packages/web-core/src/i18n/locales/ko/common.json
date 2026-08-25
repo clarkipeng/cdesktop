@@ -87,7 +87,8 @@
     "emptyDescription": "새 턴이 시작되면 세션 대화가 여기에 표시됩니다.",
     "toolName": {
       "Skill": "스킬"
-    }
+    },
+    "spawnInstructions": "생성 지침"
   },
   "changesPanel": {
     "notGitRepo": "Git 저장소가 아닙니다 — diff를 사용할 수 없습니다"

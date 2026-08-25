@@ -34,7 +34,7 @@ use executors::{
     actions::{
         ExecutorAction, ExecutorActionType,
         coding_agent_follow_up::CodingAgentFollowUpRequest,
-        coding_agent_initial::CodingAgentInitialRequest,
+        coding_agent_initial::{CodingAgentInitialRequest, PromptKind},
         script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
     },
     executors::{ExecutorError, StandardCodingAgentExecutor},
@@ -525,6 +525,7 @@ pub trait ContainerService {
                 }
                 None => ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
                     prompt,
+                    prompt_kind: PromptKind::User,
                     executor_config: executor_config.clone(),
                     working_dir,
                 }),
@@ -1384,6 +1385,7 @@ pub trait ContainerService {
             let mut a = ExecutorAction::new(
                 ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
                     prompt,
+                    prompt_kind: PromptKind::User,
                     executor_config: executor_config.clone(),
                     working_dir,
                 }),

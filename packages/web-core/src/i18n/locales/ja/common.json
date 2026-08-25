@@ -87,7 +87,8 @@
     "emptyDescription": "新しいターンが始まると、ワークスペースの会話がここに表示されます。",
     "toolName": {
       "Skill": "スキル"
-    }
+    },
+    "spawnInstructions": "起動時の指示"
   },
   "changesPanel": {
     "notGitRepo": "Git リポジトリではありません — 差分はありません"

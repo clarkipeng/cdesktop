@@ -71,7 +71,8 @@
     "emptyDescription": "新一輪開始後，工作階段對話將顯示於此。",
     "toolName": {
       "Skill": "技能"
-    }
+    },
+    "spawnInstructions": "啟動指令"
   },
   "changesPanel": {
     "notGitRepo": "不是 Git 儲存庫 — 沒有可用的差異"

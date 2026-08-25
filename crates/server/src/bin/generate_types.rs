@@ -273,6 +273,7 @@ fn generate_types_content() -> String {
         executors::executors::hermes::Hermes::decl(),
         executors::executors::AppendPrompt::decl(),
         executors::actions::coding_agent_initial::CodingAgentInitialRequest::decl(),
+        executors::actions::coding_agent_initial::PromptKind::decl(),
         executors::actions::coding_agent_follow_up::CodingAgentFollowUpRequest::decl(),
         executors::actions::review::ReviewRequest::decl(),
         executors::actions::review::RepoReviewContext::decl(),
