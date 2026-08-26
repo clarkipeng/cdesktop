@@ -323,6 +323,16 @@ impl LocalContainerService {
     /// has already elapsed. Archiving therefore never shortens how long an
     /// idle worktree survives on disk, whatever the operator configures.
     async fn auto_archive_idle_workspaces(&self) -> Result<(), DeploymentError> {
+        // Archiving moves a workspace from the 72-hour retention window into
+        // the one-hour one, so it is upstream of worktree deletion and honours
+        // the same kill switch. `pnpm run dev` sets this, which keeps a
+        // developer's live workspaces untouched.
+        if std::env::var("DISABLE_WORKTREE_CLEANUP").is_ok() {
+            tracing::info!(
+                "Auto-archive is disabled via DISABLE_WORKTREE_CLEANUP environment variable"
+            );
+            return Ok(());
+        }
         let (enabled, idle_days) = {
             let config = self.config.read().await;
             (config.auto_archive_enabled, config.auto_archive_idle_days)
