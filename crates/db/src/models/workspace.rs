@@ -923,18 +923,20 @@ mod tests {
             .await
             .unwrap();
 
-        let (status, completed_at) = match completed_days_ago {
+        let (status, completed_offset) = match completed_days_ago {
             Some(days) => ("completed", Some(format!("-{days} days"))),
             None => ("running", None),
         };
+        // Number every placeholder: mixing `?` with `?3` renumbers the
+        // anonymous ones and silently binds the wrong column.
         sqlx::query(
             "INSERT INTO execution_processes (id, session_id, status, completed_at)
-             VALUES (?, ?, ?, CASE WHEN ?3 IS NULL THEN NULL ELSE datetime('now', ?3) END)",
+             VALUES (?1, ?2, ?3, CASE WHEN ?4 IS NULL THEN NULL ELSE datetime('now', ?4) END)",
         )
         .bind(Uuid::new_v4())
         .bind(session_id)
         .bind(status)
-        .bind(completed_at)
+        .bind(completed_offset)
         .execute(pool)
         .await
         .unwrap();
