@@ -955,7 +955,7 @@ mod tests {
         add_execution(&pool, long_finished, Some(30)).await;
 
         // Pinned workspaces are held open deliberately.
-        let pinned = workspace_idle_for(&pool, 30, true).await;
+        let _pinned = workspace_idle_for(&pool, 30, true).await;
 
         // Still running. A workspace blocked on an approval is in this state:
         // the process that raised the approval has not completed.
@@ -963,7 +963,7 @@ mod tests {
         add_execution(&pool, running, None).await;
 
         // Touched recently.
-        let fresh = workspace_idle_for(&pool, 1, false).await;
+        let _fresh = workspace_idle_for(&pool, 1, false).await;
 
         // Old workspace record, but its last run finished an hour ago.
         let recently_ran = workspace_idle_for(&pool, 30, false).await;
