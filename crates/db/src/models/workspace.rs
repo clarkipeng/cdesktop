@@ -306,6 +306,21 @@ impl Workspace {
     /// Find workspaces that are expired and eligible for cleanup.
     /// Uses accelerated cleanup (1 hour) for archived workspaces.
     /// Uses standard cleanup (72 hours) for non-archived workspaces.
+    ///
+    /// Expiry is measured from the later of the workspace's own `updated_at`
+    /// and its most recent completed execution, expressed as an aggregate over
+    /// a `UNION ALL` rather than a scalar `max()`. The scalar form returns NULL
+    /// as soon as one argument is NULL, so a workspace that never completed an
+    /// execution compared against NULL and could never expire - it kept its
+    /// worktree forever. `updated_at` is always present, so the aggregate form
+    /// cannot produce NULL and no workspace can hide behind an empty execution
+    /// history. This mirrors [`Self::find_idle_for_auto_archive`].
+    ///
+    /// Only worktree-backed workspaces are selected: a `use_worktree = FALSE`
+    /// workspace owns no managed directory, so there is nothing to reclaim and
+    /// nothing to mark. `container_ref` is deliberately not required, because
+    /// `WorkspaceManager::workspace_dir_for` derives the directory from the
+    /// workspace id and name when the column is unset.
     pub async fn find_expired_for_cleanup(
         pool: &SqlitePool,
     ) -> Result<Vec<Workspace>, sqlx::Error> {
@@ -328,37 +343,34 @@ impl Workspace {
                 w.use_worktree as "use_worktree!: bool",
                 w.source as "source!: WorkspaceSource"
             FROM workspaces w
-            LEFT JOIN sessions s ON w.id = s.workspace_id
-            LEFT JOIN execution_processes ep ON s.id = ep.session_id AND ep.completed_at IS NOT NULL
-            WHERE w.container_ref IS NOT NULL
+            WHERE w.use_worktree = TRUE
                 AND w.worktree_deleted = FALSE
-                AND w.id NOT IN (
-                    SELECT DISTINCT s2.workspace_id
-                    FROM sessions s2
-                    JOIN execution_processes ep2 ON s2.id = ep2.session_id
-                    WHERE ep2.completed_at IS NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM sessions s
+                    JOIN execution_processes ep ON ep.session_id = s.id
+                    WHERE s.workspace_id = w.id
+                      AND ep.completed_at IS NULL
                 )
-            GROUP BY w.id, w.container_ref, w.updated_at
-            HAVING datetime('now', 'localtime',
-                CASE
-                    WHEN w.archived = 1
-                    THEN '-1 hours'
-                    ELSE '-72 hours'
-                END
-            ) > datetime(
-                MAX(
-                    max(
-                        datetime(w.updated_at),
-                        datetime(ep.completed_at)
+                AND datetime('now',
+                    CASE
+                        WHEN w.archived = 1
+                        THEN '-1 hours'
+                        ELSE '-72 hours'
+                    END
+                ) > (
+                    SELECT MAX(activity)
+                    FROM (
+                        SELECT datetime(w.updated_at) AS activity
+                        UNION ALL
+                        SELECT datetime(ep.completed_at)
+                        FROM sessions s
+                        JOIN execution_processes ep ON ep.session_id = s.id
+                        WHERE s.workspace_id = w.id
+                          AND ep.completed_at IS NOT NULL
                     )
                 )
-            )
-            ORDER BY MAX(
-                CASE
-                    WHEN ep.completed_at IS NOT NULL THEN ep.completed_at
-                    ELSE w.updated_at
-                END
-            ) ASC
+            ORDER BY w.updated_at ASC
             "#
         )
         .fetch_all(pool)
@@ -1004,6 +1016,144 @@ mod tests {
                 .unwrap(),
             vec![five_days]
         );
+    }
+
+    /// Insert a workspace whose own last activity was `age_hours` ago.
+    async fn workspace_aged_hours(pool: &SqlitePool, age_hours: i64, archived: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workspaces (id, branch, name, container_ref, updated_at, archived)
+             VALUES (?1, 'main', 'ws', '/tmp/ws', datetime('now', ?2), ?3)",
+        )
+        .bind(id)
+        .bind(format!("-{age_hours} hours"))
+        .bind(archived)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn expired_ids(pool: &SqlitePool) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = Workspace::find_expired_for_cleanup(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The regression that let 82GB accumulate: a workspace that never
+    /// completed an execution was compared against a NULL activity timestamp,
+    /// so it never expired and kept its worktree forever.
+    #[tokio::test]
+    async fn cleanup_reclaims_archived_workspaces_that_never_ran_anything() {
+        let pool = migrated_pool().await;
+        let never_ran = workspace_aged_hours(&pool, 24, true).await;
+
+        assert_eq!(expired_ids(&pool).await, vec![never_ran]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_respects_the_archived_and_live_retention_windows() {
+        let pool = migrated_pool().await;
+
+        // Archived: eligible after 1 hour.
+        let archived_expired = workspace_aged_hours(&pool, 2, true).await;
+        let _archived_fresh = workspace_aged_hours(&pool, 0, true).await;
+
+        // Live: eligible after 72 hours.
+        let live_expired = workspace_aged_hours(&pool, 80, false).await;
+        let _live_fresh = workspace_aged_hours(&pool, 70, false).await;
+
+        let mut expected = vec![archived_expired, live_expired];
+        expected.sort();
+        assert_eq!(expired_ids(&pool).await, expected);
+    }
+
+    /// Expiry is measured in UTC on both sides. Comparing a UTC column against
+    /// `datetime('now','localtime')` shifted every window by the machine's UTC
+    /// offset, which delayed cleanup west of UTC and, worse, expired live
+    /// worktrees hours early east of it.
+    #[tokio::test]
+    async fn cleanup_windows_do_not_shift_with_the_local_timezone() {
+        let pool = migrated_pool().await;
+
+        // Just inside the live window. A positive UTC offset would drag this
+        // across the threshold and delete a worktree that is still in use.
+        let _almost_expired = workspace_aged_hours(&pool, 71, false).await;
+        // Just inside the archived window.
+        let _almost_expired_archived = workspace_aged_hours(&pool, 0, true).await;
+
+        assert!(expired_ids(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_selects_a_workspace_with_an_open_execution() {
+        let pool = migrated_pool().await;
+        let running = workspace_aged_hours(&pool, 500, true).await;
+        add_execution(&pool, running, None).await;
+
+        assert!(expired_ids(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_measures_expiry_from_the_last_completed_execution() {
+        let pool = migrated_pool().await;
+
+        // Old record, but it finished running moments ago.
+        let recently_ran = workspace_aged_hours(&pool, 500, true).await;
+        add_execution(&pool, recently_ran, Some(0)).await;
+
+        assert!(expired_ids(&pool).await.is_empty());
+    }
+
+    /// Sweeping twice back to back is a no-op the second time: the flag set by
+    /// the first pass removes the workspace from the selection.
+    #[tokio::test]
+    async fn cleanup_selection_is_idempotent_once_the_worktree_is_marked() {
+        let pool = migrated_pool().await;
+        let expired = workspace_aged_hours(&pool, 24, true).await;
+        assert_eq!(expired_ids(&pool).await, vec![expired]);
+
+        Workspace::mark_worktree_deleted(&pool, expired)
+            .await
+            .unwrap();
+
+        assert!(expired_ids(&pool).await.is_empty());
+    }
+
+    /// A worktree-disabled workspace runs in the user's real repository, so it
+    /// owns nothing to reclaim and must never be offered to the sweep.
+    #[tokio::test]
+    async fn cleanup_never_selects_a_worktree_disabled_workspace() {
+        let pool = migrated_pool().await;
+        let direct = workspace_aged_hours(&pool, 500, true).await;
+        sqlx::query("UPDATE workspaces SET use_worktree = FALSE WHERE id = ?")
+            .bind(direct)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(expired_ids(&pool).await.is_empty());
+    }
+
+    /// `workspace_dir_for` derives a directory from the workspace id and name
+    /// when `container_ref` is unset, so requiring the column would strand
+    /// those directories permanently.
+    #[tokio::test]
+    async fn cleanup_selects_workspaces_with_no_container_ref() {
+        let pool = migrated_pool().await;
+        let no_ref = workspace_aged_hours(&pool, 24, true).await;
+        sqlx::query("UPDATE workspaces SET container_ref = NULL WHERE id = ?")
+            .bind(no_ref)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(expired_ids(&pool).await, vec![no_ref]);
     }
 
     #[test]

@@ -290,6 +290,21 @@ impl LocalContainerService {
                 });
         }
 
+        // `worktree_deleted` means "this workspace owns no directory on disk",
+        // so it is set from an observation rather than from the assumption that
+        // teardown succeeded. Teardown swallows per-worktree errors, so marking
+        // unconditionally would strand a surviving directory behind a flag that
+        // excludes it from every future sweep. Leaving the flag unset keeps the
+        // workspace eligible and the next sweep retries it.
+        if workspace_dir.exists() {
+            tracing::warn!(
+                "Workspace directory {} survived cleanup for workspace {}; leaving it eligible for the next sweep",
+                workspace_dir.display(),
+                workspace.id
+            );
+            return;
+        }
+
         let _ = Workspace::mark_worktree_deleted(&self.db.pool, workspace.id).await;
     }
 
@@ -310,8 +325,42 @@ impl LocalContainerService {
             "Found {} expired workspaces to clean up",
             expired_workspaces.len()
         );
+        let mut skipped_dirty = 0usize;
         for workspace in &expired_workspaces {
+            // Uncommitted work outranks disk. The guard lives here rather than
+            // in `cleanup_workspace` because the other caller is an explicit
+            // user deletion, which must still take the workspace with it.
+            // A dirty workspace keeps `worktree_deleted` unset, so it stays
+            // visible and is re-offered once the changes are committed or
+            // discarded.
+            match self.is_container_clean(workspace).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    skipped_dirty += 1;
+                    tracing::warn!(
+                        "Skipping cleanup of expired workspace {}: it has uncommitted changes",
+                        workspace.id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // An unreadable worktree is not a clean one.
+                    skipped_dirty += 1;
+                    tracing::warn!(
+                        "Skipping cleanup of expired workspace {}: could not determine whether it is clean: {}",
+                        workspace.id,
+                        e
+                    );
+                    continue;
+                }
+            }
             self.cleanup_workspace(workspace).await;
+        }
+        if skipped_dirty > 0 {
+            tracing::info!(
+                "Preserved {} expired workspaces holding uncommitted changes",
+                skipped_dirty
+            );
         }
         Ok(())
     }
@@ -1248,11 +1297,14 @@ impl ContainerService for LocalContainerService {
     }
 
     async fn is_container_clean(&self, workspace: &Workspace) -> Result<bool, ContainerError> {
-        let Some(container_ref) = &workspace.container_ref else {
+        // Resolve through the same helper that teardown uses, so "the directory
+        // we inspect" and "the directory we delete" cannot diverge. Reading
+        // `container_ref` directly would report a workspace with an unset
+        // column as clean while its derived directory still held changes.
+        let Some(workspace_dir) = WorkspaceManager::workspace_dir_for(workspace) else {
             return Ok(true);
         };
 
-        let workspace_dir = PathBuf::from(container_ref);
         if !workspace_dir.exists() {
             return Ok(true);
         }

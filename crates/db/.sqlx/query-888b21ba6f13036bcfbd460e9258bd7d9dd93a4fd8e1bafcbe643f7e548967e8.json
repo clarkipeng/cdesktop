@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                w.id as \"id!: Uuid\",\n                w.task_id as \"task_id: Uuid\",\n                w.container_ref,\n                w.branch as \"branch!\",\n                w.setup_completed_at as \"setup_completed_at: DateTime<Utc>\",\n                w.created_at as \"created_at!: DateTime<Utc>\",\n                w.updated_at as \"updated_at!: DateTime<Utc>\",\n                w.archived as \"archived!: bool\",\n                (w.pin_order IS NOT NULL) as \"pinned!: bool\",\n                w.pin_order as \"pin_order: i64\",\n                w.name,\n                w.worktree_deleted as \"worktree_deleted!: bool\",\n                w.use_worktree as \"use_worktree!: bool\",\n                w.source as \"source!: WorkspaceSource\"\n            FROM workspaces w\n            WHERE w.use_worktree = TRUE\n                AND w.worktree_deleted = FALSE\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM sessions s\n                    JOIN execution_processes ep ON ep.session_id = s.id\n                    WHERE s.workspace_id = w.id\n                      AND ep.completed_at IS NULL\n                )\n                AND datetime('now',\n                    CASE\n                        WHEN w.archived = 1\n                        THEN '-1 hours'\n                        ELSE '-72 hours'\n                    END\n                ) > (\n                    SELECT MAX(activity)\n                    FROM (\n                        SELECT datetime(w.updated_at) AS activity\n                        UNION ALL\n                        SELECT datetime(ep.completed_at)\n                        FROM sessions s\n                        JOIN execution_processes ep ON ep.session_id = s.id\n                        WHERE s.workspace_id = w.id\n                          AND ep.completed_at IS NOT NULL\n                    )\n                )\n            ORDER BY w.updated_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "task_id: Uuid",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "container_ref",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "branch!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "setup_completed_at: DateTime<Utc>",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at!: DateTime<Utc>",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "archived!: bool",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "pinned!: bool",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "pin_order: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "name",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_deleted!: bool",
+        "ordinal": 11,
+        "type_info": "Bool"
+      },
+      {
+        "name": "use_worktree!: bool",
+        "ordinal": 12,
+        "type_info": "Bool"
+      },
+      {
+        "name": "source!: WorkspaceSource",
+        "ordinal": 13,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "888b21ba6f13036bcfbd460e9258bd7d9dd93a4fd8e1bafcbe643f7e548967e8"
+}
