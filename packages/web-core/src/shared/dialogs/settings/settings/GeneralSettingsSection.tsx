@@ -723,7 +723,9 @@ export function GeneralSettingsSection() {
         {draft?.auto_archive_enabled && (
           <SettingsField
             label={t('settings.general.workspaces.autoArchive.idleLabel')}
-            description={t('settings.general.workspaces.autoArchive.idleHelper')}
+            description={t(
+              'settings.general.workspaces.autoArchive.idleHelper'
+            )}
           >
             <SettingsSelect
               value={String(draft?.auto_archive_idle_days ?? 7)}
