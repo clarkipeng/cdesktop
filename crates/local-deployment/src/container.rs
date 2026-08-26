@@ -42,7 +42,7 @@ use serde_json::json;
 use services::services::{
     analytics::AnalyticsContext,
     approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
-    config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT},
+    config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT, MIN_AUTO_ARCHIVE_IDLE_DAYS},
     container::{ContainerError, ContainerRef, ContainerService},
     diff_stream::{self, DiffStreamHandle},
     file::FileService,
@@ -316,6 +316,40 @@ impl LocalContainerService {
         Ok(())
     }
 
+    /// Archive workspaces that have gone idle, so they stop accumulating.
+    ///
+    /// The idle threshold is floored at [`MIN_AUTO_ARCHIVE_IDLE_DAYS`] so that
+    /// auto-archive can never fire before the 72-hour worktree retention window
+    /// has already elapsed. Archiving therefore never shortens how long an
+    /// idle worktree survives on disk, whatever the operator configures.
+    async fn auto_archive_idle_workspaces(&self) -> Result<(), DeploymentError> {
+        let (enabled, idle_days) = {
+            let config = self.config.read().await;
+            (config.auto_archive_enabled, config.auto_archive_idle_days)
+        };
+        if !enabled {
+            return Ok(());
+        }
+        let idle_days = idle_days.max(MIN_AUTO_ARCHIVE_IDLE_DAYS);
+
+        let idle = Workspace::find_idle_for_auto_archive(&self.db.pool, idle_days).await?;
+        if idle.is_empty() {
+            tracing::debug!("No idle workspaces to auto-archive");
+            return Ok(());
+        }
+        tracing::info!(
+            "Auto-archiving {} workspaces idle for more than {} days",
+            idle.len(),
+            idle_days
+        );
+        for workspace_id in idle {
+            if let Err(e) = self.archive_workspace(workspace_id).await {
+                tracing::error!("Failed to auto-archive workspace {}: {}", workspace_id, e);
+            }
+        }
+        Ok(())
+    }
+
     fn spawn_workspace_cleanup(&self) {
         let container = self.clone();
         tokio::spawn(async move {
@@ -329,6 +363,14 @@ impl LocalContainerService {
             loop {
                 cleanup_interval.tick().await;
                 tracing::info!("Starting periodic workspace cleanup...");
+                // Archive first: a freshly archived workspace becomes eligible
+                // for worktree cleanup on the next tick, not this one.
+                container
+                    .auto_archive_idle_workspaces()
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("Failed to auto-archive idle workspaces: {}", e)
+                    });
                 container
                     .cleanup_expired_workspaces()
                     .await
