@@ -33,12 +33,24 @@ export interface WorkspacesSidebarWorkspace {
   latestProcessCompletedAt?: string;
   latestProcessStatus?: 'running' | 'completed' | 'failed' | 'killed';
   prStatus?: 'open' | 'merged' | 'closed' | 'unknown';
-  primaryRepo?: { id: string; name: string; displayName: string };
+  primaryRepo?: {
+    id: string;
+    name: string;
+    displayName: string;
+    path: string;
+  };
 }
 
 export interface WorkspacesSidebarFolderGroup {
   repoId: string;
+  /** Repository path. The identity groups are keyed by. */
+  repoPath: string;
   displayName: string;
+  /**
+   * Ancestor folders that tell this group apart from another one rendering the
+   * same `displayName`. Absent when the label is already unique.
+   */
+  qualifier?: string;
   sessions: WorkspacesSidebarWorkspace[];
 }
 
@@ -282,9 +294,17 @@ function FolderGroup({
         <button
           type="button"
           onClick={toggle}
+          title={group.repoPath}
           className="min-w-0 flex items-center gap-half text-left"
         >
           <span className="truncate">{group.displayName}</span>
+          {group.qualifier && (
+            /* The qualifier is secondary: it gives up width before the repo
+               name does, so the name never truncates while a hint is intact. */
+            <span className="truncate normal-case text-low/70 [flex-shrink:9999]">
+              {group.qualifier}
+            </span>
+          )}
           <CaretDownIcon
             className={cn(
               'size-icon-xs shrink-0 opacity-0 group-hover:opacity-100 transition-transform',
@@ -302,7 +322,9 @@ function FolderGroup({
             }}
             aria-label={t('sidebar.newSessionInFolder', {
               defaultValue: 'New session in {{folder}}',
-              folder: group.displayName,
+              folder: group.qualifier
+                ? `${group.displayName} (${group.qualifier})`
+                : group.displayName,
             })}
             className="ml-auto shrink-0 pl-base opacity-0 group-hover:opacity-100 transition-opacity"
           >

@@ -20,6 +20,7 @@ import { useFolderSeedStore } from '@/shared/stores/useFolderSeedStore';
 import { useTheme } from '@/shared/hooks/useTheme';
 import { ScratchType, type DraftWorkspaceData } from 'shared/types';
 import { splitMessageToTitleDescription } from '@/shared/lib/string';
+import { repoGroupQualifiers } from '@/shared/lib/repoGroupLabels';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
 import {
   PERSIST_KEYS,
@@ -562,20 +563,35 @@ export function WorkspacesSidebarContainer({
         );
         continue;
       }
-      const existing = groups.get(primary.id);
+      // Key by path: two local checkouts of one repository differ by path and
+      // by nothing else the sidebar shows.
+      const existing = groups.get(primary.path);
       if (existing) {
         existing.sessions.push(ws);
       } else {
-        groups.set(primary.id, {
+        groups.set(primary.path, {
           repoId: primary.id,
+          repoPath: primary.path,
           displayName: primary.displayName || primary.name,
           sessions: [ws],
         });
       }
     }
 
-    const folderGroupsArr = Array.from(groups.values()).sort((a, b) =>
-      a.displayName.localeCompare(b.displayName)
+    const qualifiers = repoGroupQualifiers(
+      Array.from(groups.values(), (group) => ({
+        path: group.repoPath,
+        label: group.displayName,
+      }))
+    );
+
+    const folderGroupsArr = Array.from(groups.values(), (group) => ({
+      ...group,
+      qualifier: qualifiers.get(group.repoPath),
+    })).sort(
+      (a, b) =>
+        a.displayName.localeCompare(b.displayName) ||
+        (a.qualifier ?? '').localeCompare(b.qualifier ?? '')
     );
     return { pinnedWorkspaces: pinned, folderGroups: folderGroupsArr };
   }, [paginatedActiveWorkspaces]);
