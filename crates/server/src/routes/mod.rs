@@ -19,6 +19,7 @@ pub mod frontend;
 pub mod health;
 pub mod host_relay;
 pub mod maintenance;
+pub mod managed_tasks;
 pub mod metered_approvals;
 pub mod oauth;
 pub mod organizations;
@@ -56,6 +57,7 @@ pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
         .merge(events::router(&deployment))
         .merge(approvals::router())
         .merge(metered_approvals::router())
+        .merge(managed_tasks::router())
         .merge(maintenance::router())
         .merge(scratch::router(&deployment))
         .merge(search::router(&deployment))

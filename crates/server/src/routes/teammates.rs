@@ -34,7 +34,7 @@ use crate::{DeploymentImpl, error::ApiError};
 /// command-line `--name` arguments, so the limit is tight.
 const MAX_NAME_LEN: usize = 24;
 
-#[derive(Debug, Deserialize, TS)]
+#[derive(Debug, Serialize, Deserialize, TS)]
 pub struct SpawnTeammateRequest {
     /// Display name (also serves as role label). Required, ≤24 chars,
     /// no embedded newlines.
@@ -185,6 +185,25 @@ async fn spawn_teammate_core(
     payload: SpawnTeammateRequest,
     source: SpawnSource,
 ) -> Result<Uuid, ApiError> {
+    spawn_teammate_with_id(
+        deployment,
+        workspace,
+        caller,
+        payload,
+        source,
+        Uuid::new_v4(),
+    )
+    .await
+}
+
+pub(crate) async fn spawn_teammate_with_id(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+    caller: Option<&Session>,
+    payload: SpawnTeammateRequest,
+    source: SpawnSource,
+    session_id: Uuid,
+) -> Result<Uuid, ApiError> {
     let pool = &deployment.db().pool;
 
     validate_name(&payload.name)?;
@@ -258,7 +277,7 @@ async fn spawn_teammate_core(
             name: Some(payload.name.clone()),
             parent_session_id: caller.map(|session| session.id),
         },
-        Uuid::new_v4(),
+        session_id,
         workspace.id,
     )
     .await

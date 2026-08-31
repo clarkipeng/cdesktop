@@ -5,6 +5,7 @@ pub mod execution_process_outcome;
 pub mod execution_process_repo_state;
 pub mod execution_process_stop_operation;
 pub mod file;
+pub mod managed_task_effect;
 pub mod merge;
 pub mod metered_approval;
 pub mod project;
