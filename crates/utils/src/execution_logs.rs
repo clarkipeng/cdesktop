@@ -24,6 +24,7 @@ pub fn process_log_file_path_in_root(root: &Path, session_id: Uuid, process_id: 
 pub struct ExecutionLogWriter {
     path: PathBuf,
     file: tokio::fs::File,
+    bytes_written: u64,
 }
 
 impl ExecutionLogWriter {
@@ -36,7 +37,12 @@ impl ExecutionLogWriter {
             .append(true)
             .open(&path)
             .await?;
-        Ok(Self { path, file })
+        let bytes_written = file.metadata().await?.len();
+        Ok(Self {
+            path,
+            file,
+            bytes_written,
+        })
     }
 
     pub async fn new_for_execution(session_id: Uuid, execution_id: Uuid) -> std::io::Result<Self> {
@@ -48,8 +54,11 @@ impl ExecutionLogWriter {
     }
 
     pub async fn append_jsonl_line(&mut self, jsonl_line: &str) -> std::io::Result<()> {
-        ensure_transcript_write_allowed(&self.path, jsonl_line.len() as u64)?;
-        self.file.write_all(jsonl_line.as_bytes()).await
+        let incoming_bytes = jsonl_line.len() as u64;
+        ensure_transcript_write_allowed(&self.path, self.bytes_written, incoming_bytes)?;
+        self.file.write_all(jsonl_line.as_bytes()).await?;
+        self.bytes_written = self.bytes_written.saturating_add(incoming_bytes);
+        Ok(())
     }
 }
 

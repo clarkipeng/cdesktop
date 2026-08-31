@@ -1,8 +1,9 @@
-use std::{io, path::Path};
+use std::{io, path::Path, sync::OnceLock};
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MAX_FORK_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+static WRITER_LIMITS: OnceLock<WriterLimits> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriterLimits {
@@ -28,16 +29,15 @@ impl WriterLimits {
 }
 
 pub fn ensure_launch_allowed(path: &Path) -> io::Result<()> {
-    ensure_free_disk(path, 0, WriterLimits::from_env())
+    ensure_free_disk(path, 0, writer_limits())
 }
 
-pub fn ensure_transcript_write_allowed(path: &Path, incoming_bytes: u64) -> io::Result<()> {
-    let limits = WriterLimits::from_env();
-    let current_bytes = match std::fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error),
-    };
+pub fn ensure_transcript_write_allowed(
+    path: &Path,
+    current_bytes: u64,
+    incoming_bytes: u64,
+) -> io::Result<()> {
+    let limits = writer_limits();
     if exceeds_limit(current_bytes, incoming_bytes, limits.transcript_bytes) {
         return Err(io::Error::other(format!(
             "transcript byte limit exceeded: {} + {} > {}",
@@ -48,7 +48,7 @@ pub fn ensure_transcript_write_allowed(path: &Path, incoming_bytes: u64) -> io::
 }
 
 pub fn ensure_fork_allowed(source: &Path) -> io::Result<()> {
-    let limits = WriterLimits::from_env();
+    let limits = writer_limits();
     let source_bytes = std::fs::metadata(source)?.len();
     if source_bytes > limits.fork_bytes {
         return Err(io::Error::other(format!(
@@ -80,12 +80,16 @@ fn ensure_free_disk(path: &Path, reserved_bytes: u64, limits: WriterLimits) -> i
 fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     let mut candidate = Some(path);
     while let Some(current) = candidate {
-        if current.exists() {
+        if current.is_dir() {
             return Some(current);
         }
         candidate = current.parent();
     }
     None
+}
+
+fn writer_limits() -> WriterLimits {
+    *WRITER_LIMITS.get_or_init(WriterLimits::from_env)
 }
 
 fn configured_limit(name: &str, default: u64) -> u64 {
