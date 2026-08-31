@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
+    path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -35,7 +36,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use workspace_utils::approvals::{ApprovalPatterns, ApprovalScope, ApprovalStatus, QuestionStatus};
 
-use super::jsonrpc::{JsonRpcCallbacks, JsonRpcPeer};
+use super::{
+    jsonrpc::{JsonRpcCallbacks, JsonRpcPeer},
+    storage_guard::{StorageLimits, find_rollout_file},
+};
 use crate::{
     approvals::{ExecutorApprovalError, ExecutorApprovalService},
     env::RepoContext,
@@ -52,6 +56,8 @@ pub struct AppServerClient {
     log_writer: LogWriter,
     approvals: Option<Arc<dyn ExecutorApprovalService>>,
     thread_id: Mutex<Option<String>>,
+    rollout_path: Mutex<Option<PathBuf>>,
+    storage_limits: StorageLimits,
     pending_feedback: Mutex<VecDeque<String>>,
     auto_approve: bool,
     plan_mode: bool,
@@ -88,6 +94,8 @@ impl AppServerClient {
             resolved_model: OnceLock::new(),
             pending_plan: Mutex::new(None),
             thread_id: Mutex::new(None),
+            rollout_path: Mutex::new(None),
+            storage_limits: StorageLimits::default(),
             pending_feedback: Mutex::new(VecDeque::new()),
             repo_context,
             commit_reminder,
@@ -139,6 +147,10 @@ impl AppServerClient {
         &self,
         params: ThreadStartParams,
     ) -> Result<ThreadStartResponse, ExecutorError> {
+        self.storage_limits
+            .ensure_start_allowed()
+            .await
+            .map_err(ExecutorError::Io)?;
         let request = ClientRequest::ThreadStart {
             request_id: self.next_request_id(),
             params,
@@ -150,6 +162,10 @@ impl AppServerClient {
         &self,
         params: ThreadForkParams,
     ) -> Result<ThreadForkResponse, ExecutorError> {
+        self.storage_limits
+            .ensure_fork_allowed(&params.thread_id)
+            .await
+            .map_err(ExecutorError::Io)?;
         let request = ClientRequest::ThreadFork {
             request_id: self.next_request_id(),
             params,
@@ -672,7 +688,45 @@ impl AppServerClient {
             let mut guard = self.thread_id.lock().await;
             guard.replace(thread_id.to_string());
         }
+        let mut rollout = self.rollout_path.lock().await;
+        *rollout = find_rollout_file(thread_id).await;
+        drop(rollout);
         self.flush_pending_feedback().await;
+        Ok(())
+    }
+
+    async fn enforce_storage_limits(&self) -> Result<(), ExecutorError> {
+        let thread_id = self.thread_id.lock().await.clone();
+        let Some(thread_id) = thread_id else {
+            return self
+                .storage_limits
+                .ensure_start_allowed()
+                .await
+                .map_err(ExecutorError::Io);
+        };
+        let cached = self.rollout_path.lock().await.clone();
+        let path = match cached {
+            Some(path) => Some(path),
+            None => {
+                let found = find_rollout_file(&thread_id).await;
+                if let Some(path) = &found {
+                    *self.rollout_path.lock().await = Some(path.clone());
+                }
+                found
+            }
+        };
+        let result = match path {
+            Some(path) => self.storage_limits.ensure_rollout_allowed(&path).await,
+            None => self.storage_limits.ensure_start_allowed().await,
+        };
+        if let Err(error) = result {
+            *self.exit_outcome.lock().unwrap() = Some(
+                NormalizedExecutionOutcome::new(ExecutionOutcomeClass::TaskFailed)
+                    .with_provider_code("local_storage_limit"),
+            );
+            self.cancel.cancel();
+            return Err(ExecutorError::Io(error));
+        }
         Ok(())
     }
 
@@ -800,6 +854,7 @@ impl JsonRpcCallbacks for AppServerClient {
         request: JSONRPCRequest,
     ) -> Result<(), ExecutorError> {
         self.log_writer.log_raw(raw).await?;
+        self.enforce_storage_limits().await?;
         match ServerRequest::try_from(request.clone()) {
             Ok(server_request) => self.handle_server_request(peer, server_request).await,
             Err(err) => {
@@ -819,7 +874,8 @@ impl JsonRpcCallbacks for AppServerClient {
         raw: &str,
         _response: &JSONRPCResponse,
     ) -> Result<(), ExecutorError> {
-        self.log_writer.log_raw(raw).await
+        self.log_writer.log_raw(raw).await?;
+        self.enforce_storage_limits().await
     }
 
     async fn on_error(
@@ -828,7 +884,8 @@ impl JsonRpcCallbacks for AppServerClient {
         raw: &str,
         _error: &JSONRPCError,
     ) -> Result<(), ExecutorError> {
-        self.log_writer.log_raw(raw).await
+        self.log_writer.log_raw(raw).await?;
+        self.enforce_storage_limits().await
     }
 
     async fn on_notification(
@@ -838,6 +895,7 @@ impl JsonRpcCallbacks for AppServerClient {
         notification: JSONRPCNotification,
     ) -> Result<bool, ExecutorError> {
         self.log_writer.log_raw(raw).await?;
+        self.enforce_storage_limits().await?;
 
         let method = notification.method.as_str();
 
@@ -907,7 +965,7 @@ impl JsonRpcCallbacks for AppServerClient {
 
     async fn on_non_json(&self, raw: &str) -> Result<(), ExecutorError> {
         self.log_writer.log_raw(raw).await?;
-        Ok(())
+        self.enforce_storage_limits().await
     }
 
     async fn final_exit_result(&self) -> ExecutorExitResult {

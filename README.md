@@ -150,6 +150,8 @@ The following environment variables can be configured at build time or runtime:
 | `MCP_PORT` | Runtime | Value of `BACKEND_PORT` | MCP server connection port |
 | `DISABLE_WORKTREE_CLEANUP` | Runtime | Not set | Disable all git worktree cleanup including orphan and expired workspace cleanup, and idle-workspace auto-archive (for debugging) |
 | `CDT_ALLOWED_ORIGINS` | Runtime | Not set | Comma-separated list of origins that are allowed to make backend API requests (e.g., `https://my-cdesktop.example.com`) |
+| `CDESKTOP_MAX_CODEX_ROLLOUT_BYTES` | Runtime | `67108864` | Stop a Codex execution and refuse forks when its native rollout exceeds this size |
+| `CDESKTOP_MIN_FREE_DISK_BYTES` | Runtime | `10737418240` | Refuse Codex starts and forks, and stop active executions, below this free-disk reserve |
 
 **Build-time variables** must be set when running `pnpm run build`. **Runtime variables** are read when the application starts.
 

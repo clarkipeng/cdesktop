@@ -3,6 +3,7 @@ pub mod jsonrpc;
 pub mod normalize_logs;
 pub mod review;
 pub mod slash_commands;
+mod storage_guard;
 use std::{
     collections::HashMap,
     env,
