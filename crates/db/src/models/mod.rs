@@ -19,5 +19,6 @@ pub mod session;
 pub mod session_command;
 pub mod tag;
 pub mod task;
+pub mod task_launch;
 pub mod workspace;
 pub mod workspace_repo;

@@ -13,7 +13,7 @@ use db::models::{
 use deployment::Deployment;
 use executors::profile::ExecutorConfig;
 use serde::Serialize;
-use services::services::container::ContainerService;
+use services::services::container::{ContainerService, WorkspaceStartOptions};
 use ts_rs::TS;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -411,8 +411,7 @@ pub(crate) async fn spawn_routine_run(
             executor_config,
             routine.instructions.clone(),
             injection,
-            selected_provider_id,
-            selected_model_id,
+            WorkspaceStartOptions::new(selected_provider_id, selected_model_id),
         )
         .await?;
 

@@ -68,6 +68,34 @@ use worktree_manager::WorktreeError;
 use crate::services::{auth_binding, execution_process, notification::NotificationService};
 pub type ContainerRef = String;
 
+pub struct WorkspaceStartOptions {
+    pub session_id: Uuid,
+    pub selected_provider_id: Option<String>,
+    pub selected_model_id: Option<String>,
+}
+
+impl WorkspaceStartOptions {
+    pub fn new(selected_provider_id: Option<String>, selected_model_id: Option<String>) -> Self {
+        Self {
+            session_id: Uuid::new_v4(),
+            selected_provider_id,
+            selected_model_id,
+        }
+    }
+
+    pub fn for_session(
+        session_id: Uuid,
+        selected_provider_id: Option<String>,
+        selected_model_id: Option<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            selected_provider_id,
+            selected_model_id,
+        }
+    }
+}
+
 fn max_running_agents() -> i64 {
     std::env::var("CDESKTOP_MAX_RUNNING_AGENTS")
         .ok()
@@ -1339,8 +1367,7 @@ pub trait ContainerService {
         executor_config: ExecutorConfig,
         prompt: String,
         injection: ProviderInjection,
-        selected_provider_id: Option<String>,
-        selected_model_id: Option<String>,
+        options: WorkspaceStartOptions,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Create container
         self.create(workspace).await?;
@@ -1359,7 +1386,7 @@ pub trait ContainerService {
                 name: None,
                 parent_session_id: None,
             },
-            Uuid::new_v4(),
+            options.session_id,
             workspace.id,
         )
         .await?;
@@ -1392,7 +1419,7 @@ pub trait ContainerService {
                 None,
             );
             a = a.with_provider_injection(injection);
-            a.with_provider_selection(selected_provider_id, selected_model_id)
+            a.with_provider_selection(options.selected_provider_id, options.selected_model_id)
         };
 
         let execution_process = if repos_with_setup.is_empty() {

@@ -561,7 +561,7 @@ async fn read_rollout_data(session_id: &str) -> Option<RolloutData> {
     })
 }
 
-async fn find_rollout_file(dir: &Path, session_id: &str) -> Option<PathBuf> {
+pub(super) async fn find_rollout_file(dir: &Path, session_id: &str) -> Option<PathBuf> {
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();

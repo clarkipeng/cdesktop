@@ -95,10 +95,24 @@ pub struct UserSystemInfo {
     #[serde(flatten)]
     pub profiles: ExecutorConfigs,
     pub environment: Environment,
-    /// Capabilities supported per executor (e.g., { "CLAUDE_CODE": ["SESSION_FORK"] })
-    pub capabilities: HashMap<String, Vec<BaseAgentCapability>>,
+    /// Executor capabilities plus versioned machine-level API contracts.
+    pub capabilities: HashMap<String, CapabilityAdvertisement>,
     pub shared_api_base: Option<String>,
     pub preview_proxy_port: Option<u16>,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(untagged)]
+pub enum CapabilityAdvertisement {
+    Agent(Vec<BaseAgentCapability>),
+    TaskLaunch(TaskLaunchCapability),
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+pub struct TaskLaunchCapability {
+    pub contract_version: u32,
+    pub features: Vec<String>,
+    pub writer_limits: Vec<String>,
 }
 
 // TODO: update frontend, BE schema has changed, this replaces GET /config and /config/constants
@@ -161,13 +175,33 @@ async fn get_user_system_info(
         profiles: ExecutorConfigs::get_cached(),
         environment: Environment::new(),
         capabilities: {
-            let mut caps: HashMap<String, Vec<BaseAgentCapability>> = HashMap::new();
+            let mut caps = HashMap::new();
             let profs = ExecutorConfigs::get_cached();
             for key in profs.executors.keys() {
                 if let Some(agent) = profs.get_coding_agent(&ExecutorProfileId::new(*key)) {
-                    caps.insert(key.to_string(), agent.capabilities());
+                    caps.insert(
+                        key.to_string(),
+                        CapabilityAdvertisement::Agent(agent.capabilities()),
+                    );
                 }
             }
+            caps.insert(
+                "task_launch".to_string(),
+                CapabilityAdvertisement::TaskLaunch(TaskLaunchCapability {
+                    contract_version: 1,
+                    features: vec![
+                        "create_or_return".to_string(),
+                        "lookup".to_string(),
+                        "typed_outcomes".to_string(),
+                        "content_addressed_history".to_string(),
+                    ],
+                    writer_limits: vec![
+                        "transcript_bytes".to_string(),
+                        "fork_bytes".to_string(),
+                        "free_disk_bytes".to_string(),
+                    ],
+                }),
+            );
             caps
         },
         shared_api_base: deployment.remote_info().get_api_base(),

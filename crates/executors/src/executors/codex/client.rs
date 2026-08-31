@@ -33,9 +33,16 @@ use tokio::{
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
-use workspace_utils::approvals::{ApprovalPatterns, ApprovalScope, ApprovalStatus, QuestionStatus};
+use workspace_utils::{
+    approvals::{ApprovalPatterns, ApprovalScope, ApprovalStatus, QuestionStatus},
+    storage_limits::{ensure_fork_allowed, ensure_launch_allowed},
+};
 
-use super::jsonrpc::{JsonRpcCallbacks, JsonRpcPeer};
+use super::{
+    codex_home,
+    jsonrpc::{JsonRpcCallbacks, JsonRpcPeer},
+    slash_commands::find_rollout_file,
+};
 use crate::{
     approvals::{ExecutorApprovalError, ExecutorApprovalService},
     env::RepoContext,
@@ -139,6 +146,13 @@ impl AppServerClient {
         &self,
         params: ThreadStartParams,
     ) -> Result<ThreadStartResponse, ExecutorError> {
+        let codex_home = codex_home().ok_or_else(|| {
+            ExecutorError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Codex home directory is unavailable",
+            ))
+        })?;
+        ensure_launch_allowed(&codex_home).map_err(ExecutorError::Io)?;
         let request = ClientRequest::ThreadStart {
             request_id: self.next_request_id(),
             params,
@@ -150,6 +164,26 @@ impl AppServerClient {
         &self,
         params: ThreadForkParams,
     ) -> Result<ThreadForkResponse, ExecutorError> {
+        let sessions_dir = codex_home()
+            .ok_or_else(|| {
+                ExecutorError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Codex home directory is unavailable",
+                ))
+            })?
+            .join("sessions");
+        let rollout_path = find_rollout_file(&sessions_dir, &params.thread_id)
+            .await
+            .ok_or_else(|| {
+                ExecutorError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Cannot verify source transcript for fork {}",
+                        params.thread_id
+                    ),
+                ))
+            })?;
+        ensure_fork_allowed(&rollout_path).map_err(ExecutorError::Io)?;
         let request = ClientRequest::ThreadFork {
             request_id: self.next_request_id(),
             params,

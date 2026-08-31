@@ -292,10 +292,11 @@ pub fn spawn_stream_raw_logs_to_storage(
                                 log_writer.append_jsonl_line(&jsonl_line_with_newline).await
                             {
                                 tracing::error!(
-                                    "Failed to append log line for execution {}: {}",
+                                    "Stopped persisting logs for execution {}: {}",
                                     execution_id,
                                     e
                                 );
+                                break;
                             }
                         }
                         Err(e) => {

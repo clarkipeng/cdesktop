@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::{assets::asset_dir, log_msg::LogMsg};
+use crate::{assets::asset_dir, log_msg::LogMsg, storage_limits::ensure_transcript_write_allowed};
 
 pub const EXECUTION_LOGS_DIRNAME: &str = "sessions";
 
@@ -48,6 +48,7 @@ impl ExecutionLogWriter {
     }
 
     pub async fn append_jsonl_line(&mut self, jsonl_line: &str) -> std::io::Result<()> {
+        ensure_transcript_write_allowed(&self.path, jsonl_line.len() as u64)?;
         self.file.write_all(jsonl_line.as_bytes()).await
     }
 }
