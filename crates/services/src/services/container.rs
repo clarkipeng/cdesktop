@@ -1342,6 +1342,29 @@ pub trait ContainerService {
         selected_provider_id: Option<String>,
         selected_model_id: Option<String>,
     ) -> Result<ExecutionProcess, ContainerError> {
+        self.start_workspace_with_session_id(
+            workspace,
+            executor_config,
+            prompt,
+            injection,
+            selected_provider_id,
+            selected_model_id,
+            Uuid::new_v4(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_workspace_with_session_id(
+        &self,
+        workspace: &Workspace,
+        executor_config: ExecutorConfig,
+        prompt: String,
+        injection: ProviderInjection,
+        selected_provider_id: Option<String>,
+        selected_model_id: Option<String>,
+        session_id: Uuid,
+    ) -> Result<ExecutionProcess, ContainerError> {
         // Create container
         self.create(workspace).await?;
 
@@ -1359,7 +1382,7 @@ pub trait ContainerService {
                 name: None,
                 parent_session_id: None,
             },
-            Uuid::new_v4(),
+            session_id,
             workspace.id,
         )
         .await?;

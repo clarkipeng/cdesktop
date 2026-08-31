@@ -27,7 +27,15 @@ pub(crate) async fn create_workspace_record(
     name: Option<String>,
     use_worktree: bool,
 ) -> Result<Workspace, ApiError> {
-    let workspace_id = Uuid::new_v4();
+    create_workspace_record_with_id(deployment, name, use_worktree, Uuid::new_v4()).await
+}
+
+pub(crate) async fn create_workspace_record_with_id(
+    deployment: &DeploymentImpl,
+    name: Option<String>,
+    use_worktree: bool,
+    workspace_id: Uuid,
+) -> Result<Workspace, ApiError> {
     let branch_label = name
         .as_deref()
         .filter(|branch_label| !branch_label.is_empty())
@@ -312,6 +320,18 @@ pub async fn create_and_start_workspace(
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<CreateAndStartWorkspaceRequest>,
 ) -> Result<ResponseJson<ApiResponse<CreateAndStartWorkspaceResponse>>, ApiError> {
+    let result =
+        create_and_start_workspace_with_ids(&deployment, payload, Uuid::new_v4(), Uuid::new_v4())
+            .await?;
+    Ok(ResponseJson(ApiResponse::success(result)))
+}
+
+pub(crate) async fn create_and_start_workspace_with_ids(
+    deployment: &DeploymentImpl,
+    payload: CreateAndStartWorkspaceRequest,
+    workspace_id: Uuid,
+    session_id: Uuid,
+) -> Result<CreateAndStartWorkspaceResponse, ApiError> {
     let CreateAndStartWorkspaceRequest {
         name,
         repos,
@@ -346,8 +366,8 @@ pub async fn create_and_start_workspace(
         ));
     }
 
-    let workspace = create_workspace_record(&deployment, name, use_worktree).await?;
-    let workspace_id = workspace.id;
+    let workspace =
+        create_workspace_record_with_id(deployment, name, use_worktree, workspace_id).await?;
     let mut managed_workspace = match deployment
         .workspace_manager()
         .load_managed_workspace(workspace)
@@ -356,7 +376,7 @@ pub async fn create_and_start_workspace(
         Ok(managed_workspace) => managed_workspace,
         Err(e) => {
             return cleanup_failed_workspace_start_and_return(
-                &deployment,
+                deployment,
                 workspace_id,
                 ApiError::from(e),
             )
@@ -370,7 +390,7 @@ pub async fn create_and_start_workspace(
             .await
         {
             return cleanup_failed_workspace_start_and_return(
-                &deployment,
+                deployment,
                 workspace_id,
                 ApiError::from(e),
             )
@@ -393,7 +413,7 @@ pub async fn create_and_start_workspace(
                 git.checkout_branch(&first_repo.repo.path, &first_repo.target_branch, false)
         {
             return cleanup_failed_workspace_start_and_return(
-                &deployment,
+                deployment,
                 workspace_id,
                 ApiError::Workspace(WorkspaceError::ValidationError(e.to_string())),
             )
@@ -416,7 +436,7 @@ pub async fn create_and_start_workspace(
         .await
         {
             return cleanup_failed_workspace_start_and_return(
-                &deployment,
+                deployment,
                 workspace_id,
                 ApiError::from(e),
             )
@@ -438,7 +458,7 @@ pub async fn create_and_start_workspace(
         .await
         {
             return cleanup_failed_workspace_start_and_return(
-                &deployment,
+                deployment,
                 workspace_id,
                 ApiError::from(e),
             )
@@ -451,7 +471,7 @@ pub async fn create_and_start_workspace(
         && let Err(e) = managed_workspace.associate_attachments(ids).await
     {
         return cleanup_failed_workspace_start_and_return(
-            &deployment,
+            deployment,
             workspace_id,
             ApiError::from(e),
         )
@@ -505,20 +525,21 @@ pub async fn create_and_start_workspace(
 
     let execution_process = match deployment
         .container()
-        .start_workspace(
+        .start_workspace_with_session_id(
             &workspace,
             executor_config.clone(),
             workspace_prompt,
             injection,
             selected_provider_id_str,
             selected_model_id_str,
+            session_id,
         )
         .await
     {
         Ok(execution_process) => execution_process,
         Err(e) => {
             return cleanup_failed_workspace_start_and_return(
-                &deployment,
+                deployment,
                 workspace_id,
                 ApiError::from(e),
             )
@@ -537,12 +558,10 @@ pub async fn create_and_start_workspace(
         )
         .await;
 
-    Ok(ResponseJson(ApiResponse::success(
-        CreateAndStartWorkspaceResponse {
-            workspace,
-            execution_process,
-        },
-    )))
+    Ok(CreateAndStartWorkspaceResponse {
+        workspace,
+        execution_process,
+    })
 }
 
 #[cfg(test)]
