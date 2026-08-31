@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use codex_app_server_protocol::{ConfigEdit, JSONRPCNotification, MergeStrategy};
 use codex_protocol::protocol::{AgentMessageEvent, ErrorEvent, EventMsg};
@@ -7,7 +7,8 @@ use serde_json::json;
 use super::{
     Codex,
     client::{AppServerClient, LogWriter},
-    codex_home, fork_params_from, resolve_model,
+    fork_params_from, resolve_model,
+    storage_guard::find_rollout_file,
 };
 use crate::{
     env::ExecutionEnv,
@@ -522,8 +523,7 @@ struct RolloutData {
 }
 
 async fn read_rollout_data(session_id: &str) -> Option<RolloutData> {
-    let sessions_dir = codex_home()?.join("sessions");
-    let rollout_path = find_rollout_file(&sessions_dir, session_id).await?;
+    let rollout_path = find_rollout_file(session_id).await?;
 
     let file = tokio::fs::File::open(&rollout_path).await.ok()?;
     let reader = tokio::io::BufReader::new(file);
@@ -559,25 +559,6 @@ async fn read_rollout_data(session_id: &str) -> Option<RolloutData> {
         turn_context: last_turn_context,
         token_usage: last_token_usage,
     })
-}
-
-async fn find_rollout_file(dir: &Path, session_id: &str) -> Option<PathBuf> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = Box::pin(find_rollout_file(&path, session_id)).await {
-                return Some(found);
-            }
-        } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.starts_with("rollout-")
-            && name.contains(session_id)
-            && name.ends_with(".jsonl")
-        {
-            return Some(path);
-        }
-    }
-    None
 }
 
 async fn fetch_mcp_status_message(client: &AppServerClient) -> Result<String, ExecutorError> {
