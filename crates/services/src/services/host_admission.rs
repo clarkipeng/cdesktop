@@ -96,7 +96,7 @@ fn env_u64(name: &str, fallback: u64) -> u64 {
 }
 
 fn available_space(path: &Path) -> std::io::Result<u64> {
-    fs2::available_space(&existing_ancestor(path))
+    fs2::available_space(existing_ancestor(path))
 }
 
 fn existing_ancestor(path: &Path) -> PathBuf {
@@ -123,7 +123,7 @@ fn process_headroom(live_agents: u64) -> Option<ProcessHeadroom> {
     if rc != 0 {
         return None;
     }
-    let ceiling = lim.rlim_cur as u64;
+    let ceiling: u64 = lim.rlim_cur;
     if ceiling == 0 || lim.rlim_cur == libc::RLIM_INFINITY {
         return None;
     }
