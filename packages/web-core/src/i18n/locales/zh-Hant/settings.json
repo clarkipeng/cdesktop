@@ -200,6 +200,17 @@
           "helper": "提交提醒的自訂提示。git 狀態將自動追加。"
         }
       },
+      "workspaces": {
+        "title": "工作區",
+        "description": "設定工作區的停用方式",
+        "autoArchive": {
+          "label": "封存閒置工作區",
+          "helper": "自動封存未在執行、未固定且最近沒有活動的工作區。已封存的工作區仍可透過封存篩選器存取，其 Git 分支會被保留。",
+          "idleLabel": "封存前的閒置時間",
+          "idleHelper": "工作區在封存前必須保持閒置的時間。",
+          "days": "{{days}} 天"
+        }
+      },
       "notifications": {
         "title": "通知",
         "description": "控制何時與如何接收通知。",

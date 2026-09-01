@@ -200,6 +200,17 @@
           "helper": "提交提醒的自定义提示。git 状态将自动追加。"
         }
       },
+      "workspaces": {
+        "title": "工作区",
+        "description": "配置工作区的停用方式",
+        "autoArchive": {
+          "label": "归档闲置工作区",
+          "helper": "自动归档未在运行、未固定且最近没有活动的工作区。已归档的工作区仍可通过归档筛选器访问，其 Git 分支会被保留。",
+          "idleLabel": "归档前的闲置时间",
+          "idleHelper": "工作区在归档前必须保持闲置的时间。",
+          "days": "{{days}} 天"
+        }
+      },
       "notifications": {
         "title": "通知",
         "description": "控制何时以及如何接收通知。",
