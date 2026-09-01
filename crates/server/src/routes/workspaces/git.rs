@@ -134,6 +134,7 @@ pub enum RenameBranchError {
 pub fn router() -> Router<DeploymentImpl> {
     Router::new()
         .route("/status", get(get_workspace_branch_status))
+        .route("/diff/stats", get(get_workspace_diff_stats))
         .route("/diff/ws", get(stream_diff_ws))
         .route("/merge", post(merge_workspace))
         .route("/push", post(push_workspace_branch))
@@ -160,6 +161,20 @@ async fn resolve_cdesktop_identifier(
         return issue_id.to_string();
     }
     local_workspace_id.to_string()
+}
+
+/// On-demand, single-workspace Git diff stats. This is the explicit refresh
+/// that replaces the removed per-workspace fan-out in the summaries endpoint;
+/// the underlying computation is gated by a global subprocess semaphore.
+#[axum::debug_handler]
+pub async fn get_workspace_diff_stats(
+    Extension(workspace): Extension<Workspace>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<super::workspace_summary::DiffStats>>, ApiError> {
+    let stats = super::workspace_summary::compute_workspace_diff_stats(&deployment, &workspace)
+        .await
+        .unwrap_or_default();
+    Ok(ResponseJson(ApiResponse::success(stats)))
 }
 
 #[axum::debug_handler]

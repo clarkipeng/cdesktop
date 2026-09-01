@@ -12,6 +12,7 @@ pub mod file_ranker;
 pub mod file_search;
 pub mod filesystem;
 pub mod filesystem_watcher;
+pub mod host_admission;
 pub mod model_fetch;
 pub mod notification;
 pub mod oauth_credentials;

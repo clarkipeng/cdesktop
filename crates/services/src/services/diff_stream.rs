@@ -39,12 +39,27 @@ pub struct DiffStats {
     pub lines_removed: usize,
 }
 
+/// Ceiling on concurrent one-shot diff-stat computations across the process.
+/// Each computation fans blocking `git` children over a workspace's repos, so
+/// an unbounded caller could exhaust the process table (the ~196-child
+/// incident). Callers queue on this semaphore instead of racing.
+const MAX_CONCURRENT_DIFF_STATS: usize = 6;
+static DIFF_STATS_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFF_STATS));
+
 /// Computes diff stats for a workspace by comparing against target branches.
+///
+/// Blocking `git` work is bounded by a process-global semaphore so concurrent
+/// callers can never spawn more than `MAX_CONCURRENT_DIFF_STATS` git children
+/// at once.
 pub async fn compute_diff_stats(
     pool: &SqlitePool,
     git: &GitService,
     workspace: &Workspace,
 ) -> Option<DiffStats> {
+    // Held for the lifetime of this computation; the semaphore is never closed,
+    // so acquire only fails on poisoning, which we treat as "skip".
+    let _permit = DIFF_STATS_SEMAPHORE.acquire().await.ok()?;
     // Per-reader decision (OFF mode): fall through to read against `Repo.path`.
     // A diff against the checked-out branch's working tree is meaningful for the
     // user's real repo, so the diff stats pane works identically in both modes.
@@ -844,4 +859,23 @@ fn setup_git_watcher(
     }
 
     Some((debouncer, rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_stats_semaphore_caps_concurrent_git_work() {
+        // Regression guard for the process-table incident: no more than
+        // MAX_CONCURRENT_DIFF_STATS computations may run their blocking git
+        // work at once.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_DIFF_STATS {
+            held.push(DIFF_STATS_SEMAPHORE.try_acquire().unwrap());
+        }
+        assert!(DIFF_STATS_SEMAPHORE.try_acquire().is_err());
+        drop(held);
+        assert!(DIFF_STATS_SEMAPHORE.try_acquire().is_ok());
+    }
 }
