@@ -691,6 +691,13 @@ impl Codex {
                 (response.thread.id, response.model)
             }
             Some(session_id) => {
+                // Fork is the codex app-server's only resume primitive, and it
+                // materializes a copy of the prior rollout inside the codex
+                // binary (cdesktop cannot reference history in place). Every
+                // fork therefore passes through the storage guard
+                // (`ensure_fork_allowed`): a per-rollout size cap, a free-disk
+                // reserve, and a process-global fork-rate breaker that together
+                // bound the copy growth that caused the 363GB incident.
                 let response = client
                     .thread_fork(fork_params_from(session_id, thread_start_params))
                     .await?;

@@ -1,8 +1,3 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
-};
-
 use axum::{Json, extract::State, response::Json as ResponseJson};
 use db::models::{
     coding_agent_turn::CodingAgentTurn,
@@ -179,32 +174,14 @@ pub async fn get_workspace_summaries(
     // 6b. Primary repo per workspace (drives sidebar folder grouping)
     let primary_repos = WorkspaceRepo::find_primary_repos_for_archived(pool, archived).await?;
 
-    // 7. The default list never observes Git. A caller may explicitly refresh
-    // one non-archived, running workspace; terminal and archived rows are
-    // filtered before any refresh claim is created.
-    let diff_stats = if request.include_git && !archived {
-        match request
-            .refresh_workspace_id
-            .and_then(|id| workspaces.iter().find(|workspace| workspace.id == id))
-        {
-            Some(workspace)
-                if workspace.container_ref.is_some()
-                    && latest_processes.get(&workspace.id).is_some_and(|process| {
-                        process.status == ExecutionProcessStatus::Running
-                    }) =>
-            {
-                compute_workspace_diff_stats(&deployment, workspace)
-                    .await
-                    .map(|stats| HashMap::from([(workspace.id, stats)]))
-                    .unwrap_or_default()
-            }
-            _ => HashMap::new(),
-        }
-    } else {
-        HashMap::new()
-    };
-
-    // 8. Assemble response
+    // 7. Assemble response.
+    //
+    // This is metadata-only by construction: it never touches Git. Diff stats
+    // are omitted here because computing them fanned a blocking `git` child out
+    // per workspace with no bound (the process-table exhaustion incident).
+    // Fresh Git truth for a single workspace is fetched on demand through
+    // `GET /workspaces/{id}/git/diff/stats`, which is gated by a global
+    // subprocess semaphore.
     let summaries: Vec<WorkspaceSummary> = workspaces
         .iter()
         .map(|ws| {
@@ -213,15 +190,14 @@ pub async fn get_workspace_summaries(
             let has_pending = latest
                 .map(|p| pending_approval_eps.contains(&p.execution_process_id))
                 .unwrap_or(false);
-            let stats = diff_stats.get(&id);
 
             WorkspaceSummary {
                 workspace_id: id,
                 latest_session_id: latest.map(|p| p.session_id),
                 has_pending_approval: has_pending,
-                files_changed: stats.map(|s| s.files_changed),
-                lines_added: stats.map(|s| s.lines_added),
-                lines_removed: stats.map(|s| s.lines_removed),
+                files_changed: None,
+                lines_added: None,
+                lines_removed: None,
                 latest_process_completed_at: latest.and_then(|p| p.completed_at),
                 latest_process_status: latest.map(|p| p.status.clone()),
                 has_running_dev_server: dev_server_workspaces.contains(&id),

@@ -19,7 +19,7 @@ use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
 use utils::{
     assets::prod_asset_dir_path,
     execution_logs::{
-        ExecutionLogWriter, process_log_file_path, process_log_file_path_in_root,
+        ExecutionLogWriter, LogAppend, process_log_file_path, process_log_file_path_in_root,
         read_execution_log_file,
     },
     log_msg::LogMsg,
@@ -246,6 +246,7 @@ pub async fn append_log_message(session_id: Uuid, execution_id: Uuid, msg: &LogM
         .with_context(|| format!("serialize log message for execution {}", execution_id))?;
     let mut json_line_with_newline = json_line;
     json_line_with_newline.push('\n');
+    // A `Blocked` result is the byte cap doing its job, not an error.
     log_writer
         .append_jsonl_line(&json_line_with_newline)
         .await
@@ -278,6 +279,7 @@ pub fn spawn_stream_raw_logs_to_storage(
             map.get(&execution_id).cloned()
         };
 
+        let mut log_blocked_logged = false;
         if let Some(store) = store {
             let mut stream = store.history_plus_stream();
 
@@ -288,14 +290,24 @@ pub fn spawn_stream_raw_logs_to_storage(
                             let mut jsonl_line_with_newline = jsonl_line;
                             jsonl_line_with_newline.push('\n');
 
-                            if let Err(e) =
-                                log_writer.append_jsonl_line(&jsonl_line_with_newline).await
-                            {
-                                tracing::error!(
-                                    "Failed to append log line for execution {}: {}",
-                                    execution_id,
-                                    e
-                                );
+                            match log_writer.append_jsonl_line(&jsonl_line_with_newline).await {
+                                Ok(LogAppend::Written) => {}
+                                Ok(LogAppend::Blocked) => {
+                                    if !log_blocked_logged {
+                                        log_blocked_logged = true;
+                                        tracing::warn!(
+                                            "Execution {} log hit its byte cap: blocked(limit)",
+                                            execution_id
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to append log line for execution {}: {}",
+                                        execution_id,
+                                        e
+                                    );
+                                }
                             }
                         }
                         Err(e) => {

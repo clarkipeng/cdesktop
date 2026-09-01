@@ -96,6 +96,8 @@ pub enum ContainerError {
     ExecutionProcess(#[from] ExecutionProcessError),
     #[error("Io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    HostAdmission(#[from] crate::services::host_admission::AdmissionError),
     #[error("Failed to kill process: {0}")]
     KillFailed(std::io::Error),
     #[error(transparent)]

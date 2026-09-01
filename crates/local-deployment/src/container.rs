@@ -1377,6 +1377,12 @@ impl ContainerService for LocalContainerService {
             env.provider_structured = Some(structured.clone());
         }
 
+        // Reserve host process + disk headroom before the fork. On an
+        // exhausted host this refuses with a typed error instead of letting
+        // the fork fail with EAGAIN or the first write fail on a full disk.
+        let live_agents = self.child_store.read().await.len() as u64;
+        services::services::host_admission::reserve_spawn_headroom(&current_dir, live_agents)?;
+
         // Create the child and stream, add to execution tracker with timeout
         let mut spawned = tokio::time::timeout(
             Duration::from_secs(30),
