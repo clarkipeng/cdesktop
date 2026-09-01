@@ -203,6 +203,7 @@ pub async fn follow_up(
         .get("x-cdesktop-from-session")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
+    reject_self_delivery(team_from_session, session.id)?;
 
     // Load workspace from session
     let mut workspace = Workspace::find_by_id(pool, session.workspace_id)
@@ -211,7 +212,7 @@ pub async fn follow_up(
             "Workspace not found".to_string(),
         )))?;
 
-    tracing::info!("{:?}", workspace);
+    tracing::debug!("{:?}", workspace);
 
     // Worktree-disabled mode: optionally checkout a branch in the real repo,
     // then record the resulting HEAD into workspace.branch. User is trusted
@@ -418,6 +419,15 @@ pub async fn follow_up(
     Ok(ResponseJson(ApiResponse::success(command)))
 }
 
+fn reject_self_delivery(sender: Option<Uuid>, recipient: Uuid) -> Result<(), ApiError> {
+    if sender == Some(recipient) {
+        return Err(ApiError::Conflict(
+            "A session cannot send a peer command to itself".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn list_commands(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
@@ -609,4 +619,21 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .nest("/{session_id}/queue", queue::router(deployment));
 
     Router::new().nest("/sessions", sessions_router)
+}
+
+#[cfg(test)]
+mod peer_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn peer_delivery_refuses_self_before_enqueue() {
+        let session_id = Uuid::new_v4();
+
+        assert!(matches!(
+            reject_self_delivery(Some(session_id), session_id),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(reject_self_delivery(Some(Uuid::new_v4()), session_id).is_ok());
+        assert!(reject_self_delivery(None, session_id).is_ok());
+    }
 }
