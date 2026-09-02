@@ -44,8 +44,16 @@ pub struct DiffStats {
 /// an unbounded caller could exhaust the process table (the ~196-child
 /// incident). Callers queue on this semaphore instead of racing.
 const MAX_CONCURRENT_DIFF_STATS: usize = 6;
+
+/// The process-global limiter is built from this constructor, so a test can
+/// exhaust an identical semaphore of its own instead of stealing permits from
+/// live callers.
+fn new_diff_stats_semaphore() -> tokio::sync::Semaphore {
+    tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFF_STATS)
+}
+
 static DIFF_STATS_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFF_STATS));
+    std::sync::LazyLock::new(new_diff_stats_semaphore);
 
 /// Computes diff stats for a workspace by comparing against target branches.
 ///
@@ -870,12 +878,18 @@ mod tests {
         // Regression guard for the process-table incident: no more than
         // MAX_CONCURRENT_DIFF_STATS computations may run their blocking git
         // work at once.
-        let mut held = Vec::new();
-        for _ in 0..MAX_CONCURRENT_DIFF_STATS {
-            held.push(DIFF_STATS_SEMAPHORE.try_acquire().unwrap());
-        }
-        assert!(DIFF_STATS_SEMAPHORE.try_acquire().is_err());
+        //
+        // Uses its own semaphore from the same constructor as the
+        // process-global one. Draining the global would starve any concurrent
+        // caller for the rest of the test binary's life and make this test's
+        // own result depend on who else happened to hold a permit.
+        let semaphore = new_diff_stats_semaphore();
+        let held: Vec<_> = (0..MAX_CONCURRENT_DIFF_STATS)
+            .map(|_| semaphore.try_acquire().expect("permit within the cap"))
+            .collect();
+
+        assert!(semaphore.try_acquire().is_err());
         drop(held);
-        assert!(DIFF_STATS_SEMAPHORE.try_acquire().is_ok());
+        assert!(semaphore.try_acquire().is_ok());
     }
 }
