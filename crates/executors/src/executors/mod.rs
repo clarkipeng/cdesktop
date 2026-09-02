@@ -93,6 +93,12 @@ pub enum ExecutorError {
     SetupHelperNotSupported,
     #[error("Auth required: {0}")]
     AuthRequired(String),
+    /// The adapter refused the operation and has already classified it. The
+    /// typed terminal travels with the error so the exit signal reports the
+    /// real reason (and its retry hint) instead of degrading to `Unknown`.
+    // Boxed to keep `ExecutorError` small (clippy result_large_err).
+    #[error("Refused: {}", .0.safe_message)]
+    Refused(Box<crate::outcome::NormalizedExecutionOutcome>),
 }
 
 #[enum_dispatch]

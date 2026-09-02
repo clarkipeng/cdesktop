@@ -38,7 +38,7 @@ use workspace_utils::approvals::{ApprovalPatterns, ApprovalScope, ApprovalStatus
 
 use super::{
     jsonrpc::{JsonRpcCallbacks, JsonRpcPeer},
-    storage_guard::{StorageLimits, find_rollout_file},
+    storage_guard::{ForkGuardError, StorageLimits, find_rollout_file},
 };
 use crate::{
     approvals::{ExecutorApprovalError, ExecutorApprovalService},
@@ -162,15 +162,40 @@ impl AppServerClient {
         &self,
         params: ThreadForkParams,
     ) -> Result<ThreadForkResponse, ExecutorError> {
-        self.storage_limits
+        if let Err(error) = self
+            .storage_limits
             .ensure_fork_allowed(&params.thread_id)
             .await
-            .map_err(ExecutorError::Io)?;
+        {
+            return Err(self.refuse_fork(error));
+        }
         let request = ClientRequest::ThreadFork {
             request_id: self.next_request_id(),
             params,
         };
-        self.send_request(request, "thread/fork").await
+        let response: ThreadForkResponse = self.send_request(request, "thread/fork").await?;
+        // Charge the rate budget only now that a rollout copy really exists.
+        // Refused forks materialize nothing, so they must cost nothing.
+        self.storage_limits.record_fork();
+        Ok(response)
+    }
+
+    /// Turn a fork refusal into a typed terminal. A rate-limited refusal is
+    /// transient and carries the window remainder, so the caller retries
+    /// instead of treating an exhausted budget as a failed task.
+    fn refuse_fork(&self, error: ForkGuardError) -> ExecutorError {
+        let retry_after_seconds = match error {
+            ForkGuardError::RateLimited {
+                retry_after_seconds,
+            } => retry_after_seconds,
+            ForkGuardError::Io(error) => return ExecutorError::Io(error),
+        };
+        let outcome = NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
+            .with_provider_code("fork_rate_limited")
+            .with_retry_after_seconds(retry_after_seconds);
+        *self.exit_outcome.lock().unwrap() = Some(outcome.clone());
+        self.cancel.cancel();
+        ExecutorError::Refused(Box::new(outcome))
     }
 
     pub async fn turn_start_with_mode(
