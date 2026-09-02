@@ -231,6 +231,8 @@ fn generate_types_content() -> String {
         executors::outcome::ExecutionOutcomeClass::decl(),
         executors::outcome::OutcomeBindingScope::decl(),
         executors::outcome::NormalizedExecutionOutcome::decl(),
+        services::services::host_admission::AdmissionResource::decl(),
+        services::services::host_admission::AdmissionRefusal::decl(),
         server::routes::metered_approvals::MeteredApprovalResponseRequest::decl(),
         server::routes::execution_routing::ExecutionRoutingSettings::decl(),
         server::routes::execution_routing::ExecutionRoutingRoute::decl(),

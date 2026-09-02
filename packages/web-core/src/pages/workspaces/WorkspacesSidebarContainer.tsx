@@ -1,4 +1,10 @@
-import React, { useState, useMemo, useCallback, useEffect } from 'react';
+import React, {
+  useState,
+  useMemo,
+  useCallback,
+  useEffect,
+  useRef,
+} from 'react';
 import {
   usePillDragStore,
   useDraggingWorkspaceId,
@@ -31,6 +37,7 @@ import {
   type WorkspaceSortOrder,
 } from '@/shared/stores/useUiPreferencesStore';
 import type { Workspace } from '@/shared/hooks/useWorkspaces';
+import { useWorkspaceDiffStats } from '@/shared/hooks/useWorkspaceDiffStats';
 import { CommandBarDialog } from '@/shared/dialogs/command-bar/CommandBarDialog';
 import { SettingsDialog } from '@/shared/dialogs/settings/SettingsDialog';
 import { NavbarSidebarSearchSlot } from '@/shared/components/ui-new/containers/NavbarSidebarSearchSlot';
@@ -544,12 +551,65 @@ export function WorkspacesSidebarContainer({
     [sortedArchivedWorkspaces, displayLimit, isSearching]
   );
 
+  // Diff stats for the rows the user can actually see. The summaries endpoint
+  // is metadata-only now, so each visible pill fetches its own git truth
+  // behind the server's global subprocess semaphore.
+  const {
+    stats: diffStats,
+    loadingIds: diffStatsLoadingIds,
+    setWorkspaceVisible,
+  } = useWorkspaceDiffStats();
+
+  // Stable per-workspace visibility reporters. A fresh closure per render
+  // would tear down and rebuild every row's IntersectionObserver and
+  // invalidate the folder-grouping memo on every keystroke.
+  const visibilityHandlers = useRef(
+    new Map<string, (visible: boolean) => void>()
+  );
+  const getVisibilityHandler = useCallback(
+    (workspaceId: string) => {
+      const existing = visibilityHandlers.current.get(workspaceId);
+      if (existing) return existing;
+      const handler = (visible: boolean) =>
+        setWorkspaceVisible(workspaceId, visible);
+      visibilityHandlers.current.set(workspaceId, handler);
+      return handler;
+    },
+    [setWorkspaceVisible]
+  );
+
+  const withDiffStats = useCallback(
+    (workspaces: Workspace[]): Workspace[] =>
+      workspaces.map((ws) => {
+        const fetched = diffStats.get(ws.id);
+        return {
+          ...ws,
+          filesChanged: fetched?.filesChanged,
+          linesAdded: fetched?.linesAdded,
+          linesRemoved: fetched?.linesRemoved,
+          diffStatsLoading: diffStatsLoadingIds.has(ws.id),
+          onVisibilityChange: getVisibilityHandler(ws.id),
+        };
+      }),
+    [diffStats, diffStatsLoadingIds, getVisibilityHandler]
+  );
+
+  const activeRows = useMemo(
+    () => withDiffStats(paginatedActiveWorkspaces),
+    [paginatedActiveWorkspaces, withDiffStats]
+  );
+
+  const archivedRows = useMemo(
+    () => withDiffStats(paginatedArchivedWorkspaces),
+    [paginatedArchivedWorkspaces, withDiffStats]
+  );
+
   // Partition paginated active list into { pinned, byFolder }.
   const { pinnedWorkspaces, folderGroups } = useMemo(() => {
-    const pinned: typeof paginatedActiveWorkspaces = [];
+    const pinned: Workspace[] = [];
     const groups = new Map<string, WorkspacesSidebarFolderGroup>();
 
-    for (const ws of paginatedActiveWorkspaces) {
+    for (const ws of activeRows) {
       if (ws.isPinned) {
         pinned.push(ws);
         continue;
@@ -594,7 +654,7 @@ export function WorkspacesSidebarContainer({
         (a.qualifier ?? '').localeCompare(b.qualifier ?? '')
     );
     return { pinnedWorkspaces: pinned, folderGroups: folderGroupsArr };
-  }, [paginatedActiveWorkspaces]);
+  }, [activeRows]);
 
   // Check if there are more workspaces to load
   const hasMoreWorkspaces = showArchive
@@ -927,9 +987,9 @@ export function WorkspacesSidebarContainer({
   return (
     <>
       <WorkspacesSidebar
-        workspaces={paginatedActiveWorkspaces}
+        workspaces={activeRows}
         totalWorkspacesCount={activeWorkspaces.length}
-        archivedWorkspaces={paginatedArchivedWorkspaces}
+        archivedWorkspaces={archivedRows}
         isLoading={isWorkspacesListLoading}
         selectedWorkspaceId={focusedSessionId ?? selectedWorkspaceId ?? null}
         onSelectWorkspace={handleSelectWorkspace}

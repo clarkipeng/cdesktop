@@ -27,9 +27,19 @@ export interface SidebarWorkspace {
   createdAt: string;
   updatedAt: string;
   description: string;
+  /**
+   * Diff stats are not part of the summaries payload. Computing them for
+   * every workspace fanned unbounded blocking `git` children out per poll, so
+   * they are fetched on demand per visible row (`useWorkspaceDiffStats`) and
+   * merged in by the sidebar container.
+   */
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
+  /** Diff stats for this row are still being fetched. */
+  diffStatsLoading?: boolean;
+  /** Reports viewport entry/exit so only visible rows fetch diff stats. */
+  onVisibilityChange?: (visible: boolean) => void;
   isRunning?: boolean;
   isPinned?: boolean;
   /** Position in pinned list (0 = top). undefined if not pinned. */
@@ -74,10 +84,8 @@ function toSidebarWorkspace(
     createdAt: ws.created_at,
     updatedAt: ws.updated_at,
     description: '',
-    // Use real stats from summary if available
-    filesChanged: summary?.files_changed ?? undefined,
-    linesAdded: summary?.lines_added ?? undefined,
-    linesRemoved: summary?.lines_removed ?? undefined,
+    // Diff stats deliberately absent: the summaries endpoint is metadata-only.
+    // See `useWorkspaceDiffStats` for the on-demand per-visible-row fetch.
     // Real data from stream
     isRunning: ws.is_running,
     isPinned: ws.pinned,

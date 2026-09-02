@@ -25,6 +25,15 @@ export interface WorkspacesSidebarWorkspace {
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
+  /** Diff stats for this row are still being fetched. */
+  diffStatsLoading?: boolean;
+  /**
+   * Called when this row enters or leaves the viewport. Travels with the row
+   * rather than as a sidebar-level prop so every list variant (pinned, folder,
+   * flat, archived) reports visibility without threading a callback through
+   * each of them.
+   */
+  onVisibilityChange?: (visible: boolean) => void;
   isRunning?: boolean;
   isPinned?: boolean;
   hasPendingApproval?: boolean;
@@ -238,6 +247,8 @@ function WorkspaceList({
           filesChanged={workspace.filesChanged}
           linesAdded={workspace.linesAdded}
           linesRemoved={workspace.linesRemoved}
+          diffStatsLoading={workspace.diffStatsLoading}
+          onVisibilityChange={workspace.onVisibilityChange}
           isActive={selectedWorkspaceId === workspace.id}
           isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
           isRunning={workspace.isRunning}
@@ -592,6 +603,8 @@ function PinnedSection({
                   filesChanged={workspace.filesChanged}
                   linesAdded={workspace.linesAdded}
                   linesRemoved={workspace.linesRemoved}
+                  diffStatsLoading={workspace.diffStatsLoading}
+                  onVisibilityChange={workspace.onVisibilityChange}
                   isActive={selectedWorkspaceId === workspace.id}
                   isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
                   isRunning={workspace.isRunning}
@@ -831,6 +844,8 @@ export function WorkspacesSidebar({
                   filesChanged={workspace.filesChanged}
                   linesAdded={workspace.linesAdded}
                   linesRemoved={workspace.linesRemoved}
+                  diffStatsLoading={workspace.diffStatsLoading}
+                  onVisibilityChange={workspace.onVisibilityChange}
                   isActive={selectedWorkspaceId === workspace.id}
                   isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
                   isRunning={workspace.isRunning}
@@ -956,6 +971,8 @@ export function WorkspacesSidebar({
                 filesChanged={workspace.filesChanged}
                 linesAdded={workspace.linesAdded}
                 linesRemoved={workspace.linesRemoved}
+                diffStatsLoading={workspace.diffStatsLoading}
+                onVisibilityChange={workspace.onVisibilityChange}
                 isActive={selectedWorkspaceId === workspace.id}
                 isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
                 isRunning={workspace.isRunning}

@@ -74,6 +74,7 @@ import {
   MergeWorkspaceRequest,
   PushWorkspaceRequest,
   RepoBranchStatus,
+  DiffStats,
   AbortConflictsRequest,
   ContinueRebaseRequest,
   Session,
@@ -575,6 +576,26 @@ export const workspacesApi = {
       `/api/workspaces/${workspaceId}/git/status`
     );
     return handleApiResponse<RepoBranchStatus[]>(response);
+  },
+
+  /**
+   * On-demand Git diff stats for one workspace.
+   *
+   * `null` means the stats could not be computed, which is deliberately
+   * distinct from `{0,0,0}` ("computed, no changes"). Server-side the
+   * computation queues on a small global subprocess semaphore, so this is
+   * safe to call per visible workspace - but never for every workspace at
+   * once: that fan-out is exactly what the summaries endpoint stopped doing.
+   */
+  getDiffStats: async (
+    workspaceId: string,
+    hostId?: string | null
+  ): Promise<DiffStats | null> => {
+    const response = await makeHostAwareRequest(
+      `/api/workspaces/${workspaceId}/git/diff/stats`,
+      hostId
+    );
+    return handleApiResponse<DiffStats | null>(response);
   },
 
   getRepos: async (workspaceId: string): Promise<RepoWithTargetBranch[]> => {
