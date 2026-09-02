@@ -45,6 +45,7 @@ use executors::{
             patch::{fix_patch_ops, is_add_or_replace, patch_entry_path},
         },
     },
+    outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
     profile::{ExecutorConfig, ExecutorProfileId},
     provider::ProviderInjection,
 };
@@ -100,6 +101,23 @@ pub enum ContainerError {
     KillFailed(std::io::Error),
     #[error(transparent)]
     Other(#[from] AnyhowError), // Catches any unclassified errors
+}
+
+/// Typed terminal for a spawn that never started.
+///
+/// Host admission and other capacity refusals are transient by construction:
+/// nothing about the task is wrong, the host was full. Classifying them as
+/// `TaskFailed` would tell a retrying caller to give up.
+pub fn start_error_outcome(error: &ContainerError) -> NormalizedExecutionOutcome {
+    match error {
+        ContainerError::HostAdmission(admission) => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
+                .with_provider_code("local_host_admission")
+                .with_retry_after_seconds(admission.retry_after_seconds())
+        }
+        _ => NormalizedExecutionOutcome::new(ExecutionOutcomeClass::TaskFailed)
+            .with_provider_code("local_start_failed"),
+    }
 }
 
 #[async_trait]
@@ -1050,6 +1068,21 @@ pub trait ContainerService {
         status: ExecutionProcessStatus,
     ) -> Result<(), ContainerError>;
 
+    /// Start persisting this execution's live log stream to its durable file.
+    ///
+    /// Overridden by implementors that own the child process, so the durable
+    /// writer's byte cap can stop a runaway agent instead of silently dropping
+    /// its output. The default persists without a stop hook.
+    async fn spawn_log_persistence(&self, execution_process: &ExecutionProcess) {
+        execution_process::spawn_stream_raw_logs_to_storage(
+            self.msg_stores().clone(),
+            self.db().clone(),
+            execution_process.id,
+            execution_process.session_id,
+            None,
+        );
+    }
+
     async fn try_commit_changes(&self, ctx: &ExecutionContext) -> Result<bool, ContainerError>;
 
     async fn copy_project_files(
@@ -1673,12 +1706,16 @@ pub trait ContainerService {
                 .write()
                 .await
                 .remove(&execution_process.id);
-            // Mark process as failed
-            if let Err(update_error) = ExecutionProcess::update_completion(
+            // Mark process as failed, with a typed outcome. A spawn that was
+            // refused rather than attempted is retryable, and the row has to
+            // say so - an untyped failure reads as "the task is broken".
+            let outcome = start_error_outcome(&start_error);
+            if let Err(update_error) = ExecutionProcess::complete_running_attempt(
                 &self.db().pool,
                 execution_process.id,
                 ExecutionProcessStatus::Failed,
                 None,
+                Some(&outcome),
             )
             .await
             {
@@ -1795,12 +1832,7 @@ pub trait ContainerService {
             }
         }
 
-        execution_process::spawn_stream_raw_logs_to_storage(
-            self.msg_stores().clone(),
-            self.db().clone(),
-            execution_process.id,
-            session.id,
-        );
+        self.spawn_log_persistence(&execution_process).await;
         Ok(execution_process)
     }
 
