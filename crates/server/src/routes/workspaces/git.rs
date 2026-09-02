@@ -166,14 +166,24 @@ async fn resolve_cdesktop_identifier(
 /// On-demand, single-workspace Git diff stats. This is the explicit refresh
 /// that replaces the removed per-workspace fan-out in the summaries endpoint;
 /// the underlying computation is gated by a global subprocess semaphore.
+///
+/// `null` means the stats could not be computed (no container, unreadable
+/// repo, git failure). It is deliberately distinct from `{0,0,0}`, which means
+/// "computed, and there are no changes" - collapsing the two showed a
+/// confident "no changes" for every workspace whose git truth was unavailable.
 #[axum::debug_handler]
 pub async fn get_workspace_diff_stats(
     Extension(workspace): Extension<Workspace>,
     State(deployment): State<DeploymentImpl>,
-) -> Result<ResponseJson<ApiResponse<super::workspace_summary::DiffStats>>, ApiError> {
-    let stats = super::workspace_summary::compute_workspace_diff_stats(&deployment, &workspace)
-        .await
-        .unwrap_or_default();
+) -> Result<ResponseJson<ApiResponse<Option<super::workspace_summary::DiffStats>>>, ApiError> {
+    let stats =
+        super::workspace_summary::compute_workspace_diff_stats(&deployment, &workspace).await;
+    if stats.is_none() {
+        tracing::warn!(
+            workspace_id = %workspace.id,
+            "diff stats unavailable for workspace; reporting null rather than zero changes"
+        );
+    }
     Ok(ResponseJson(ApiResponse::success(stats)))
 }
 
