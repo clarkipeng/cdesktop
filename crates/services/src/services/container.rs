@@ -78,6 +78,8 @@ fn max_running_agents() -> i64 {
 
 #[derive(Debug, Error)]
 pub enum ContainerError {
+    #[error("Infrastructure unavailable: {0}")]
+    InfrastructureUnavailable(String),
     #[error(transparent)]
     GitServiceError(#[from] GitServiceError),
     #[error(transparent)]
@@ -111,6 +113,10 @@ pub trait ContainerService {
     fn notification_service(&self) -> &NotificationService;
 
     fn scheduler_lock(&self) -> &Mutex<()>;
+
+    /// Every native backend names its own capacity authority. Keeping this
+    /// required prevents a new backend from silently bypassing admission.
+    fn ensure_launch_admission(&self) -> Result<(), ContainerError>;
 
     async fn touch(&self, workspace: &Workspace) -> Result<(), ContainerError>;
 
@@ -1492,6 +1498,7 @@ pub trait ContainerService {
         execution_process_id: Uuid,
         claim_pending_commands: bool,
     ) -> Result<ExecutionProcess, ContainerError> {
+        self.ensure_launch_admission()?;
         // Create new execution process record
         // Capture current HEAD per repository as the "before" commit for this execution
         let repositories =

@@ -59,7 +59,7 @@ use utils::{log_msg::LogMsg, msg_store::MsgStore, text::truncate_to_char_boundar
 use uuid::Uuid;
 use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 
-use crate::{command, copy};
+use crate::{command, copy, process_budget::HostProcessBudget};
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
 
@@ -99,6 +99,7 @@ pub struct LocalContainerService {
     approvals: Approvals,
     notification_service: NotificationService,
     remote_client: Option<RemoteClient>,
+    process_budget: HostProcessBudget,
 }
 
 impl LocalContainerService {
@@ -113,6 +114,7 @@ impl LocalContainerService {
         analytics: Option<AnalyticsContext>,
         approvals: Approvals,
         remote_client: Option<RemoteClient>,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Self {
         let child_store = Arc::new(RwLock::new(HashMap::new()));
         let cancellation_tokens = Arc::new(RwLock::new(HashMap::new()));
@@ -138,6 +140,7 @@ impl LocalContainerService {
             approvals,
             notification_service,
             remote_client,
+            process_budget: HostProcessBudget::start(shutdown),
         };
 
         container.spawn_workspace_cleanup();
@@ -1086,6 +1089,10 @@ impl ContainerService for LocalContainerService {
 
     fn scheduler_lock(&self) -> &Mutex<()> {
         &self.scheduler_lock
+    }
+
+    fn ensure_launch_admission(&self) -> Result<(), ContainerError> {
+        self.process_budget.ensure_available()
     }
 
     async fn touch(&self, workspace: &Workspace) -> Result<(), ContainerError> {

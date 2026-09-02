@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{future::Future, sync::LazyLock};
 
 use axum::{
     Json, Router,
@@ -74,6 +74,39 @@ struct ManagedTaskEffectResponse {
     created: bool,
 }
 
+struct ReservedManagedLaunch {
+    record: ManagedTaskEffect,
+    inserted: bool,
+    launch_result: Option<Result<(), ApiError>>,
+}
+
+/// The reservation is committed before the native launch closure runs. A
+/// duplicate `(task_id, epoch)` therefore returns the IDs of the first native
+/// effect without invoking the launcher again.
+async fn reserve_and_launch<F, Fut>(
+    pool: &sqlx::SqlitePool,
+    effect: NewManagedTaskEffect<'_>,
+    launch: F,
+) -> Result<ReservedManagedLaunch, ApiError>
+where
+    F: FnOnce(Uuid, Uuid) -> Fut,
+    Fut: Future<Output = Result<(), ApiError>>,
+{
+    let (record, inserted) = ManagedTaskEffect::begin(pool, effect)
+        .await
+        .map_err(map_effect_error)?;
+    let launch_result = inserted.then(|| launch(record.workspace_id, record.session_id));
+    let launch_result = match launch_result {
+        Some(launch) => Some(launch.await),
+        None => None,
+    };
+    Ok(ReservedManagedLaunch {
+        record,
+        inserted,
+        launch_result,
+    })
+}
+
 async fn create_or_return(
     State(deployment): State<DeploymentImpl>,
     Path((task_id, epoch)): Path<(Uuid, i64)>,
@@ -86,7 +119,8 @@ async fn create_or_return(
     let kind = launch.kind();
     let workspace_id = launch.workspace_id();
     let session_id = Uuid::new_v4();
-    let (record, inserted) = ManagedTaskEffect::begin(
+    let deployment_for_launch = deployment.clone();
+    let reserved = reserve_and_launch(
         &deployment.db().pool,
         NewManagedTaskEffect {
             task_id,
@@ -97,9 +131,54 @@ async fn create_or_return(
             session_id,
             owner_instance_id: *INSTANCE_ID,
         },
+        |workspace_id, session_id| async move {
+            match launch {
+                ManagedLaunch::Workspace { request } => {
+                    create_and_start_workspace_with_ids(
+                        &deployment_for_launch,
+                        request,
+                        workspace_id,
+                        session_id,
+                    )
+                    .await?;
+                }
+                ManagedLaunch::Session {
+                    workspace_id: requested_workspace_id,
+                    caller_session_id,
+                    request,
+                } => {
+                    let workspace = Workspace::find_by_id(
+                        &deployment_for_launch.db().pool,
+                        requested_workspace_id,
+                    )
+                    .await?
+                    .ok_or(WorkspaceError::WorkspaceNotFound)?;
+                    let caller =
+                        Session::find_by_id(&deployment_for_launch.db().pool, caller_session_id)
+                            .await?
+                            .ok_or(SessionError::NotFound)?;
+                    if caller.workspace_id != workspace.id || workspace.id != workspace_id {
+                        return Err(ApiError::Conflict(
+                            "Caller session belongs to another workspace".into(),
+                        ));
+                    }
+                    spawn_teammate_with_id(
+                        &deployment_for_launch,
+                        &workspace,
+                        Some(&caller),
+                        request,
+                        SpawnSource::SessionCli,
+                        session_id,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        },
     )
-    .await
-    .map_err(map_effect_error)?;
+    .await?;
+    let record = reserved.record;
+    let inserted = reserved.inserted;
 
     if !inserted {
         let record = reconcile(&deployment, record).await?;
@@ -113,47 +192,9 @@ async fn create_or_return(
         ))));
     }
 
-    let launch_result: Result<(), ApiError> = async {
-        match launch {
-            ManagedLaunch::Workspace { request } => {
-                create_and_start_workspace_with_ids(
-                    &deployment,
-                    request,
-                    record.workspace_id,
-                    record.session_id,
-                )
-                .await?;
-            }
-            ManagedLaunch::Session {
-                workspace_id,
-                caller_session_id,
-                request,
-            } => {
-                let workspace = Workspace::find_by_id(&deployment.db().pool, workspace_id)
-                    .await?
-                    .ok_or(WorkspaceError::WorkspaceNotFound)?;
-                let caller = Session::find_by_id(&deployment.db().pool, caller_session_id)
-                    .await?
-                    .ok_or(SessionError::NotFound)?;
-                if caller.workspace_id != workspace.id {
-                    return Err(ApiError::Conflict(
-                        "Caller session belongs to another workspace".into(),
-                    ));
-                }
-                spawn_teammate_with_id(
-                    &deployment,
-                    &workspace,
-                    Some(&caller),
-                    request,
-                    SpawnSource::SessionCli,
-                    record.session_id,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-    .await;
+    let launch_result = reserved
+        .launch_result
+        .expect("the inserting request always invokes the native launcher");
 
     let record = match launch_result {
         Ok(()) => {
@@ -253,7 +294,36 @@ fn to_response(record: ManagedTaskEffect, created_by_request: bool) -> ManagedTa
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
     use super::*;
+
+    async fn pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("../db/migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    fn effect(task_id: Uuid, session_id: Uuid) -> NewManagedTaskEffect<'static> {
+        NewManagedTaskEffect {
+            task_id,
+            epoch: 1,
+            request_hash: "same-request",
+            kind: "session",
+            workspace_id: Uuid::new_v4(),
+            session_id,
+            owner_instance_id: Uuid::new_v4(),
+        }
+    }
 
     #[test]
     fn request_hash_is_stable_and_parameter_sensitive() {
@@ -284,5 +354,42 @@ mod tests {
             request_hash(&first).unwrap(),
             request_hash(&second).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn route_launch_seam_retries_without_creating_a_second_native_session() {
+        let pool = pool().await;
+        let task_id = Uuid::new_v4();
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        let first = reserve_and_launch(&pool, effect(task_id, Uuid::new_v4()), {
+            let launches = launches.clone();
+            move |_, _| async move {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(first.inserted);
+        let first_session_id = first.record.session_id;
+        ManagedTaskEffect::finish(&pool, task_id, 1, "active", true, None)
+            .await
+            .unwrap();
+
+        let retry = reserve_and_launch(&pool, effect(task_id, Uuid::new_v4()), {
+            let launches = launches.clone();
+            move |_, _| async move {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!retry.inserted);
+        assert!(retry.launch_result.is_none());
+        assert_eq!(retry.record.session_id, first_session_id);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
     }
 }

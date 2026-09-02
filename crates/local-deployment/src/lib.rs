@@ -45,6 +45,7 @@ use crate::{container::LocalContainerService, pty::PtyService};
 mod command;
 pub mod container;
 mod copy;
+mod process_budget;
 pub mod pty;
 
 #[derive(Clone)]
@@ -226,6 +227,7 @@ impl Deployment for LocalDeployment {
             analytics_ctx,
             approvals.clone(),
             remote_client.clone().ok(),
+            shutdown.child_token(),
         )
         .await;
 
