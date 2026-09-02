@@ -39,6 +39,18 @@ impl<T, E> ApiResponse<T, E> {
         }
     }
 
+    /// Creates an error response carrying both a human-readable `message` and
+    /// machine-readable `error_data`, so a generic error toast and a
+    /// programmatic retry can read the same response.
+    pub fn error_with_message_and_data(message: &str, data: E) -> Self {
+        ApiResponse {
+            success: false,
+            data: None,
+            error_data: Some(data),
+            message: Some(message.to_string()),
+        }
+    }
+
     /// Returns true if the response was successful.
     pub fn is_success(&self) -> bool {
         self.success
