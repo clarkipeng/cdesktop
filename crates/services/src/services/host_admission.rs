@@ -195,10 +195,7 @@ pub fn is_admission_gated(run_reason: &ExecutionProcessRunReason) -> bool {
 /// `tracked_agents` is cdesktop's count of live executor children, used only
 /// as the fallback process estimate on platforms that cannot report the real
 /// process count.
-pub fn check_spawn_headroom(
-    disk_probe: &Path,
-    tracked_agents: u64,
-) -> Result<(), AdmissionError> {
+pub fn check_spawn_headroom(disk_probe: &Path, tracked_agents: u64) -> Result<(), AdmissionError> {
     admit(
         available_space(disk_probe),
         min_free_bytes(),
@@ -367,9 +364,7 @@ mod tests {
     fn only_coding_agents_are_admission_gated() {
         // Self-deadlock guard: the paths that FREE the resource must never be
         // gated on the resource.
-        assert!(is_admission_gated(
-            &ExecutionProcessRunReason::CodingAgent
-        ));
+        assert!(is_admission_gated(&ExecutionProcessRunReason::CodingAgent));
         for exempt in [
             ExecutionProcessRunReason::CleanupScript,
             ExecutionProcessRunReason::ArchiveScript,
