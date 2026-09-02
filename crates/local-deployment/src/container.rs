@@ -46,6 +46,7 @@ use services::services::{
     container::{ContainerError, ContainerRef, ContainerService},
     diff_stream::{self, DiffStreamHandle},
     file::FileService,
+    host_admission,
     notification::NotificationService,
     remote_client::RemoteClient,
     remote_sync,
@@ -1377,11 +1378,17 @@ impl ContainerService for LocalContainerService {
             env.provider_structured = Some(structured.clone());
         }
 
-        // Reserve host process + disk headroom before the fork. On an
-        // exhausted host this refuses with a typed error instead of letting
+        // Check host process + disk headroom before the fork. On an exhausted
+        // host this refuses with a typed, retryable error instead of letting
         // the fork fail with EAGAIN or the first write fail on a full disk.
-        let live_agents = self.child_store.read().await.len() as u64;
-        services::services::host_admission::reserve_spawn_headroom(&current_dir, live_agents)?;
+        //
+        // Gated by run reason: cleanup/archive/setup/dev-server are exempt
+        // (see `host_admission::is_admission_gated`) because refusing the
+        // paths that reclaim disk would make an exhausted host unrecoverable.
+        if host_admission::is_admission_gated(&execution_process.run_reason) {
+            let tracked_agents = self.child_store.read().await.len() as u64;
+            host_admission::check_spawn_headroom(&current_dir, tracked_agents)?;
+        }
 
         // Create the child and stream, add to execution tracker with timeout
         let mut spawned = tokio::time::timeout(
