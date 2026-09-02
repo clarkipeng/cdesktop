@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
-import { useQueries } from '@tanstack/react-query';
+import { useQueries, useQuery } from '@tanstack/react-query';
 import { workspacesApi } from '@/shared/lib/api';
 import { useHostId } from '@/shared/providers/HostIdProvider';
 
@@ -103,4 +103,39 @@ export function useWorkspaceDiffStats(): UseWorkspaceDiffStatsResult {
 
     return { stats, loadingIds, setWorkspaceVisible };
   }, [visibleIds, results, setWorkspaceVisible]);
+}
+
+/**
+ * Diff stats for one known workspace, fetched on demand.
+ *
+ * For single-workspace panels, which cannot fan out by construction: they
+ * already know exactly which workspace they are showing.
+ */
+export function useSingleWorkspaceDiffStats(
+  workspaceId: string | null | undefined
+): { stats: WorkspaceDiffStats | null; isLoading: boolean } {
+  const hostId = useHostId();
+  const { data, isPending, isError } = useQuery({
+    queryKey: workspaceDiffStatsKeys.byWorkspace(workspaceId ?? '', hostId),
+    queryFn: () => workspacesApi.getDiffStats(workspaceId!, hostId),
+    enabled: !!workspaceId,
+    staleTime: STALE_TIME_MS,
+    refetchInterval: REFETCH_INTERVAL_MS,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+
+  return useMemo(() => {
+    if (!workspaceId) return { stats: null, isLoading: false };
+    if (isPending) return { stats: null, isLoading: true };
+    if (isError || !data) return { stats: null, isLoading: false };
+    return {
+      stats: {
+        filesChanged: data.files_changed,
+        linesAdded: data.lines_added,
+        linesRemoved: data.lines_removed,
+      },
+      isLoading: false,
+    };
+  }, [workspaceId, data, isPending, isError]);
 }
