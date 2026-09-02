@@ -395,9 +395,8 @@ mod tests {
         // The honest-counting fix: when the platform can answer, the count is
         // the real host process count, which is always at least this test
         // process. `None` (fail-open) is the only other legal answer.
-        match live_process_count() {
-            Some(count) => assert!(count >= 1, "implausible live process count {count}"),
-            None => {}
+        if let Some(count) = live_process_count() {
+            assert!(count >= 1, "implausible live process count {count}");
         }
     }
 }

@@ -18,6 +18,7 @@ import { MessageEditProvider } from '@/features/workspace-chat/model/contexts/Me
 import { CreateModeProvider } from '@/features/create-mode/model/CreateModeProvider';
 import { useWorkspaceSessions } from '@/shared/hooks/useWorkspaceSessions';
 import { useWorkspaceRecord } from '@/shared/hooks/useWorkspaceRecord';
+import { useSingleWorkspaceDiffStats } from '@/shared/hooks/useWorkspaceDiffStats';
 import { SessionChatBoxContainer } from '@/features/workspace-chat/ui/SessionChatBoxContainer';
 import { CreateChatBoxContainer } from '@/shared/components/CreateChatBoxContainer';
 import { KanbanIssuePanelContainer } from './KanbanIssuePanelContainer';
@@ -167,6 +168,11 @@ function WorkspaceSessionPanel({
       ),
     [activeWorkspaces, archivedWorkspaces, workspaceId]
   );
+
+  // Diff stats are no longer part of the summaries payload (metadata-only).
+  // This panel shows exactly one workspace, so it fetches its own git truth.
+  const { stats: workspaceDiffStats } =
+    useSingleWorkspaceDiffStats(workspaceId);
 
   const linkedWorkspace = useMemo(
     () =>
@@ -337,9 +343,9 @@ function WorkspaceSessionPanel({
                             mode: 'placeholder' as const,
                           })}
                   sessions={sessions}
-                  filesChanged={workspaceSummary?.filesChanged ?? 0}
-                  linesAdded={workspaceSummary?.linesAdded ?? 0}
-                  linesRemoved={workspaceSummary?.linesRemoved ?? 0}
+                  filesChanged={workspaceDiffStats?.filesChanged ?? 0}
+                  linesAdded={workspaceDiffStats?.linesAdded ?? 0}
+                  linesRemoved={workspaceDiffStats?.linesRemoved ?? 0}
                   disableViewCode
                   showOpenWorkspaceButton
                   onScrollToPreviousMessage={handleScrollToPreviousMessage}
