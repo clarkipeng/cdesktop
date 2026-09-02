@@ -725,6 +725,24 @@ provider_code?: string, retry_after_seconds?: bigint, resets_at?: string, bindin
  */
 safe_message: string, };
 
+export enum AdmissionResource { disk = "disk", processes = "processes" }
+
+export type AdmissionRefusal = { resource: AdmissionResource, 
+/**
+ * Observed availability: free bytes for `disk`, live processes for
+ * `processes`.
+ */
+available: bigint, 
+/**
+ * The bound that was violated: the free-byte reserve for `disk`, the
+ * projected process need for `processes`.
+ */
+reserve: bigint, retry_after_seconds: bigint, 
+/**
+ * Fixed, cdesktop-owned description. Never contains host paths.
+ */
+safe_message: string, };
+
 export type MeteredApprovalResponseRequest = { approved: boolean, reason?: string, };
 
 export type ExecutionRoutingSettings = { enabled: boolean, routes: Array<ExecutionRoutingRoute>, meteredFallback: string, sameRouteRetries: number, transientBackoffSeconds: Array<number>, approvalTimeoutMinutes: number, allRoutesExhausted: string, notifyOnSwap: boolean, exposeAccountAlias: boolean, fallbackOnFreeFailure: boolean, };
