@@ -1481,6 +1481,40 @@ impl ContainerService for LocalContainerService {
                         // Mark first: the stop below makes the exit monitor
                         // fire, and it must already see why.
                         container.log_limit_hits.write().await.insert(process.id);
+                        let outcome = NormalizedProcessOutcome::blocked_by_log_limit();
+                        let completed = ExecutionProcess::complete_running_attempt(
+                            &container.db().pool,
+                            process.id,
+                            ExecutionProcessStatus::Failed,
+                            None,
+                            outcome.normalized_outcome(),
+                        )
+                        .await;
+                        match completed {
+                            Ok(true) => {
+                                // The exit monitor lost the CAS by design, so
+                                // finish and dispatch the session chain here.
+                                // Otherwise a log-limited follow-up remains
+                                // queued forever.
+                                if let Err(error) = SessionCommand::finish_execution(
+                                    &container.db().pool,
+                                    process.id,
+                                    false,
+                                )
+                                .await
+                                {
+                                    tracing::error!(execution_process_id = %process.id, %error, "failed to finish log-limited execution");
+                                }
+                                if let Err(error) = container.dispatch_all_pending_commands().await
+                                {
+                                    tracing::error!(execution_process_id = %process.id, %error, "failed to dispatch follow-up after log limit");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::error!(execution_process_id = %process.id, %error, "failed to record log-limit completion")
+                            }
+                        }
                         if let Err(error) = container
                             .stop_execution(&process, ExecutionProcessStatus::Failed)
                             .await
@@ -1520,14 +1554,15 @@ impl ContainerService for LocalContainerService {
                 execution_process_id = %execution_process.id,
                 "stopping execution with no live child; terminalizing the orphan row"
             );
-            let requeue = status == ExecutionProcessStatus::Killed;
-            ExecutionProcess::update_completion(
-                &self.db().pool,
-                execution_process.id,
-                status,
-                None,
-            )
-            .await?;
+            let requeue = status == ExecutionProcessStatus::Killed
+                && ExecutionProcess::complete_running_attempt(
+                    &self.db().pool,
+                    execution_process.id,
+                    status,
+                    None,
+                    None,
+                )
+                .await?;
             if requeue {
                 SessionCommand::requeue_killed_execution(&self.db().pool, execution_process.id)
                     .await?;
@@ -1577,8 +1612,14 @@ impl ContainerService for LocalContainerService {
         // completed. Never publish it before cancellation/kill succeeds: a
         // keyed-stop replay must not mistake an interrupted intent for a
         // stopped process after restart.
-        ExecutionProcess::update_completion(&self.db.pool, execution_process.id, status, exit_code)
-            .await?;
+        ExecutionProcess::complete_running_attempt(
+            &self.db.pool,
+            execution_process.id,
+            status,
+            exit_code,
+            None,
+        )
+        .await?;
         self.remove_child_from_store(&execution_process.id).await;
 
         // Mark the process finished in the MsgStore and wait for DB persistence

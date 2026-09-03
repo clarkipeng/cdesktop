@@ -604,6 +604,19 @@ export function WorkspacesSidebarContainer({
     [paginatedArchivedWorkspaces, withDiffStats]
   );
 
+  useEffect(() => {
+    const currentIds = new Set(
+      [...paginatedActiveWorkspaces, ...paginatedArchivedWorkspaces].map(
+        (workspace) => workspace.id
+      )
+    );
+    visibilityHandlers.current.forEach((_, workspaceId) => {
+      if (!currentIds.has(workspaceId)) {
+        visibilityHandlers.current.delete(workspaceId);
+      }
+    });
+  }, [paginatedActiveWorkspaces, paginatedArchivedWorkspaces]);
+
   // Partition paginated active list into { pinned, byFolder }.
   const { pinnedWorkspaces, folderGroups } = useMemo(() => {
     const pinned: Workspace[] = [];

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useQueries, useQuery } from '@tanstack/react-query';
 import { workspacesApi } from '@/shared/lib/api';
 import { useHostId } from '@/shared/providers/HostIdProvider';
@@ -60,7 +60,7 @@ export function useWorkspaceDiffStats(): UseWorkspaceDiffStatsResult {
     []
   );
 
-  const results = useQueries({
+  const { stats, loadingIds } = useQueries({
     queries: visibleIds.map((workspaceId) => ({
       queryKey: workspaceDiffStatsKeys.byWorkspace(workspaceId, hostId),
       queryFn: () => workspacesApi.getDiffStats(workspaceId, hostId),
@@ -71,38 +71,33 @@ export function useWorkspaceDiffStats(): UseWorkspaceDiffStatsResult {
       // in a tight loop would spend subprocess permits on a known answer.
       retry: false,
     })),
+    combine: (results) => {
+      const stats = new Map<string, WorkspaceDiffStats | null>();
+      const loadingIds = new Set<string>();
+      visibleIds.forEach((workspaceId, index) => {
+        const result = results[index];
+        if (!result) return;
+        if (result.isPending) loadingIds.add(workspaceId);
+        else if (result.isError) stats.set(workspaceId, null);
+        else {
+          const data = result.data;
+          stats.set(
+            workspaceId,
+            data
+              ? {
+                  filesChanged: data.files_changed,
+                  linesAdded: data.lines_added,
+                  linesRemoved: data.lines_removed,
+                }
+              : null
+          );
+        }
+      });
+      return { stats, loadingIds };
+    },
   });
 
-  return useMemo(() => {
-    const stats = new Map<string, WorkspaceDiffStats | null>();
-    const loadingIds = new Set<string>();
-
-    visibleIds.forEach((workspaceId, index) => {
-      const result = results[index];
-      if (!result) return;
-      if (result.isPending) {
-        loadingIds.add(workspaceId);
-        return;
-      }
-      if (result.isError) {
-        stats.set(workspaceId, null);
-        return;
-      }
-      const data = result.data;
-      stats.set(
-        workspaceId,
-        data
-          ? {
-              filesChanged: data.files_changed,
-              linesAdded: data.lines_added,
-              linesRemoved: data.lines_removed,
-            }
-          : null
-      );
-    });
-
-    return { stats, loadingIds, setWorkspaceVisible };
-  }, [visibleIds, results, setWorkspaceVisible]);
+  return { stats, loadingIds, setWorkspaceVisible };
 }
 
 /**

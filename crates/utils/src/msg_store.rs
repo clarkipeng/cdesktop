@@ -9,13 +9,22 @@ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use crate::{log_msg::LogMsg, stream_lines::LinesStreamExt};
 
-/// One cap, shared with the durable jsonl writer
-/// (`execution_logs::max_execution_log_bytes`). These used to disagree by
-/// ~6x: the UI mirrored up to 100MB of history that the durable log had
-/// already stopped recording, so a restart silently lost everything past the
-/// file cap. Reading the same number means what the UI shows is what survives.
-static HISTORY_BYTES: std::sync::LazyLock<usize> =
-    std::sync::LazyLock::new(|| crate::execution_logs::max_execution_log_bytes() as usize);
+/// The event-stream journal is deliberately independent from the per-process
+/// durable log limit. Events contain database patches, not executor output;
+/// limiting them to 16MB made a configurable execution-log cap silently alter
+/// SSE replay. Keep a generous, bounded process-wide journal instead.
+pub const DEFAULT_EVENT_JOURNAL_BYTES: usize = 100 * 1024 * 1024;
+const EVENT_JOURNAL_BYTES_ENV: &str = "CDESKTOP_MAX_EVENT_JOURNAL_BYTES";
+const MAX_EVENT_JOURNAL_BYTES: usize = 1024 * 1024 * 1024;
+
+static HISTORY_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var(EVENT_JOURNAL_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value: &usize| *value > 0)
+        .map(|value| value.min(MAX_EVENT_JOURNAL_BYTES))
+        .unwrap_or(DEFAULT_EVENT_JOURNAL_BYTES)
+});
 
 #[derive(Clone)]
 struct StoredMsg {
@@ -183,11 +192,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn in_memory_history_cap_matches_the_durable_log_cap() {
-        // Regression guard for the split cap: the UI mirror used to hold 100MB
-        // while the durable file stopped at 16MB, so a restart silently lost
-        // ~84MB of history the user had been reading.
-        assert_eq!(
+    fn event_journal_has_its_own_bounded_default() {
+        assert_eq!(*HISTORY_BYTES, DEFAULT_EVENT_JOURNAL_BYTES);
+        assert_ne!(
             *HISTORY_BYTES,
             crate::execution_logs::DEFAULT_MAX_EXECUTION_LOG_BYTES as usize
         );

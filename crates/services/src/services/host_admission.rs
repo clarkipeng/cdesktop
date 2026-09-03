@@ -170,20 +170,14 @@ fn admit(
 
 /// Whether a spawn for this run reason is subject to host admission.
 ///
-/// Only new coding-agent subtrees are gated. Every other run reason is a
-/// lifecycle or recovery path, and gating those on the resource they free is
-/// a self-deadlock: cleanup and archive are exactly how a full disk gets
-/// emptied, so they must run *because* the host is exhausted, not in spite of
-/// it. Setup scripts and dev servers gate on the coding agent that follows
-/// them, so gating them twice only turns one refusal into two.
+/// Only cleanup and archive are exempt. They reclaim disk space, so gating
+/// them on the resource they free would self-deadlock recovery. All other
+/// launches consume host capacity and must be admitted.
 pub fn is_admission_gated(run_reason: &ExecutionProcessRunReason) -> bool {
-    match run_reason {
-        ExecutionProcessRunReason::CodingAgent => true,
-        ExecutionProcessRunReason::SetupScript
-        | ExecutionProcessRunReason::CleanupScript
-        | ExecutionProcessRunReason::ArchiveScript
-        | ExecutionProcessRunReason::DevServer => false,
-    }
+    !matches!(
+        run_reason,
+        ExecutionProcessRunReason::CleanupScript | ExecutionProcessRunReason::ArchiveScript
+    )
 }
 
 /// Refuse the spawn unless the host has both free-disk and process headroom.
@@ -361,20 +355,24 @@ mod tests {
     }
 
     #[test]
-    fn only_coding_agents_are_admission_gated() {
+    fn only_recovery_scripts_are_admission_exempt() {
         // Self-deadlock guard: the paths that FREE the resource must never be
         // gated on the resource.
-        assert!(is_admission_gated(&ExecutionProcessRunReason::CodingAgent));
-        for exempt in [
-            ExecutionProcessRunReason::CleanupScript,
-            ExecutionProcessRunReason::ArchiveScript,
+        for gated in [
+            ExecutionProcessRunReason::CodingAgent,
             ExecutionProcessRunReason::SetupScript,
             ExecutionProcessRunReason::DevServer,
         ] {
             assert!(
-                !is_admission_gated(&exempt),
-                "{exempt:?} must spawn on an exhausted host"
+                is_admission_gated(&gated),
+                "{gated:?} must be admitted before spawning"
             );
+        }
+        for exempt in [
+            ExecutionProcessRunReason::CleanupScript,
+            ExecutionProcessRunReason::ArchiveScript,
+        ] {
+            assert!(!is_admission_gated(&exempt));
         }
     }
 

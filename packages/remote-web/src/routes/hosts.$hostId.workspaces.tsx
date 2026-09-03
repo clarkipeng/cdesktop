@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   createFileRoute,
   useNavigate,
@@ -26,6 +26,7 @@ import {
   ArrowLeftIcon,
 } from "@phosphor-icons/react";
 import { RunningDots } from "@vibe/ui/components/RunningDots";
+import { useWorkspaceDiffStats } from "@/shared/hooks/useWorkspaceDiffStats";
 
 export const Route = createFileRoute("/hosts/$hostId/workspaces")({
   beforeLoad: async ({ location }) => {
@@ -50,6 +51,7 @@ function MobileWorkspacesList() {
     useWorkspaceContext();
   const [showArchive, setShowArchive] = useState(false);
   const workspaces = showArchive ? archivedWorkspaces : activeWorkspaces;
+  const { stats: diffStats, setWorkspaceVisible } = useWorkspaceDiffStats();
 
   const handleSelectWorkspace = (id: string) => {
     selectWorkspace(id);
@@ -102,12 +104,13 @@ function MobileWorkspacesList() {
         ) : (
           <div className="flex flex-col">
             {workspaces.map((workspace) => {
+              const diffStatsForWorkspace = diffStats.get(workspace.id);
               const isFailed =
                 workspace.latestProcessStatus === "failed" ||
                 workspace.latestProcessStatus === "killed";
               const hasChanges =
-                workspace.filesChanged !== undefined &&
-                workspace.filesChanged > 0;
+                (diffStatsForWorkspace?.filesChanged ?? workspace.filesChanged ??
+                  0) > 0;
 
               return (
                 <div
@@ -117,6 +120,10 @@ function MobileWorkspacesList() {
                     "border-b border-border",
                   )}
                 >
+                  <WorkspaceVisibilityReporter
+                    workspaceId={workspace.id}
+                    setWorkspaceVisible={setWorkspaceVisible}
+                  />
                   <button
                     onClick={() => handleSelectWorkspace(workspace.id)}
                     className={cn(
@@ -212,15 +219,22 @@ function MobileWorkspacesList() {
                       {hasChanges && (
                         <span className="shrink-0 flex items-center gap-half">
                           <FileIcon className="size-icon-xs" weight="fill" />
-                          <span>{workspace.filesChanged}</span>
-                          {workspace.linesAdded !== undefined && (
+                          <span>
+                            {diffStatsForWorkspace?.filesChanged ??
+                              workspace.filesChanged}
+                          </span>
+                          {(diffStatsForWorkspace?.linesAdded ??
+                            workspace.linesAdded) !== undefined && (
                             <span className="text-success">
-                              +{workspace.linesAdded}
+                              +{diffStatsForWorkspace?.linesAdded ??
+                                workspace.linesAdded}
                             </span>
                           )}
-                          {workspace.linesRemoved !== undefined && (
+                          {(diffStatsForWorkspace?.linesRemoved ??
+                            workspace.linesRemoved) !== undefined && (
                             <span className="text-error">
-                              -{workspace.linesRemoved}
+                              -{diffStatsForWorkspace?.linesRemoved ??
+                                workspace.linesRemoved}
                             </span>
                           )}
                         </span>
@@ -274,6 +288,31 @@ function MobileWorkspacesList() {
       </div>
     </div>
   );
+}
+
+function WorkspaceVisibilityReporter({
+  workspaceId,
+  setWorkspaceVisible,
+}: {
+  workspaceId: string;
+  setWorkspaceVisible: (workspaceId: string, visible: boolean) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      setWorkspaceVisible(workspaceId, entry.isIntersecting);
+    });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+      setWorkspaceVisible(workspaceId, false);
+    };
+  }, [workspaceId, setWorkspaceVisible]);
+
+  return <div ref={ref} className="absolute inset-0 pointer-events-none" />;
 }
 
 const formatRelativeElapsed = (dateString: string): string => {
