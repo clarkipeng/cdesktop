@@ -13,7 +13,6 @@ import {
   DirectoryEntry,
   ExecutionProcess,
   ExecutionProcessOutcome,
-  ExecutionRoutingSettings,
   ExecutionProcessRepoState,
   GitBranch,
   Repo,
@@ -111,16 +110,16 @@ import {
   UpdateRoutine,
   RunNowResponse,
 } from 'shared/types';
-import type {
-  MeteredApproval,
-  MeteredApprovalResponseRequest,
-} from './execution-routing/apiTypes';
 import type { Project as RemoteProject } from 'shared/remote-types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
 import { createWorkspaceWithSession } from '@/shared/types/attempt';
 import { resolveHostRequestScope } from '@/shared/lib/hostRequestScope';
 import { makeRequest as makeRemoteRequest } from '@/shared/lib/remoteApi';
 import { makeLocalApiRequest } from '@/shared/lib/localApiTransport';
+import type {
+  MeteredApproval,
+  MeteredApprovalResponseRequest,
+} from './execution-routing/apiTypes';
 
 export class ApiError<E = unknown> extends Error {
   public status?: number;
@@ -829,15 +828,6 @@ export const workspacesApi = {
 };
 
 // Execution Routing APIs
-export const executionRoutingApi = {
-  // `null` means sightmesh has not configured routing on this host; the
-  // dashboard falls back to fixtures only in that case.
-  getSettings: async (): Promise<ExecutionRoutingSettings | null> => {
-    const response = await makeRequest('/api/execution-routing/settings');
-    return handleApiResponse<ExecutionRoutingSettings | null>(response);
-  },
-};
-
 // Execution Process APIs
 export const executionProcessesApi = {
   listOutcomes: async (
