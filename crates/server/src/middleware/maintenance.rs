@@ -8,12 +8,21 @@ use axum::{
 
 use crate::routes::maintenance::drain_remaining_millis;
 
+fn starts_execution(path: &str) -> bool {
+    path == "/workspaces/start"
+        || path == "/workspaces/from-pr"
+        || path.ends_with("/follow-up")
+        || path.ends_with("/commands/dispatch")
+        || path.ends_with("/review")
+        || path.ends_with("/teammates")
+        || path.ends_with("/setup")
+        || path.contains("/execution/dev-server/start")
+        || path.contains("/execution/cleanup")
+        || path.contains("/execution/archive")
+}
+
 fn should_reject(method: &Method, path: &str, remaining: u64) -> bool {
-    let is_mutation = matches!(
-        *method,
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
-    is_mutation && !path.ends_with("/maintenance/drain") && remaining > 0
+    *method == Method::POST && starts_execution(path) && remaining > 0
 }
 
 pub async fn reject_mutations_while_draining(request: Request, next: Next) -> Response {
@@ -37,9 +46,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drain_rejects_mutations_but_allows_reads_and_its_control_route() {
+    fn drain_rejects_starts_but_allows_stops_and_other_mutations() {
         assert!(should_reject(&Method::POST, "/sessions/1/follow-up", 1000));
-        assert!(should_reject(&Method::DELETE, "/workspaces/1", 1000));
+        assert!(should_reject(&Method::POST, "/workspaces/start", 1000));
+        assert!(!should_reject(
+            &Method::POST,
+            "/execution-processes/1/stop",
+            1000
+        ));
+        assert!(!should_reject(
+            &Method::POST,
+            "/workspaces/1/execution/stop",
+            1000
+        ));
+        assert!(!should_reject(&Method::DELETE, "/workspaces/1", 1000));
         assert!(!should_reject(&Method::GET, "/workspaces", 1000));
         assert!(!should_reject(&Method::POST, "/maintenance/drain", 1000));
         assert!(!should_reject(&Method::POST, "/sessions/1/follow-up", 0));

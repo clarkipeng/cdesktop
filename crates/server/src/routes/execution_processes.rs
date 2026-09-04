@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use db::models::{
-    execution_process::{ExecutionProcess, ExecutionProcessStatus},
+    execution_process::{ExecutionProcess, ExecutionProcessStatus, RunningExecutionInfo},
     execution_process_repo_state::ExecutionProcessRepoState,
     execution_process_stop_operation::{
         StopExecutionOperation, StopExecutionOperationState, StopExecutionOutcome,
@@ -95,6 +95,13 @@ async fn list_execution_processes_by_session(
         query.show_soft_deleted.unwrap_or(false),
     )
     .await?;
+    Ok(ResponseJson(ApiResponse::success(processes)))
+}
+
+async fn list_running_execution_processes(
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<Vec<RunningExecutionInfo>>>, ApiError> {
+    let processes = ExecutionProcess::find_running_info(&deployment.db().pool).await?;
     Ok(ResponseJson(ApiResponse::success(processes)))
 }
 
@@ -500,6 +507,7 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 
     let workspaces_router = Router::new()
         .route("/", get(list_execution_processes_by_session))
+        .route("/running", get(list_running_execution_processes))
         .route(
             "/stream/session/ws",
             get(stream_execution_processes_by_session_ws),

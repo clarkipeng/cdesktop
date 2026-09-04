@@ -960,6 +960,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_release_preserves_authoritative_terminal_commands() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let (done, _) = SessionCommand::enqueue(&pool, command(session_id, "done", None))
+            .await
+            .unwrap();
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let done_execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, done_execution_id)
+            .await
+            .unwrap();
+        SessionCommand::finish_execution(&pool, done_execution_id, true)
+            .await
+            .unwrap();
+
+        let (cancelled, _) = SessionCommand::enqueue(&pool, command(session_id, "cancelled", None))
+            .await
+            .unwrap();
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let cancelled_execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, cancelled_execution_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE session_commands SET state = 'cancelled' WHERE id = ?")
+            .bind(cancelled.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        SessionCommand::release_execution(&pool, done_execution_id)
+            .await
+            .unwrap();
+        SessionCommand::release_execution(&pool, cancelled_execution_id)
+            .await
+            .unwrap();
+
+        let commands = SessionCommand::for_session(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(commands[0].id, done.id);
+        assert_eq!(commands[0].state, SessionCommandState::Done);
+        assert_eq!(commands[1].id, cancelled.id);
+        assert_eq!(commands[1].state, SessionCommandState::Cancelled);
+        assert!(
+            SessionCommand::pending(&pool, session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn continue_enqueue_leaves_pending_commands_alone() {
         let pool = pool().await;
         let session_id = Uuid::new_v4();
