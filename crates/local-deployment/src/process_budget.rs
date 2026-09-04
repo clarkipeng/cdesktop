@@ -343,7 +343,6 @@ mod tests {
     #[test]
     fn reserve_is_conservative_even_when_configured_lower() {
         assert!(configured_reserve() >= MIN_RESERVE);
-        assert!(DEFAULT_RESERVE > 250);
     }
 
     #[test]

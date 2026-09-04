@@ -930,10 +930,5 @@
     "sidebar": {
       "nav": "루틴"
     }
-  },
-  "agents": {
-    "sidebar": {
-      "nav": "Agents"
-    }
   }
 }

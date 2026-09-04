@@ -930,10 +930,5 @@
     "sidebar": {
       "nav": "Rutinas"
     }
-  },
-  "agents": {
-    "sidebar": {
-      "nav": "Agents"
-    }
   }
 }

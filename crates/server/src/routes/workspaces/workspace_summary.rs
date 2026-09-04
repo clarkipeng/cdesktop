@@ -77,11 +77,6 @@ impl Drop for RefreshClaim {
 #[derive(Debug, Deserialize, Serialize, TS)]
 pub struct WorkspaceSummaryRequest {
     pub archived: bool,
-    /// Git truth is opt-in and strictly task-local; fleet lists are metadata-only.
-    #[serde(default)]
-    pub include_git: bool,
-    #[serde(default)]
-    pub refresh_workspace_id: Option<Uuid>,
 }
 
 /// Summary info for a single workspace
@@ -250,14 +245,8 @@ mod tests {
 
     #[test]
     fn default_summary_is_metadata_only_even_for_a_large_live_fleet() {
-        let request = WorkspaceSummaryRequest {
-            archived: false,
-            include_git: false,
-            refresh_workspace_id: None,
-        };
-        assert!(!request.include_git);
-        // The selection predicate is false before a workspace refresh future can exist.
-        assert!(!(request.include_git && !request.archived));
+        let request = WorkspaceSummaryRequest { archived: false };
+        assert!(!request.archived);
     }
 
     #[tokio::test]

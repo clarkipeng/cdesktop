@@ -930,10 +930,5 @@
     "sidebar": {
       "nav": "ルーティン"
     }
-  },
-  "agents": {
-    "sidebar": {
-      "nav": "Agents"
-    }
   }
 }

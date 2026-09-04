@@ -31,6 +31,16 @@ pub struct NewManagedTaskEffect<'a> {
     pub lease_id: Uuid,
 }
 
+pub struct FinishManagedTaskEffect<'a> {
+    pub task_id: Uuid,
+    pub epoch: i64,
+    pub owner_instance_id: Uuid,
+    pub lease_id: Uuid,
+    pub state: &'a str,
+    pub effect_created: bool,
+    pub reason: Option<&'a str>,
+}
+
 #[derive(Debug, Error)]
 pub enum ManagedTaskEffectError {
     #[error(transparent)]
@@ -104,13 +114,7 @@ impl ManagedTaskEffect {
 
     pub async fn finish(
         pool: &SqlitePool,
-        task_id: Uuid,
-        epoch: i64,
-        owner_instance_id: Uuid,
-        lease_id: Uuid,
-        state: &str,
-        effect_created: bool,
-        reason: Option<&str>,
+        effect: FinishManagedTaskEffect<'_>,
     ) -> Result<Self, sqlx::Error> {
         sqlx::query(
             "UPDATE managed_task_effects
@@ -119,16 +123,16 @@ impl ManagedTaskEffect {
              WHERE task_id = ? AND epoch = ? AND state = 'pending'
                AND owner_instance_id = ? AND lease_id = ?",
         )
-        .bind(state)
-        .bind(effect_created)
-        .bind(reason)
-        .bind(task_id)
-        .bind(epoch)
-        .bind(owner_instance_id)
-        .bind(lease_id)
+        .bind(effect.state)
+        .bind(effect.effect_created)
+        .bind(effect.reason)
+        .bind(effect.task_id)
+        .bind(effect.epoch)
+        .bind(effect.owner_instance_id)
+        .bind(effect.lease_id)
         .execute(pool)
         .await?;
-        Self::find(pool, task_id, epoch)
+        Self::find(pool, effect.task_id, effect.epoch)
             .await?
             .ok_or(sqlx::Error::RowNotFound)
     }
@@ -236,13 +240,15 @@ mod tests {
 
         let foreign = ManagedTaskEffect::finish(
             &pool,
-            task_id,
-            1,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            "lost",
-            false,
-            Some("foreign"),
+            FinishManagedTaskEffect {
+                task_id,
+                epoch: 1,
+                owner_instance_id: Uuid::new_v4(),
+                lease_id: Uuid::new_v4(),
+                state: "lost",
+                effect_created: false,
+                reason: Some("foreign"),
+            },
         )
         .await
         .unwrap();
@@ -250,13 +256,15 @@ mod tests {
 
         let finished = ManagedTaskEffect::finish(
             &pool,
-            task_id,
-            1,
-            effect.owner_instance_id,
-            effect.lease_id,
-            "active",
-            true,
-            None,
+            FinishManagedTaskEffect {
+                task_id,
+                epoch: 1,
+                owner_instance_id: effect.owner_instance_id,
+                lease_id: effect.lease_id,
+                state: "active",
+                effect_created: true,
+                reason: None,
+            },
         )
         .await
         .unwrap();

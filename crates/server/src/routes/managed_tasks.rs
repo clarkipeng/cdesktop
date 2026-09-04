@@ -7,7 +7,9 @@ use axum::{
     routing::put,
 };
 use db::models::{
-    managed_task_effect::{ManagedTaskEffect, ManagedTaskEffectError, NewManagedTaskEffect},
+    managed_task_effect::{
+        FinishManagedTaskEffect, ManagedTaskEffect, ManagedTaskEffectError, NewManagedTaskEffect,
+    },
     requests::CreateAndStartWorkspaceRequest,
     session::{Session, SessionError},
     workspace::{Workspace, WorkspaceError},
@@ -201,13 +203,15 @@ async fn create_or_return(
         Ok(()) => {
             ManagedTaskEffect::finish(
                 &deployment.db().pool,
-                task_id,
-                epoch,
-                *INSTANCE_ID,
-                record.lease_id,
-                "active",
-                true,
-                None,
+                FinishManagedTaskEffect {
+                    task_id,
+                    epoch,
+                    owner_instance_id: *INSTANCE_ID,
+                    lease_id: record.lease_id,
+                    state: "active",
+                    effect_created: true,
+                    reason: None,
+                },
             )
             .await?
         }
@@ -219,13 +223,15 @@ async fn create_or_return(
             let effect_created = native_effect_exists(&deployment, &current).await?;
             ManagedTaskEffect::finish(
                 &deployment.db().pool,
-                task_id,
-                epoch,
-                *INSTANCE_ID,
-                record.lease_id,
-                if effect_created { "active" } else { "lost" },
-                effect_created,
-                (!effect_created).then_some("native_launch_failed"),
+                FinishManagedTaskEffect {
+                    task_id,
+                    epoch,
+                    owner_instance_id: *INSTANCE_ID,
+                    lease_id: record.lease_id,
+                    state: if effect_created { "active" } else { "lost" },
+                    effect_created,
+                    reason: (!effect_created).then_some("native_launch_failed"),
+                },
             )
             .await?
         }
@@ -379,13 +385,15 @@ mod tests {
         let first_session_id = first.record.session_id;
         ManagedTaskEffect::finish(
             &pool,
-            task_id,
-            1,
-            first.record.owner_instance_id,
-            first.record.lease_id,
-            "active",
-            true,
-            None,
+            FinishManagedTaskEffect {
+                task_id,
+                epoch: 1,
+                owner_instance_id: first.record.owner_instance_id,
+                lease_id: first.record.lease_id,
+                state: "active",
+                effect_created: true,
+                reason: None,
+            },
         )
         .await
         .unwrap();

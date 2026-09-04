@@ -70,8 +70,10 @@ struct ForkRateBreakerState {
 
 /// A pre-RPC budget slot. It returns capacity when dropped unless committed
 /// after the fork succeeds.
+#[derive(Debug)]
 pub(super) struct ForkReservation {
-    id: Option<u64>,
+    id: u64,
+    committed: bool,
 }
 
 impl ForkRateBreaker {
@@ -124,7 +126,10 @@ impl ForkRateBreaker {
 
     fn reserve(&self) -> Result<ForkReservation, ForkGuardError> {
         self.reserve_at(Instant::now())
-            .map(|id| ForkReservation { id })
+            .map(|id| ForkReservation {
+                id,
+                committed: false,
+            })
             .map_err(|remaining| {
                 // Round up: a sub-second remainder must still ask for >= 1s, or a
                 // caller that honours `retry_after` retries into the same refusal.
@@ -137,14 +142,14 @@ impl ForkRateBreaker {
 
 impl ForkReservation {
     pub(super) fn commit(mut self) {
-        self.id.take();
+        self.committed = true;
     }
 }
 
 impl Drop for ForkReservation {
     fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            GLOBAL_FORK_BREAKER.release(id);
+        if !self.committed {
+            GLOBAL_FORK_BREAKER.release(self.id);
         }
     }
 }
