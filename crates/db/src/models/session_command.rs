@@ -75,6 +75,51 @@ impl SessionCommand {
             .await
     }
 
+    /// Cancel a command unless its execution is currently running.
+    ///
+    /// The transition and running-process predicate are one statement, so a
+    /// cancelled command cannot be claimed, dispatched, or revived by crash
+    /// recovery. Already terminal commands are returned unchanged.
+    pub async fn cancel(
+        pool: &SqlitePool,
+        session_id: Uuid,
+        id: Uuid,
+    ) -> Result<CancelSessionCommand, sqlx::Error> {
+        if let Some(command) = sqlx::query_as::<_, Self>(
+            "UPDATE session_commands SET state = 'cancelled', finished_at = datetime('now', 'subsec') \
+             WHERE id = ? AND session_id = ? AND state IN ('pending', 'claimed') \
+             AND NOT EXISTS (SELECT 1 FROM execution_processes \
+                             WHERE id = session_commands.execution_process_id AND status = 'running') \
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?
+        {
+            return Ok(CancelSessionCommand::Cancelled(command));
+        }
+
+        let Some(command) = Self::find_by_id(pool, id).await? else {
+            return Ok(CancelSessionCommand::NotFound);
+        };
+        if command.session_id != session_id {
+            return Ok(CancelSessionCommand::NotFound);
+        }
+        if let Some(execution_process_id) = command.execution_process_id {
+            let running: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM execution_processes WHERE id = ? AND status = 'running')",
+            )
+            .bind(execution_process_id)
+            .fetch_one(pool)
+            .await?;
+            if running != 0 {
+                return Ok(CancelSessionCommand::Running(command));
+            }
+        }
+        Ok(CancelSessionCommand::Cancelled(command))
+    }
+
     /// Durably queue one command.
     ///
     /// A `Replace` enqueue supersedes the session's other pending commands in
@@ -390,6 +435,12 @@ impl SessionCommand {
         .await?;
         Ok(())
     }
+}
+
+pub enum CancelSessionCommand {
+    Cancelled(SessionCommand),
+    NotFound,
+    Running(SessionCommand),
 }
 
 #[cfg(test)]
@@ -1013,6 +1064,82 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_is_idempotent_and_never_dispatches_or_recovers() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let (command, _) = SessionCommand::enqueue(&pool, command(session_id, "cancel", None))
+            .await
+            .unwrap();
+
+        let CancelSessionCommand::Cancelled(cancelled) =
+            SessionCommand::cancel(&pool, session_id, command.id)
+                .await
+                .unwrap()
+        else {
+            panic!("pending command should cancel");
+        };
+        assert_eq!(cancelled.state, SessionCommandState::Cancelled);
+
+        let CancelSessionCommand::Cancelled(repeated) =
+            SessionCommand::cancel(&pool, session_id, command.id)
+                .await
+                .unwrap()
+        else {
+            panic!("cancel should be idempotent");
+        };
+        assert_eq!(repeated.id, command.id);
+        assert!(
+            SessionCommand::claim_pending(&pool, session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            SessionCommand::pending_session_ids(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            SessionCommand::release_unbound(&pool, session_id)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_a_command_with_a_running_execution() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let (command, _) = SessionCommand::enqueue(&pool, command(session_id, "running", None))
+            .await
+            .unwrap();
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let execution_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_processes (id, status) VALUES (?, 'running')")
+            .bind(execution_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        SessionCommand::bind_execution(&pool, session_id, execution_id)
+            .await
+            .unwrap();
+
+        let CancelSessionCommand::Running(running) =
+            SessionCommand::cancel(&pool, session_id, command.id)
+                .await
+                .unwrap()
+        else {
+            panic!("running execution should refuse cancellation");
+        };
+        assert_eq!(running.id, command.id);
+        assert_eq!(running.state, SessionCommandState::Claimed);
     }
 
     #[tokio::test]

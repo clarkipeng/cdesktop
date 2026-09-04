@@ -6,11 +6,19 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
 const MAX_DRAIN_SECONDS: u64 = 30;
 static DRAIN_UNTIL_MILLIS: AtomicU64 = AtomicU64::new(0);
 static EXECUTION_ADMISSION: LazyLock<Arc<RwLock<()>>> = LazyLock::new(|| Arc::new(RwLock::new(())));
+// Drain state is process-global. Tests in dependent crates share that process,
+// so they must hold this guard for their full mutation/assertion sequence.
+static TEST_DRAIN_OWNER: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
+
+#[doc(hidden)]
+pub async fn test_drain_owner() -> OwnedMutexGuard<()> {
+    TEST_DRAIN_OWNER.clone().lock_owned().await
+}
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -74,6 +82,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_and_internal_starts_are_refused_while_stops_remain_ungated() {
+        let _owner = test_drain_owner().await;
         set_drain(300).await;
         // HTTP workspace/session starts, managed-task launches, manual routine
         // runs, and scheduler routine runs all converge on this boundary.

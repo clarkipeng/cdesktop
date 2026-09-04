@@ -111,6 +111,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_is_bounded_and_can_be_released() {
+        let _owner = services::services::maintenance::test_drain_owner().await;
         let _ = set_drain(Json(DrainRequest { seconds: 300 })).await;
         assert!(drain_remaining_millis() <= 30 * 1000);
         assert!(drain_remaining_millis() > 0);

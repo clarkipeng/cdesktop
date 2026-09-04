@@ -27,6 +27,7 @@ mod tests {
 
     #[tokio::test]
     async fn externally_reachable_start_gets_retryable_service_unavailable() {
+        let _owner = services::services::maintenance::test_drain_owner().await;
         set_drain(30).await;
         let error = admit_execution_start().await.unwrap_err();
         let response = drain_refusal_response(&error);

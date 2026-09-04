@@ -3,7 +3,7 @@ pub mod review;
 
 use axum::{
     Extension, Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     middleware::from_fn_with_state,
     response::Json as ResponseJson,
@@ -19,7 +19,8 @@ use db::models::{
     scratch::{Scratch, ScratchType},
     session::{CreateSession, Session, SessionError},
     session_command::{
-        NewSessionCommand, SessionCommand, SessionCommandConfig, SessionCommandIntent,
+        CancelSessionCommand, NewSessionCommand, SessionCommand, SessionCommandConfig,
+        SessionCommandIntent,
     },
     workspace::{Workspace, WorkspaceError},
     workspace_repo::WorkspaceRepo,
@@ -437,6 +438,22 @@ async fn list_commands(
     )))
 }
 
+/// Cancel one durable command before it has a running execution. The model
+/// performs the state transition and running-process check atomically.
+async fn cancel_command(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+    Path(command_id): Path<Uuid>,
+) -> Result<ResponseJson<ApiResponse<SessionCommand>>, ApiError> {
+    match SessionCommand::cancel(&deployment.db().pool, session.id, command_id).await? {
+        CancelSessionCommand::Cancelled(command) => Ok(ResponseJson(ApiResponse::success(command))),
+        CancelSessionCommand::NotFound => Err(ApiError::Session(SessionError::NotFound)),
+        CancelSessionCommand::Running(_) => Err(ApiError::Conflict(
+            "Cannot cancel a command with a running execution; stop the execution instead.".into(),
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RequeueCommandsRequest {
     execution_process_id: Uuid,
@@ -601,6 +618,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .route("/follow-up", post(follow_up))
         .route("/outcomes", get(list_outcomes))
         .route("/commands", get(list_commands))
+        .route("/commands/{command_id}/cancel", post(cancel_command))
         .route("/commands/requeue", post(requeue_commands))
         .route("/commands/dispatch", post(dispatch_commands))
         .route("/turn-selections", get(get_turn_selections))
