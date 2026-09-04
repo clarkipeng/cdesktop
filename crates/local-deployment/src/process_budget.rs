@@ -1,9 +1,12 @@
 //! A cached, native host-process admission signal. Sampling never forks, and
 //! admission only reads the last service-owned sample.
 
+#[cfg(target_os = "macos")]
 use std::{
     ffi::CString,
     os::raw::{c_char, c_int, c_uint, c_void},
+};
+use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
