@@ -338,7 +338,13 @@ pub(crate) async fn spawn_teammate_with_id(
             &ExecutionProcessRunReason::CodingAgent,
         )
         .await
-        .map_err(|e| ApiError::from(TeammateError::SpawnFailed(e.to_string())))?;
+        .map_err(|error| match error {
+            services::services::container::ContainerError::HostAdmission(_)
+            | services::services::container::ContainerError::MaintenanceDrain(_) => {
+                ApiError::from(error)
+            }
+            _ => ApiError::from(TeammateError::SpawnFailed(error.to_string())),
+        })?;
 
     let model_id = executor_config.model_id.clone().unwrap_or_default();
     deployment
