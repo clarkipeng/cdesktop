@@ -325,6 +325,7 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             session_id,
             owner_instance_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
         }
     }
 
@@ -376,9 +377,18 @@ mod tests {
         .unwrap();
         assert!(first.inserted);
         let first_session_id = first.record.session_id;
-        ManagedTaskEffect::finish(&pool, task_id, 1, "active", true, None)
-            .await
-            .unwrap();
+        ManagedTaskEffect::finish(
+            &pool,
+            task_id,
+            1,
+            first.record.owner_instance_id,
+            first.record.lease_id,
+            "active",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
 
         let retry = reserve_and_launch(&pool, effect(task_id, Uuid::new_v4()), {
             let launches = launches.clone();

@@ -162,21 +162,17 @@ impl AppServerClient {
         &self,
         params: ThreadForkParams,
     ) -> Result<ThreadForkResponse, ExecutorError> {
-        if let Err(error) = self
+        let reservation = self
             .storage_limits
-            .ensure_fork_allowed(&params.thread_id)
+            .reserve_fork(&params.thread_id)
             .await
-        {
-            return Err(self.refuse_fork(error));
-        }
+            .map_err(|error| self.refuse_fork(error))?;
         let request = ClientRequest::ThreadFork {
             request_id: self.next_request_id(),
             params,
         };
         let response: ThreadForkResponse = self.send_request(request, "thread/fork").await?;
-        // Charge the rate budget only now that a rollout copy really exists.
-        // Refused forks materialize nothing, so they must cost nothing.
-        self.storage_limits.record_fork();
+        reservation.commit();
         Ok(response)
     }
 

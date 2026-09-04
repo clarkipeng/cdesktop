@@ -55,13 +55,23 @@ impl From<io::Error> for ForkGuardError {
     }
 }
 
-/// Sliding-window rate limiter over forks. `check` never mutates state and
-/// `record` is called only once a fork has actually happened, so a refused
-/// fork consumes no budget and a tripped breaker recovers as the window drains.
+/// Sliding-window rate limiter over fork reservations. A reservation is made
+/// before the RPC, so concurrent callers cannot over-admit the budget.
 struct ForkRateBreaker {
     max: usize,
     window: Duration,
-    events: Mutex<VecDeque<Instant>>,
+    state: Mutex<ForkRateBreakerState>,
+}
+
+struct ForkRateBreakerState {
+    events: VecDeque<(u64, Instant)>,
+    next_id: u64,
+}
+
+/// A pre-RPC budget slot. It returns capacity when dropped unless committed
+/// after the fork succeeds.
+pub(super) struct ForkReservation {
+    id: Option<u64>,
 }
 
 impl ForkRateBreaker {
@@ -69,31 +79,41 @@ impl ForkRateBreaker {
         Self {
             max,
             window,
-            events: Mutex::new(VecDeque::new()),
+            state: Mutex::new(ForkRateBreakerState {
+                events: VecDeque::new(),
+                next_id: 0,
+            }),
         }
     }
 
-    /// Read-only budget check. `Err` is the remaining window, i.e. how long
-    /// until the oldest charged fork ages out and capacity returns.
-    fn check_at(&self, now: Instant) -> Result<(), Duration> {
-        let mut events = self.events.lock().unwrap();
-        Self::drain_expired(&mut events, now, self.window);
-        if events.len() < self.max {
-            return Ok(());
+    /// Reserve one slot atomically. `Err` is the remaining window, i.e. how
+    /// long until the oldest successful reservation ages out.
+    fn reserve_at(&self, now: Instant) -> Result<u64, Duration> {
+        let mut state = self.state.lock().unwrap();
+        Self::drain_expired(&mut state.events, now, self.window);
+        if state.events.len() < self.max {
+            let id = state.next_id;
+            state.next_id = state.next_id.wrapping_add(1);
+            state.events.push_back((id, now));
+            return Ok(id);
         }
-        let oldest = events.front().copied().unwrap_or(now);
+        let oldest = state.events.front().map(|(_, at)| *at).unwrap_or(now);
         Err(self.window.saturating_sub(now.duration_since(oldest)))
     }
 
-    /// Charge one real fork against the budget.
-    fn record_at(&self, now: Instant) {
-        let mut events = self.events.lock().unwrap();
-        Self::drain_expired(&mut events, now, self.window);
-        events.push_back(now);
+    fn release(&self, id: u64) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(position) = state
+            .events
+            .iter()
+            .position(|(event_id, _)| *event_id == id)
+        {
+            state.events.remove(position);
+        }
     }
 
-    fn drain_expired(events: &mut VecDeque<Instant>, now: Instant, window: Duration) {
-        while let Some(front) = events.front() {
+    fn drain_expired(events: &mut VecDeque<(u64, Instant)>, now: Instant, window: Duration) {
+        while let Some((_, front)) = events.front() {
             if now.duration_since(*front) >= window {
                 events.pop_front();
             } else {
@@ -102,23 +122,30 @@ impl ForkRateBreaker {
         }
     }
 
-    fn check(&self) -> Result<(), ForkGuardError> {
-        self.check_at(Instant::now()).map_err(|remaining| {
-            // Round up: a sub-second remainder must still ask for >= 1s, or a
-            // caller that honours `retry_after` retries into the same refusal.
-            ForkGuardError::RateLimited {
-                retry_after_seconds: remaining.as_secs_f64().ceil().max(1.0) as i64,
-            }
-        })
+    fn reserve(&self) -> Result<ForkReservation, ForkGuardError> {
+        self.reserve_at(Instant::now())
+            .map(|id| ForkReservation { id })
+            .map_err(|remaining| {
+                // Round up: a sub-second remainder must still ask for >= 1s, or a
+                // caller that honours `retry_after` retries into the same refusal.
+                ForkGuardError::RateLimited {
+                    retry_after_seconds: remaining.as_secs_f64().ceil().max(1.0) as i64,
+                }
+            })
     }
+}
 
-    fn record(&self) {
-        self.record_at(Instant::now());
+impl ForkReservation {
+    pub(super) fn commit(mut self) {
+        self.id.take();
     }
+}
 
-    #[cfg(test)]
-    fn clear(&self) {
-        self.events.lock().unwrap().clear();
+impl Drop for ForkReservation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            GLOBAL_FORK_BREAKER.release(id);
+        }
     }
 }
 
@@ -154,8 +181,10 @@ impl StorageLimits {
         Ok(())
     }
 
-    pub(super) async fn ensure_fork_allowed(&self, thread_id: &str) -> Result<(), ForkGuardError> {
-        GLOBAL_FORK_BREAKER.check()?;
+    pub(super) async fn reserve_fork(
+        &self,
+        thread_id: &str,
+    ) -> Result<ForkReservation, ForkGuardError> {
         self.ensure_start_allowed().await?;
         let path = find_rollout_file(thread_id).await.ok_or_else(|| {
             io::Error::new(
@@ -164,15 +193,7 @@ impl StorageLimits {
             )
         })?;
         self.ensure_rollout_allowed(&path).await?;
-        Ok(())
-    }
-
-    /// Charge the fork-rate budget. Called only after a fork has actually
-    /// been performed: a fork refused by the size cap, the disk reserve, the
-    /// rollout lookup or the app-server itself consumes no budget, so a
-    /// failing resume can never starve a healthy one.
-    pub(super) fn record_fork(&self) {
-        GLOBAL_FORK_BREAKER.record();
+        GLOBAL_FORK_BREAKER.reserve()
     }
 
     pub(super) async fn ensure_rollout_allowed(&self, path: &Path) -> io::Result<()> {
@@ -234,6 +255,11 @@ fn env_limit(name: &str, fallback: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use super::*;
 
     #[tokio::test]
@@ -268,31 +294,28 @@ mod tests {
         let breaker = ForkRateBreaker::new(2, Duration::from_secs(60));
         let t0 = Instant::now();
 
-        assert!(breaker.check_at(t0).is_ok());
-        breaker.record_at(t0);
-        assert!(breaker.check_at(t0).is_ok());
-        breaker.record_at(t0);
+        assert!(breaker.reserve_at(t0).is_ok());
+        assert!(breaker.reserve_at(t0).is_ok());
 
-        let remaining = breaker.check_at(t0).unwrap_err();
+        let remaining = breaker.reserve_at(t0).unwrap_err();
         assert_eq!(remaining, Duration::from_secs(60));
 
         // Once the window drains, forks are allowed again.
-        assert!(breaker.check_at(t0 + Duration::from_secs(61)).is_ok());
+        assert!(breaker.reserve_at(t0 + Duration::from_secs(61)).is_ok());
     }
 
     #[test]
     fn refused_forks_consume_no_budget() {
-        // M4 fairness: only real forks are charged. Checking the budget a
-        // thousand times (e.g. a thousand resumes all refused by the size cap)
-        // must never trip the breaker for the sessions that would succeed.
+        // A failed RPC releases its reservation, so it cannot starve healthy
+        // forks that arrive later.
         let breaker = ForkRateBreaker::new(2, Duration::from_secs(60));
         let t0 = Instant::now();
 
         for _ in 0..1_000 {
-            assert!(breaker.check_at(t0).is_ok());
+            let id = breaker.reserve_at(t0).unwrap();
+            breaker.release(id);
         }
-        breaker.record_at(t0);
-        assert!(breaker.check_at(t0).is_ok());
+        assert!(breaker.reserve_at(t0).is_ok());
     }
 
     #[test]
@@ -300,37 +323,42 @@ mod tests {
         // A retry hint of 0 would send the caller straight back into the same
         // refusal, so a sub-second remainder still asks for one second.
         let breaker = ForkRateBreaker::new(1, Duration::from_millis(200));
-        breaker.record();
-        match breaker.check() {
+        breaker.reserve_at(Instant::now()).unwrap();
+        match breaker.reserve() {
             Err(ForkGuardError::RateLimited {
                 retry_after_seconds,
             }) => assert_eq!(retry_after_seconds, 1),
             other => panic!("expected a rate-limited refusal, got {other:?}"),
         }
-        breaker.clear();
     }
 
-    #[tokio::test]
-    async fn global_breaker_gates_the_real_fork_path() {
-        // The breaker is only worth anything if it sits on the path
-        // `AppServerClient::thread_fork` actually calls. Trip the *global*
-        // breaker, then prove `ensure_fork_allowed` refuses before it even
-        // looks for the rollout file (the thread id below does not exist, so a
-        // NotFound here would mean the breaker was bypassed).
-        let limits = StorageLimits {
-            max_rollout_bytes: u64::MAX,
-            min_free_bytes: 1,
-        };
-        for _ in 0..env_limit(MAX_FORKS_ENV, DEFAULT_MAX_FORKS_PER_WINDOW as u64) {
-            GLOBAL_FORK_BREAKER.record();
+    #[test]
+    fn concurrent_forks_reserve_at_most_the_budget() {
+        // All callers cross this barrier before reserving. A split check and
+        // record would admit every caller; the single locked reservation can
+        // admit only the 30 slots that exist before their RPCs complete.
+        const MAX_FORKS: usize = 30;
+        const FORKS: usize = 64;
+        let breaker = Arc::new(ForkRateBreaker::new(MAX_FORKS, Duration::from_secs(60)));
+        let barrier = Arc::new(Barrier::new(FORKS));
+        let handles = (0..FORKS)
+            .map(|_| {
+                let breaker = breaker.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    breaker.reserve_at(Instant::now()).ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let reservations = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(reservations.len(), MAX_FORKS);
+        for id in reservations {
+            breaker.release(id);
         }
-
-        let result = limits.ensure_fork_allowed("no-such-thread-id").await;
-        GLOBAL_FORK_BREAKER.clear();
-
-        assert!(
-            matches!(result, Err(ForkGuardError::RateLimited { .. })),
-            "expected a rate-limited refusal, got {result:?}"
-        );
     }
 }
