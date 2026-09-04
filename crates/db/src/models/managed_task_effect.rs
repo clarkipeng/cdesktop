@@ -13,6 +13,7 @@ pub struct ManagedTaskEffect {
     pub workspace_id: Uuid,
     pub session_id: Uuid,
     pub owner_instance_id: Uuid,
+    pub lease_id: Uuid,
     pub effect_created: bool,
     pub reason: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -27,6 +28,7 @@ pub struct NewManagedTaskEffect<'a> {
     pub workspace_id: Uuid,
     pub session_id: Uuid,
     pub owner_instance_id: Uuid,
+    pub lease_id: Uuid,
 }
 
 #[derive(Debug, Error)]
@@ -46,8 +48,8 @@ impl ManagedTaskEffect {
     ) -> Result<(Self, bool), ManagedTaskEffectError> {
         let inserted = sqlx::query(
             "INSERT INTO managed_task_effects
-             (task_id, epoch, request_hash, kind, workspace_id, session_id, owner_instance_id)
-             SELECT ?, ?, ?, ?, ?, ?, ?
+             (task_id, epoch, request_hash, kind, workspace_id, session_id, owner_instance_id, lease_id)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?
              WHERE NOT EXISTS (
                  SELECT 1 FROM managed_task_effects WHERE task_id = ? AND epoch > ?
              )
@@ -60,6 +62,7 @@ impl ManagedTaskEffect {
         .bind(effect.workspace_id)
         .bind(effect.session_id)
         .bind(effect.owner_instance_id)
+        .bind(effect.lease_id)
         .bind(effect.task_id)
         .bind(effect.epoch)
         .execute(pool)
@@ -103,6 +106,8 @@ impl ManagedTaskEffect {
         pool: &SqlitePool,
         task_id: Uuid,
         epoch: i64,
+        owner_instance_id: Uuid,
+        lease_id: Uuid,
         state: &str,
         effect_created: bool,
         reason: Option<&str>,
@@ -111,13 +116,16 @@ impl ManagedTaskEffect {
             "UPDATE managed_task_effects
              SET state = ?, effect_created = ?, reason = ?,
                  updated_at = datetime('now', 'subsec')
-             WHERE task_id = ? AND epoch = ? AND state = 'pending'",
+             WHERE task_id = ? AND epoch = ? AND state = 'pending'
+               AND owner_instance_id = ? AND lease_id = ?",
         )
         .bind(state)
         .bind(effect_created)
         .bind(reason)
         .bind(task_id)
         .bind(epoch)
+        .bind(owner_instance_id)
+        .bind(lease_id)
         .execute(pool)
         .await?;
         Self::find(pool, task_id, epoch)
@@ -152,6 +160,7 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             owner_instance_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
         }
     }
 
@@ -214,5 +223,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ManagedTaskEffectError::StaleEpoch));
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_lease_can_finalize_a_pending_effect() {
+        let pool = pool().await;
+        let task_id = Uuid::new_v4();
+        let (effect, inserted) = ManagedTaskEffect::begin(&pool, effect(task_id, 1, "same"))
+            .await
+            .unwrap();
+        assert!(inserted);
+
+        let foreign = ManagedTaskEffect::finish(
+            &pool,
+            task_id,
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "lost",
+            false,
+            Some("foreign"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(foreign.state, "pending");
+
+        let finished = ManagedTaskEffect::finish(
+            &pool,
+            task_id,
+            1,
+            effect.owner_instance_id,
+            effect.lease_id,
+            "active",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(finished.state, "active");
     }
 }

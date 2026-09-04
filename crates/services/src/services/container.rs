@@ -52,7 +52,7 @@ use executors::{
 use futures::{StreamExt, future, stream::BoxStream};
 use git::{GitService, GitServiceError};
 use json_patch::Patch;
-use sqlx::Error as SqlxError;
+use sqlx::{Error as SqlxError, SqlitePool};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, RwLock},
@@ -99,6 +99,8 @@ pub enum ContainerError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     HostAdmission(#[from] crate::services::host_admission::AdmissionError),
+    #[error("The host already has the maximum number of running coding agents")]
+    CodingAgentCapacity,
     #[error("Failed to kill process: {0}")]
     KillFailed(std::io::Error),
     #[error(transparent)]
@@ -116,6 +118,11 @@ pub fn start_error_outcome(error: &ContainerError) -> NormalizedExecutionOutcome
             NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
                 .with_provider_code("local_host_admission")
                 .with_retry_after_seconds(admission.retry_after_seconds())
+        }
+        ContainerError::CodingAgentCapacity => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
+                .with_provider_code("coding_agent_capacity")
+                .with_retry_after_seconds(1)
         }
         _ => NormalizedExecutionOutcome::new(ExecutionOutcomeClass::TaskFailed)
             .with_provider_code("local_start_failed"),
@@ -422,11 +429,6 @@ pub trait ContainerService {
         if ExecutionProcess::has_running_coding_agent_for_session(pool, session_id).await? {
             return Ok(None);
         }
-        let max_running = max_running_agents();
-        if ExecutionProcess::count_running_coding_agents(pool).await? >= max_running {
-            return Ok(None);
-        }
-
         // Metered approval gate (plan §12): consult the durable policy for
         // the head of the queue before claiming. `ask` creates/awaits its
         // durable approval, `never` blocks with a routes_exhausted record —
@@ -562,6 +564,7 @@ pub trait ContainerService {
                 selected_provider_id.map(|id| id.to_string()),
                 executor_config.model_id.clone(),
             );
+            self.admit_coding_agent(pool).await?;
             self.start_execution_with_id(
                 &workspace,
                 &session,
@@ -574,6 +577,10 @@ pub trait ContainerService {
         }
         .await;
 
+        if matches!(result, Err(ContainerError::CodingAgentCapacity)) {
+            SessionCommand::release_unbound(pool, session_id).await?;
+            return Ok(None);
+        }
         if result.is_err() {
             SessionCommand::finish_execution(pool, execution_id, false).await?;
         }
@@ -1513,6 +1520,23 @@ pub trait ContainerService {
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
     ) -> Result<ExecutionProcess, ContainerError> {
+        // Coding-agent admission is centralized here for every direct launch.
+        // Queue dispatch already holds this lock and calls the same primitive
+        // immediately before creating its execution row.
+        if *run_reason == ExecutionProcessRunReason::CodingAgent {
+            let _scheduler = self.scheduler_lock().lock().await;
+            self.admit_coding_agent(&self.db().pool).await?;
+            return self
+                .start_execution_with_id(
+                    workspace,
+                    session,
+                    executor_action,
+                    run_reason,
+                    Uuid::new_v4(),
+                    false,
+                )
+                .await;
+        }
         self.start_execution_with_id(
             workspace,
             session,
@@ -1522,6 +1546,16 @@ pub trait ContainerService {
             false,
         )
         .await
+    }
+
+    /// Must be called while `scheduler_lock` is held. The execution row is
+    /// created before releasing that lock, so a running row is the durable
+    /// reservation for one fleet-wide coding-agent slot.
+    async fn admit_coding_agent(&self, pool: &SqlitePool) -> Result<(), ContainerError> {
+        if ExecutionProcess::count_running_coding_agents(pool).await? >= max_running_agents() {
+            return Err(ContainerError::CodingAgentCapacity);
+        }
+        Ok(())
     }
 
     async fn start_execution_with_id(

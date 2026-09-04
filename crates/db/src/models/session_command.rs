@@ -119,7 +119,7 @@ impl SessionCommand {
                 sqlx::query(
                     "UPDATE session_commands \
                      SET state = 'cancelled', finished_at = datetime('now', 'subsec') \
-                     WHERE session_id = ? AND id != ? AND state = 'pending'",
+                     WHERE session_id = ? AND id != ? AND state IN ('pending', 'claimed')",
                 )
                 .bind(session_id)
                 .bind(inserted.id)
@@ -306,38 +306,34 @@ impl SessionCommand {
         Ok(result.rows_affected())
     }
 
-    /// Return commands from an interrupted terminal execution to the native
-    /// queue without changing their durable identity or dedupe key.
+    /// Return only interruptible commands from a terminal execution to the
+    /// native queue. The terminal-process predicate shares this statement
+    /// with the transition, so a concurrent restart cannot revive work from a
+    /// live process. `done` and `cancelled` are authoritative terminals.
     pub async fn requeue_execution(
         pool: &SqlitePool,
         execution_process_id: Uuid,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE session_commands SET state = 'pending', execution_process_id = NULL, \
-             finished_at = NULL WHERE execution_process_id = ? AND state IN ('claimed', 'failed')",
+             finished_at = NULL WHERE execution_process_id = ? AND state IN ('claimed', 'failed') \
+             AND EXISTS (SELECT 1 FROM execution_processes \
+                         WHERE id = ? AND status != 'running')",
         )
+        .bind(execution_process_id)
         .bind(execution_process_id)
         .execute(pool)
         .await?;
         Ok(result.rows_affected())
     }
 
-    /// A keyed stop can race the exit monitor, which records its claimed rows
-    /// as done. Only the cdesktop route that has verified a killed process may
-    /// use this wider transition.
+    /// Compatibility spelling for callers that have observed a killed process.
+    /// Completion remains terminal and is never requeued.
     pub async fn requeue_killed_execution(
         pool: &SqlitePool,
         execution_process_id: Uuid,
     ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE session_commands SET state = 'pending', execution_process_id = NULL, \
-             finished_at = NULL WHERE execution_process_id = ? \
-             AND state IN ('claimed', 'failed', 'done')",
-        )
-        .bind(execution_process_id)
-        .execute(pool)
-        .await?;
-        Ok(result.rows_affected())
+        Self::requeue_execution(pool, execution_process_id).await
     }
 
     pub async fn ensure_claimed(
@@ -415,10 +411,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE execution_processes (id BLOB PRIMARY KEY NOT NULL)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE execution_processes (id BLOB PRIMARY KEY NOT NULL, status TEXT NOT NULL DEFAULT 'failed')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             r#"CREATE TABLE session_commands (
                 id BLOB PRIMARY KEY NOT NULL,
@@ -917,6 +915,47 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_cancels_claimed_work_and_recovery_cannot_revive_it() {
+        let pool = pool().await;
+        let session_id = Uuid::new_v4();
+        let (claimed, _) = SessionCommand::enqueue(&pool, command(session_id, "stale", None))
+            .await
+            .unwrap();
+        SessionCommand::claim_pending(&pool, session_id)
+            .await
+            .unwrap();
+        let execution_id = execution_row(&pool).await;
+        SessionCommand::bind_execution(&pool, session_id, execution_id)
+            .await
+            .unwrap();
+
+        let mut replacement = command(session_id, "live", Some("replace"));
+        replacement.intent = SessionCommandIntent::Replace;
+        let (replacement, _) = SessionCommand::enqueue(&pool, replacement).await.unwrap();
+
+        // An exit monitor racing the stop can only transition claimed rows;
+        // it cannot turn this cancelled command into `done` or pending again.
+        SessionCommand::finish_execution(&pool, execution_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            SessionCommand::requeue_killed_execution(&pool, execution_id)
+                .await
+                .unwrap(),
+            0
+        );
+        let commands = SessionCommand::for_session(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(commands[0].id, claimed.id);
+        assert_eq!(commands[0].state, SessionCommandState::Cancelled);
+        assert_eq!(
+            SessionCommand::pending(&pool, session_id).await.unwrap()[0].id,
+            replacement.id
         );
     }
 

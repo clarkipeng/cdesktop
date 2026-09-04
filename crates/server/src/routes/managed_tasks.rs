@@ -130,6 +130,7 @@ async fn create_or_return(
             workspace_id,
             session_id,
             owner_instance_id: *INSTANCE_ID,
+            lease_id: Uuid::new_v4(),
         },
         |workspace_id, session_id| async move {
             match launch {
@@ -198,8 +199,17 @@ async fn create_or_return(
 
     let record = match launch_result {
         Ok(()) => {
-            ManagedTaskEffect::finish(&deployment.db().pool, task_id, epoch, "active", true, None)
-                .await?
+            ManagedTaskEffect::finish(
+                &deployment.db().pool,
+                task_id,
+                epoch,
+                *INSTANCE_ID,
+                record.lease_id,
+                "active",
+                true,
+                None,
+            )
+            .await?
         }
         Err(error) => {
             tracing::error!(%task_id, epoch, "managed task launch failed: {error}");
@@ -211,6 +221,8 @@ async fn create_or_return(
                 &deployment.db().pool,
                 task_id,
                 epoch,
+                *INSTANCE_ID,
+                record.lease_id,
                 if effect_created { "active" } else { "lost" },
                 effect_created,
                 (!effect_created).then_some("native_launch_failed"),
@@ -241,20 +253,11 @@ async fn reconcile(
     deployment: &DeploymentImpl,
     record: ManagedTaskEffect,
 ) -> Result<ManagedTaskEffect, ApiError> {
-    if record.state != "pending" || record.owner_instance_id == *INSTANCE_ID {
-        return Ok(record);
-    }
-    let effect_created = native_effect_exists(deployment, &record).await?;
-    ManagedTaskEffect::finish(
-        &deployment.db().pool,
-        record.task_id,
-        record.epoch,
-        if effect_created { "active" } else { "lost" },
-        effect_created,
-        (!effect_created).then_some("owner_restarted_before_effect_was_observed"),
-    )
-    .await
-    .map_err(ApiError::from)
+    // A pending effect belongs exclusively to its owner and lease. Another
+    // live server may only report that retryable pending state; it must never
+    // infer a restart from a concurrent request and publish a false terminal.
+    let _ = deployment;
+    Ok(record)
 }
 
 async fn native_effect_exists(
