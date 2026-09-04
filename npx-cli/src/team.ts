@@ -309,7 +309,20 @@ async function cmdManager(flags: SendFlags): Promise<void> {
   if (manager.id === caller) {
     fatal("current session is already the workspace lead; there is no parent manager to contact");
   }
-  return cmdSend(manager.id, flags);
+  const prompt = readMessageArg(flags.message, flags.messageFile);
+  // Manager reports must never kill the lead's active turn. The follow-up
+  // route durably queues the message and dispatches it immediately when the
+  // lead is idle, preserving the running execution when it is busy.
+  const data = await apiPost<{ prompt: string }, { id: string }>(
+    `/sessions/${encodeURIComponent(manager.id)}/follow-up`,
+    { prompt },
+    { "x-cdesktop-from-session": caller },
+  );
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify({ data, interrupted: [] })}\n`);
+  } else {
+    process.stdout.write(`messaged manager ${manager.id}\n`);
+  }
 }
 
 interface ListFlags {
@@ -376,8 +389,8 @@ function printTeamHelp(): void {
       "      model or provider — they keep their own config.",
       "",
       "  cdesktop team manager --message <text> | --message-file <path> [--json]",
-      "      Immediately steer the workspace lead with a question, blocker,",
-      "      status update, or completion notice without looking up its id.",
+      "      Queue a question, blocker, status update, or completion notice for",
+      "      the workspace lead without interrupting its active turn.",
       "",
       "  cdesktop team list [--json]",
       "      List the current workspace's team roster. Oldest session = lead.",

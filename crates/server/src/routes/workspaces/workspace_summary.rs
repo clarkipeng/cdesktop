@@ -136,13 +136,9 @@ pub async fn get_workspace_summaries(
     let archived = request.archived;
 
     // 1. Fetch all workspaces with the given archived status
-    let workspaces: Vec<Workspace> = Workspace::find_all_with_status(pool, Some(archived), None)
-        .await?
-        .into_iter()
-        .map(|ws| ws.workspace)
-        .collect();
+    let workspace_ids = Workspace::find_ids_by_archived(pool, archived).await?;
 
-    if workspaces.is_empty() {
+    if workspace_ids.is_empty() {
         return Ok(ResponseJson(ApiResponse::success(
             WorkspaceSummaryResponse { summaries: vec![] },
         )));
@@ -182,10 +178,10 @@ pub async fn get_workspace_summaries(
     // Fresh Git truth for a single workspace is fetched on demand through
     // `GET /workspaces/{id}/git/diff/stats`, which is gated by a global
     // subprocess semaphore.
-    let summaries: Vec<WorkspaceSummary> = workspaces
+    let summaries: Vec<WorkspaceSummary> = workspace_ids
         .iter()
-        .map(|ws| {
-            let id = ws.id;
+        .map(|id| {
+            let id = *id;
             let latest = latest_processes.get(&id);
             let has_pending = latest
                 .map(|p| pending_approval_eps.contains(&p.execution_process_id))

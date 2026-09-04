@@ -239,6 +239,17 @@ pub enum ExecutionProcessStatus {
     Killed,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct RunningExecutionInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub session_id: Uuid,
+    pub workspace_id: Uuid,
+    pub workspace_name: String,
+    pub run_reason: ExecutionProcessRunReason,
+    pub started_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Type, Serialize, Deserialize, PartialEq, TS)]
 #[sqlx(type_name = "execution_process_run_reason", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
@@ -458,6 +469,27 @@ impl ExecutionProcess {
                     ep.created_at as "created_at!: DateTime<Utc>",
                     ep.updated_at as "updated_at!: DateTime<Utc>"
                FROM execution_processes ep WHERE ep.status = 'running' ORDER BY ep.created_at ASC"#,
+        )
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Running activity for fleet drain probes, including human-readable
+    /// session/workspace names in the same database query.
+    pub async fn find_running_info(
+        pool: &SqlitePool,
+    ) -> Result<Vec<RunningExecutionInfo>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT ep.id, COALESCE(s.name, w.name, w.branch) AS name,
+                      ep.session_id,
+                      w.id AS workspace_id,
+                      COALESCE(w.name, w.branch) AS workspace_name,
+                      ep.run_reason, ep.started_at
+               FROM execution_processes ep
+               JOIN sessions s ON s.id = ep.session_id
+               JOIN workspaces w ON w.id = s.workspace_id
+               WHERE ep.status = 'running'
+               ORDER BY ep.started_at ASC"#,
         )
         .fetch_all(pool)
         .await

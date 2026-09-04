@@ -271,7 +271,18 @@ async fn native_effect_exists(
     record: &ManagedTaskEffect,
 ) -> Result<bool, ApiError> {
     let session = Session::find_by_id(&deployment.db().pool, record.session_id).await?;
-    Ok(session.is_some_and(|session| session.workspace_id == record.workspace_id))
+    if session.is_none_or(|session| session.workspace_id != record.workspace_id) {
+        return Ok(false);
+    }
+    Ok(
+        !db::models::execution_process::ExecutionProcess::find_by_session_id(
+            &deployment.db().pool,
+            record.session_id,
+            true,
+        )
+        .await?
+        .is_empty(),
+    )
 }
 
 fn request_hash(launch: &ManagedLaunch) -> Result<String, ApiError> {

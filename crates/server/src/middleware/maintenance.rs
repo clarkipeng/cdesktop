@@ -1,47 +1,38 @@
 use axum::{
-    body::Body,
-    extract::Request,
-    http::{Method, StatusCode, header},
-    middleware::Next,
-    response::Response,
+    Json,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
 };
+use services::services::maintenance::DrainError;
+use utils::response::ApiResponse;
 
-use crate::routes::maintenance::drain_remaining_millis;
-
-fn should_reject(method: &Method, path: &str, remaining: u64) -> bool {
-    let is_mutation = matches!(
-        *method,
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
-    is_mutation && !path.ends_with("/maintenance/drain") && remaining > 0
-}
-
-pub async fn reject_mutations_while_draining(request: Request, next: Next) -> Response {
-    let remaining = drain_remaining_millis();
-    if should_reject(request.method(), request.uri().path(), remaining) {
-        let retry_after = remaining.div_ceil(1000).max(1).to_string();
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::RETRY_AFTER, retry_after)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"success":false,"message":"cdesktop is draining for a verified local update; retry shortly"}"#,
-            ))
-            .unwrap_or_else(|_| Response::new(Body::empty()));
-    }
-    next.run(request).await
+/// Preserve the HTTP retry contract at the edge. Admission itself belongs to
+/// the shared execution-start boundary, not to route or method classification.
+pub fn drain_refusal_response(error: &DrainError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, error.retry_after_seconds().to_string())],
+        Json(ApiResponse::<()>::error(
+            "cdesktop is draining for a verified local update; retry shortly",
+        )),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
+    use services::services::maintenance::{admit_execution_start, set_drain};
+
     use super::*;
 
-    #[test]
-    fn drain_rejects_mutations_but_allows_reads_and_its_control_route() {
-        assert!(should_reject(&Method::POST, "/sessions/1/follow-up", 1000));
-        assert!(should_reject(&Method::DELETE, "/workspaces/1", 1000));
-        assert!(!should_reject(&Method::GET, "/workspaces", 1000));
-        assert!(!should_reject(&Method::POST, "/maintenance/drain", 1000));
-        assert!(!should_reject(&Method::POST, "/sessions/1/follow-up", 0));
+    #[tokio::test]
+    async fn externally_reachable_start_gets_retryable_service_unavailable() {
+        let _owner = services::services::maintenance::test_drain_owner().await;
+        set_drain(30).await;
+        let error = admit_execution_start().await.unwrap_err();
+        let response = drain_refusal_response(&error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        set_drain(0).await;
     }
 }

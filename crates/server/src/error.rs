@@ -22,6 +22,7 @@ use services::services::{
     container::ContainerError,
     file::FileError,
     host_admission::{AdmissionError, AdmissionRefusal},
+    maintenance::DrainError,
     remote_client::RemoteClientError,
     repo::RepoError as RepoServiceError,
 };
@@ -56,6 +57,8 @@ pub enum ApiError {
     /// is retryable: it answers with 503 + a structured refusal, not a 500.
     #[error(transparent)]
     HostAdmission(AdmissionError),
+    #[error(transparent)]
+    MaintenanceDrain(DrainError),
     #[error(transparent)]
     Executor(#[from] ExecutorError),
     #[error(transparent)]
@@ -173,6 +176,7 @@ impl From<ContainerError> for ApiError {
             ContainerError::ExecutorError(e) => ApiError::Executor(e),
             ContainerError::Worktree(e) => e.into(),
             ContainerError::HostAdmission(e) => ApiError::HostAdmission(e),
+            ContainerError::MaintenanceDrain(e) => ApiError::MaintenanceDrain(e),
             other => ApiError::Container(other),
         }
     }
@@ -358,6 +362,9 @@ impl IntoResponse for ApiError {
         if let ApiError::HostAdmission(err) = &self {
             return host_admission_response(err);
         }
+        if let ApiError::MaintenanceDrain(err) = &self {
+            return crate::middleware::drain_refusal_response(err);
+        }
         let info = match &self {
             ApiError::Repo(RepoError::Database(_)) => ErrorInfo::internal("RepoError"),
             ApiError::Repo(RepoError::NotFound) => {
@@ -540,6 +547,11 @@ impl IntoResponse for ApiError {
             ApiError::HostAdmission(err) => ErrorInfo::with_status(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "HostAdmissionError",
+                err.to_string(),
+            ),
+            ApiError::MaintenanceDrain(err) => ErrorInfo::with_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "MaintenanceDrainError",
                 err.to_string(),
             ),
             ApiError::Executor(_) => ErrorInfo::internal("ExecutorError"),

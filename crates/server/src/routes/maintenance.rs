@@ -1,31 +1,12 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::{Path, PathBuf};
 
 use axum::{Json, Router, response::Json as ResponseJson, routing::get};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use services::services::maintenance::{drain_remaining_millis, set_drain as set_drain_seconds};
 use utils::response::ApiResponse;
 
 use crate::DeploymentImpl;
-
-const MAX_DRAIN_SECONDS: u64 = 30;
-static DRAIN_UNTIL_MILLIS: AtomicU64 = AtomicU64::new(0);
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-pub fn drain_remaining_millis() -> u64 {
-    DRAIN_UNTIL_MILLIS
-        .load(Ordering::Acquire)
-        .saturating_sub(now_millis())
-}
 
 #[derive(Debug, Deserialize)]
 struct DrainRequest {
@@ -51,13 +32,7 @@ async fn get_drain() -> ResponseJson<ApiResponse<DrainStatus>> {
 }
 
 async fn set_drain(Json(request): Json<DrainRequest>) -> ResponseJson<ApiResponse<DrainStatus>> {
-    let seconds = request.seconds.min(MAX_DRAIN_SECONDS);
-    let deadline = if seconds == 0 {
-        0
-    } else {
-        now_millis().saturating_add(seconds.saturating_mul(1000))
-    };
-    DRAIN_UNTIL_MILLIS.store(deadline, Ordering::Release);
+    set_drain_seconds(request.seconds).await;
     ResponseJson(ApiResponse::success(status()))
 }
 
@@ -136,8 +111,9 @@ mod tests {
 
     #[tokio::test]
     async fn drain_is_bounded_and_can_be_released() {
+        let _owner = services::services::maintenance::test_drain_owner().await;
         let _ = set_drain(Json(DrainRequest { seconds: 300 })).await;
-        assert!(drain_remaining_millis() <= MAX_DRAIN_SECONDS * 1000);
+        assert!(drain_remaining_millis() <= 30 * 1000);
         assert!(drain_remaining_millis() > 0);
 
         let _ = set_drain(Json(DrainRequest { seconds: 0 })).await;

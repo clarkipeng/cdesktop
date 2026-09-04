@@ -784,6 +784,22 @@ impl Workspace {
         Ok(workspaces)
     }
 
+    /// Workspace ids for metadata-only list summaries. Unlike
+    /// `find_all_with_status`, this does not compute process status or derive
+    /// and persist missing workspace names.
+    pub async fn find_ids_by_archived(
+        pool: &SqlitePool,
+        archived: bool,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT id FROM workspaces WHERE source = 'user' AND archived = ? \
+             ORDER BY updated_at DESC",
+        )
+        .bind(archived)
+        .fetch_all(pool)
+        .await
+    }
+
     /// Delete a workspace by ID
     pub async fn delete(pool: &SqlitePool, id: Uuid) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!("DELETE FROM workspaces WHERE id = $1", id)

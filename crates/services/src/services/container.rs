@@ -99,6 +99,8 @@ pub enum ContainerError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     HostAdmission(#[from] crate::services::host_admission::AdmissionError),
+    #[error(transparent)]
+    MaintenanceDrain(#[from] crate::services::maintenance::DrainError),
     #[error("The host already has the maximum number of running coding agents")]
     CodingAgentCapacity,
     #[error("Failed to kill process: {0}")]
@@ -118,6 +120,11 @@ pub fn start_error_outcome(error: &ContainerError) -> NormalizedExecutionOutcome
             NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
                 .with_provider_code("local_host_admission")
                 .with_retry_after_seconds(admission.retry_after_seconds())
+        }
+        ContainerError::MaintenanceDrain(drain) => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
+                .with_provider_code("maintenance_drain")
+                .with_retry_after_seconds(drain.retry_after_seconds() as i64)
         }
         ContainerError::CodingAgentCapacity => {
             NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
@@ -1567,6 +1574,9 @@ pub trait ContainerService {
         execution_process_id: Uuid,
         claim_pending_commands: bool,
     ) -> Result<ExecutionProcess, ContainerError> {
+        // Hold start admission through the durable row creation. Drain activation
+        // takes the matching writer, so no admitted start can appear after drain begins.
+        let _maintenance_admission = crate::services::maintenance::admit_execution_start().await?;
         self.ensure_launch_admission()?;
         // Create new execution process record
         // Capture current HEAD per repository as the "before" commit for this execution
