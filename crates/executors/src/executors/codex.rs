@@ -691,6 +691,18 @@ impl Codex {
                 (response.thread.id, response.model)
             }
             Some(session_id) => {
+                // Fork is the codex app-server's only resume primitive, and it
+                // materializes a copy of the prior rollout inside the codex
+                // binary (cdesktop cannot reference history in place).
+                //
+                // The storage guard (`ensure_fork_allowed`) only *limits* that
+                // copying: a per-rollout size cap, a free-disk reserve and a
+                // process-global fork-rate breaker. It does not garbage-collect
+                // rollouts, does not deduplicate history, and does not make an
+                // over-cap session resumable - such a session is refused, not
+                // recovered. The real fix is rollout GC plus content-addressed
+                // history: clarkipeng/cdesktop#29, upstream
+                // cdesktop-ai/cdesktop#16.
                 let response = client
                     .thread_fork(fork_params_from(session_id, thread_start_params))
                     .await?;
@@ -809,6 +821,21 @@ impl Codex {
                         if io_err.kind() == std::io::ErrorKind::BrokenPipe =>
                     {
                         // Broken pipe likely means the parent process exited, so we can ignore it
+                        return;
+                    }
+                    ExecutorError::Refused(outcome) => {
+                        // Already classified by the adapter (e.g. the fork-rate
+                        // breaker). Report the typed terminal verbatim so the
+                        // retry hint survives instead of decaying to Unknown.
+                        log_writer
+                            .log_raw(&Error::launch_error(outcome.safe_message.clone()).raw())
+                            .await
+                            .ok();
+                        exit_signal_tx
+                            .send_exit_signal(ExecutorExitResult::Failure(Some(
+                                outcome.as_ref().clone(),
+                            )))
+                            .await;
                         return;
                     }
                     ExecutorError::AuthRequired(message) => {

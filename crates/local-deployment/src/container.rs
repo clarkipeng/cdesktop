@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -34,7 +34,7 @@ use executors::{
         StandardCodingAgentExecutor,
     },
     logs::{NormalizedEntryType, utils::patch::extract_normalized_entry_from_patch},
-    outcome::NormalizedExecutionOutcome,
+    outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
 };
 use futures::{FutureExt, TryStreamExt, stream::select};
 use git::GitService;
@@ -45,7 +45,9 @@ use services::services::{
     config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT, MIN_AUTO_ARCHIVE_IDLE_DAYS},
     container::{ContainerError, ContainerRef, ContainerService},
     diff_stream::{self, DiffStreamHandle},
+    execution_process as execution_process_service,
     file::FileService,
+    host_admission,
     notification::NotificationService,
     remote_client::RemoteClient,
     remote_sync,
@@ -90,6 +92,10 @@ pub struct LocalContainerService {
     /// When stopping execution, we await these to ensure logs are fully persisted.
     db_stream_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
     exit_monitor_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
+    /// Executions stopped by cdesktop's own log byte cap. Read once by the
+    /// exit monitor so the terminal row carries `local_log_limit` instead of
+    /// the meaningless exit status of a process we killed ourselves.
+    log_limit_hits: Arc<RwLock<HashSet<Uuid>>>,
     workspace_touch_times: Arc<RwLock<HashMap<Uuid, Instant>>>,
     scheduler_lock: Arc<Mutex<()>>,
     config: Arc<RwLock<Config>>,
@@ -131,6 +137,7 @@ impl LocalContainerService {
             msg_stores,
             db_stream_handles,
             exit_monitor_handles,
+            log_limit_hits: Arc::new(RwLock::new(HashSet::new())),
             workspace_touch_times,
             scheduler_lock: Arc::new(Mutex::new(())),
             config,
@@ -568,6 +575,7 @@ impl LocalContainerService {
         let config = self.config.clone();
         let container = self.clone();
         let analytics = self.analytics.clone();
+        let log_limit_hits = self.log_limit_hits.clone();
 
         let mut process_exit_rx = self.spawn_os_exit_watcher(exec_id);
 
@@ -597,6 +605,15 @@ impl LocalContainerService {
                         exit_status_result.unwrap_or_else(|e| Err(std::io::Error::other(e))),
                     )
                 }
+            };
+            // cdesktop stopped this process itself because its log hit the
+            // byte cap, so the OS exit says nothing useful. Report the real
+            // reason - still through the same exactly-once CAS below, never a
+            // second terminal writer.
+            let outcome = if log_limit_hits.write().await.remove(&exec_id) {
+                NormalizedProcessOutcome::blocked_by_log_limit()
+            } else {
+                outcome
             };
             let (status, exit_code) = outcome.status_and_exit_code();
 
@@ -1004,6 +1021,22 @@ impl LocalContainerService {
     }
 }
 
+/// Whether the durable log's byte cap should stop this process tree.
+///
+/// Coding agents are unbounded producers: a cap that only drops their output
+/// leaves them running and spending with nothing recorded. Scripts are bounded
+/// work with bounded output, so their logs are capped and marked and the
+/// script is left to finish.
+fn log_limit_stops_process(run_reason: &ExecutionProcessRunReason) -> bool {
+    match run_reason {
+        ExecutionProcessRunReason::CodingAgent => true,
+        ExecutionProcessRunReason::SetupScript
+        | ExecutionProcessRunReason::CleanupScript
+        | ExecutionProcessRunReason::ArchiveScript
+        | ExecutionProcessRunReason::DevServer => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum NormalizedProcessOutcome {
     Success {
@@ -1031,6 +1064,19 @@ impl NormalizedProcessOutcome {
                 exit_code: Some(1),
                 outcome: None,
             },
+        }
+    }
+
+    /// cdesktop's own log byte cap stopped the process tree. Mirrors the
+    /// storage-limit outcome (`local_storage_limit`): a local, cdesktop-owned
+    /// limit, not a provider or task failure.
+    fn blocked_by_log_limit() -> Self {
+        Self::Failure {
+            exit_code: None,
+            outcome: Some(
+                NormalizedExecutionOutcome::new(ExecutionOutcomeClass::TaskFailed)
+                    .with_provider_code("local_log_limit"),
+            ),
         }
     }
 
@@ -1377,6 +1423,18 @@ impl ContainerService for LocalContainerService {
             env.provider_structured = Some(structured.clone());
         }
 
+        // Check host process + disk headroom before the fork. On an exhausted
+        // host this refuses with a typed, retryable error instead of letting
+        // the fork fail with EAGAIN or the first write fail on a full disk.
+        //
+        // Gated by run reason: cleanup/archive/setup/dev-server are exempt
+        // (see `host_admission::is_admission_gated`) because refusing the
+        // paths that reclaim disk would make an exhausted host unrecoverable.
+        if host_admission::is_admission_gated(&execution_process.run_reason) {
+            let tracked_agents = self.child_store.read().await.len() as u64;
+            host_admission::check_spawn_headroom(&current_dir, tracked_agents)?;
+        }
+
         // Create the child and stream, add to execution tracker with timeout
         let mut spawned = tokio::time::timeout(
             Duration::from_secs(30),
@@ -1411,6 +1469,48 @@ impl ContainerService for LocalContainerService {
         self.add_exit_monitor_handle(execution_process.id, hn).await;
 
         Ok(())
+    }
+
+    /// Persist logs, and for coding agents arm the byte cap to stop the
+    /// process tree.
+    ///
+    /// A cap that only drops lines is a log eater: the agent keeps running,
+    /// keeps spending, and nothing it does after the cap is recorded. Scripts
+    /// are bounded work with bounded output, so they keep the cap-and-mark
+    /// behaviour and are left to finish.
+    async fn spawn_log_persistence(&self, execution_process: &ExecutionProcess) {
+        let on_log_limit: Option<execution_process_service::LogLimitStop> =
+            if log_limit_stops_process(&execution_process.run_reason) {
+                let container = self.clone();
+                let process = execution_process.clone();
+                Some(Box::new(move || {
+                    Box::pin(async move {
+                        // Mark first: the stop below makes the exit monitor
+                        // fire, and it must already see why.
+                        container.log_limit_hits.write().await.insert(process.id);
+                        if let Err(error) = container
+                            .stop_execution(&process, ExecutionProcessStatus::Failed)
+                            .await
+                        {
+                            tracing::error!(
+                                execution_process_id = %process.id,
+                                %error,
+                                "failed to stop process tree after its log hit the byte cap"
+                            );
+                        }
+                    })
+                }))
+            } else {
+                None
+            };
+
+        execution_process_service::spawn_stream_raw_logs_to_storage(
+            self.msg_stores().clone(),
+            self.db().clone(),
+            execution_process.id,
+            execution_process.session_id,
+            on_log_limit,
+        );
     }
 
     async fn stop_execution(
@@ -1692,6 +1792,38 @@ mod tests {
         {
             use std::os::windows::process::ExitStatusExt;
             ExitStatusExt::from_raw(code as u32)
+        }
+    }
+
+    #[test]
+    fn log_limit_terminal_is_typed_not_unknown() {
+        // cdesktop killed this process itself, so the exit status carries no
+        // information. Without an explicit outcome the row read as an
+        // unclassified failure and the reason for the stop was unrecoverable.
+        let outcome = NormalizedProcessOutcome::blocked_by_log_limit();
+        assert_eq!(
+            outcome.status_and_exit_code(),
+            (ExecutionProcessStatus::Failed, None)
+        );
+        let normalized = outcome.normalized_outcome().expect("typed outcome");
+        assert_eq!(normalized.class, ExecutionOutcomeClass::TaskFailed);
+        assert_eq!(normalized.provider_code.as_deref(), Some("local_log_limit"));
+    }
+
+    #[test]
+    fn only_coding_agents_are_stopped_by_the_log_cap() {
+        // Scripts are bounded producers and are left to finish; unbounded
+        // coding agents are the case the cap exists for.
+        assert!(log_limit_stops_process(
+            &ExecutionProcessRunReason::CodingAgent
+        ));
+        for bounded in [
+            ExecutionProcessRunReason::SetupScript,
+            ExecutionProcessRunReason::CleanupScript,
+            ExecutionProcessRunReason::ArchiveScript,
+            ExecutionProcessRunReason::DevServer,
+        ] {
+            assert!(!log_limit_stops_process(&bounded), "{bounded:?}");
         }
     }
 

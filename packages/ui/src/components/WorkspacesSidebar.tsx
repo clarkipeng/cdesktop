@@ -6,7 +6,6 @@ import {
   SpinnerIcon,
   CaretDownIcon,
   LightningIcon,
-  RobotIcon,
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../lib/cn';
@@ -25,6 +24,15 @@ export interface WorkspacesSidebarWorkspace {
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
+  /** Diff stats for this row are still being fetched. */
+  diffStatsLoading?: boolean;
+  /**
+   * Called when this row enters or leaves the viewport. Travels with the row
+   * rather than as a sidebar-level prop so every list variant (pinned, folder,
+   * flat, archived) reports visibility without threading a callback through
+   * each of them.
+   */
+  onVisibilityChange?: (visible: boolean) => void;
   isRunning?: boolean;
   isPinned?: boolean;
   hasPendingApproval?: boolean;
@@ -170,10 +178,6 @@ export interface WorkspacesSidebarProps {
   onOpenRoutines?: () => void;
   /** Whether the Routines nav row should render as active. */
   isRoutinesActive?: boolean;
-  /** Open the Agents page (rendered as a top-level nav row). */
-  onOpenAgents?: () => void;
-  /** Whether the Agents nav row should render as active. */
-  isAgentsActive?: boolean;
 }
 
 export interface WorkspacesSidebarReopenTagProps {
@@ -238,6 +242,8 @@ function WorkspaceList({
           filesChanged={workspace.filesChanged}
           linesAdded={workspace.linesAdded}
           linesRemoved={workspace.linesRemoved}
+          diffStatsLoading={workspace.diffStatsLoading}
+          onVisibilityChange={workspace.onVisibilityChange}
           isActive={selectedWorkspaceId === workspace.id}
           isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
           isRunning={workspace.isRunning}
@@ -381,29 +387,6 @@ function RoutinesNavRow({
     >
       <LightningIcon className="size-icon-sm" />
       <span>{t('routines.sidebar.nav', { defaultValue: 'Routines' })}</span>
-    </button>
-  );
-}
-
-function AgentsNavRow({
-  onOpenAgents,
-  isActive,
-}: {
-  onOpenAgents?: () => void;
-  isActive?: boolean;
-}) {
-  const { t } = useTranslation('common');
-  return (
-    <button
-      type="button"
-      onClick={onOpenAgents}
-      className={cn(
-        'w-full flex items-center gap-base px-double py-half text-base text-normal hover:bg-tertiary/60 transition-colors',
-        isActive && 'bg-tertiary/60'
-      )}
-    >
-      <RobotIcon className="size-icon-sm" />
-      <span>{t('agents.sidebar.nav', { defaultValue: 'Agents' })}</span>
     </button>
   );
 }
@@ -592,6 +575,8 @@ function PinnedSection({
                   filesChanged={workspace.filesChanged}
                   linesAdded={workspace.linesAdded}
                   linesRemoved={workspace.linesRemoved}
+                  diffStatsLoading={workspace.diffStatsLoading}
+                  onVisibilityChange={workspace.onVisibilityChange}
                   isActive={selectedWorkspaceId === workspace.id}
                   isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
                   isRunning={workspace.isRunning}
@@ -661,8 +646,6 @@ export function WorkspacesSidebar({
   bottomActions,
   onOpenRoutines,
   isRoutinesActive,
-  onOpenAgents,
-  isAgentsActive,
 }: WorkspacesSidebarProps) {
   const { t } = useTranslation(['tasks', 'common']);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -753,11 +736,6 @@ export function WorkspacesSidebar({
         />
       )}
 
-      {/* Agents nav row */}
-      {!isLoading && !showArchive && onOpenAgents && (
-        <AgentsNavRow onOpenAgents={onOpenAgents} isActive={isAgentsActive} />
-      )}
-
       {activeRemoteHost && (
         <div className="px-base py-half">
           <div className="rounded-sm border border-border bg-panel/60 px-base py-half flex items-center justify-between gap-base">
@@ -831,6 +809,8 @@ export function WorkspacesSidebar({
                   filesChanged={workspace.filesChanged}
                   linesAdded={workspace.linesAdded}
                   linesRemoved={workspace.linesRemoved}
+                  diffStatsLoading={workspace.diffStatsLoading}
+                  onVisibilityChange={workspace.onVisibilityChange}
                   isActive={selectedWorkspaceId === workspace.id}
                   isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
                   isRunning={workspace.isRunning}
@@ -956,6 +936,8 @@ export function WorkspacesSidebar({
                 filesChanged={workspace.filesChanged}
                 linesAdded={workspace.linesAdded}
                 linesRemoved={workspace.linesRemoved}
+                diffStatsLoading={workspace.diffStatsLoading}
+                onVisibilityChange={workspace.onVisibilityChange}
                 isActive={selectedWorkspaceId === workspace.id}
                 isOpenInGrid={openInGridWorkspaceIds?.has(workspace.id)}
                 isRunning={workspace.isRunning}

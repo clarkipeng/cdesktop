@@ -19,7 +19,7 @@ use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
 use utils::{
     assets::prod_asset_dir_path,
     execution_logs::{
-        ExecutionLogWriter, process_log_file_path, process_log_file_path_in_root,
+        ExecutionLogWriter, LogAppend, process_log_file_path, process_log_file_path_in_root,
         read_execution_log_file,
     },
     log_msg::LogMsg,
@@ -246,32 +246,44 @@ pub async fn append_log_message(session_id: Uuid, execution_id: Uuid, msg: &LogM
         .with_context(|| format!("serialize log message for execution {}", execution_id))?;
     let mut json_line_with_newline = json_line;
     json_line_with_newline.push('\n');
+    // Single cdesktop-owned messages (start errors, setup-required hints) are
+    // control lines: they draw on the writer's overdraft so the byte cap never
+    // swallows the explanation the user needs. `Blocked` past the overdraft is
+    // the cap doing its job, not an error.
     log_writer
-        .append_jsonl_line(&json_line_with_newline)
+        .append_control_line(&json_line_with_newline)
         .await
         .with_context(|| format!("append log message for execution {}", execution_id))?;
     Ok(())
 }
+
+/// Invoked once when an execution's durable log hits its byte cap.
+///
+/// The implementor stops the owned process tree. Terminalization deliberately
+/// stays on the normal exit-monitor path so the exactly-once compare-and-set
+/// release keeps being the only writer of the terminal row.
+pub type LogLimitStop = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
 pub fn spawn_stream_raw_logs_to_storage(
     msg_stores: Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>,
     db: DBService,
     execution_id: Uuid,
     session_id: Uuid,
+    on_log_limit: Option<LogLimitStop>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut log_writer =
-            match ExecutionLogWriter::new_for_execution(session_id, execution_id).await {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to create log file writer for execution {}: {}",
-                        execution_id,
-                        e
-                    );
-                    return;
-                }
-            };
+        let log_writer = match ExecutionLogWriter::new_for_execution(session_id, execution_id).await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create log file writer for execution {}: {}",
+                    execution_id,
+                    e
+                );
+                return;
+            }
+        };
 
         let store = {
             let map = msg_stores.read().await;
@@ -279,73 +291,106 @@ pub fn spawn_stream_raw_logs_to_storage(
         };
 
         if let Some(store) = store {
-            let mut stream = store.history_plus_stream();
+            stream_logs_to_writer(
+                log_writer,
+                store.history_plus_stream(),
+                db,
+                execution_id,
+                on_log_limit,
+            )
+            .await;
+        }
+    })
+}
 
-            while let Some(Ok(msg)) = stream.next().await {
-                match &msg {
-                    LogMsg::Stdout(_) | LogMsg::Stderr(_) => match serde_json::to_string(&msg) {
-                        Ok(jsonl_line) => {
-                            let mut jsonl_line_with_newline = jsonl_line;
-                            jsonl_line_with_newline.push('\n');
+/// Drains `stream` into `log_writer`, firing `on_log_limit` the first time the
+/// writer's byte cap refuses a line.
+///
+/// Split out of the spawn so the byte-cap stop is testable against a small cap
+/// and a scripted stream, with no live child process.
+async fn stream_logs_to_writer(
+    mut log_writer: ExecutionLogWriter,
+    mut stream: futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>,
+    db: DBService,
+    execution_id: Uuid,
+    mut on_log_limit: Option<LogLimitStop>,
+) {
+    while let Some(Ok(msg)) = stream.next().await {
+        match &msg {
+            LogMsg::Stdout(_) | LogMsg::Stderr(_) => match serde_json::to_string(&msg) {
+                Ok(jsonl_line) => {
+                    let mut jsonl_line_with_newline = jsonl_line;
+                    jsonl_line_with_newline.push('\n');
 
-                            if let Err(e) =
-                                log_writer.append_jsonl_line(&jsonl_line_with_newline).await
-                            {
-                                tracing::error!(
-                                    "Failed to append log line for execution {}: {}",
-                                    execution_id,
-                                    e
+                    match log_writer.append_jsonl_line(&jsonl_line_with_newline).await {
+                        Ok(LogAppend::Written) => {}
+                        Ok(LogAppend::Blocked) => {
+                            // A limit that only drops logs is a log eater: the
+                            // agent keeps burning tokens and disk with nothing
+                            // recorded. The first block stops the process tree.
+                            if let Some(stop) = on_log_limit.take() {
+                                tracing::warn!(
+                                    "Execution {} log hit its byte cap; stopping the process tree: blocked(limit)",
+                                    execution_id
                                 );
+                                stop().await;
                             }
                         }
                         Err(e) => {
                             tracing::error!(
-                                "Failed to serialize log message for execution {}: {}",
-                                execution_id,
-                                e
-                            );
-                        }
-                    },
-                    LogMsg::SessionId(agent_session_id) => {
-                        if let Err(e) = CodingAgentTurn::update_agent_session_id(
-                            &db.pool,
-                            execution_id,
-                            agent_session_id,
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "Failed to update agent_session_id {} for execution process {}: {}",
-                                agent_session_id,
+                                "Failed to append log line for execution {}: {}",
                                 execution_id,
                                 e
                             );
                         }
                     }
-                    LogMsg::MessageId(agent_message_id) => {
-                        if let Err(e) = CodingAgentTurn::update_agent_message_id(
-                            &db.pool,
-                            execution_id,
-                            agent_message_id,
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "Failed to update agent_message_id {} for execution process {}: {}",
-                                agent_message_id,
-                                execution_id,
-                                e
-                            );
-                        }
-                    }
-                    LogMsg::Finished => {
-                        break;
-                    }
-                    LogMsg::JsonPatch(_) | LogMsg::Ready => continue,
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to serialize log message for execution {}: {}",
+                        execution_id,
+                        e
+                    );
+                }
+            },
+            LogMsg::SessionId(agent_session_id) => {
+                if let Err(e) = CodingAgentTurn::update_agent_session_id(
+                    &db.pool,
+                    execution_id,
+                    agent_session_id,
+                )
+                .await
+                {
+                    tracing::error!(
+                        "Failed to update agent_session_id {} for execution process {}: {}",
+                        agent_session_id,
+                        execution_id,
+                        e
+                    );
                 }
             }
+            LogMsg::MessageId(agent_message_id) => {
+                if let Err(e) = CodingAgentTurn::update_agent_message_id(
+                    &db.pool,
+                    execution_id,
+                    agent_message_id,
+                )
+                .await
+                {
+                    tracing::error!(
+                        "Failed to update agent_message_id {} for execution process {}: {}",
+                        agent_message_id,
+                        execution_id,
+                        e
+                    );
+                }
+            }
+            LogMsg::Finished => {
+                break;
+            }
+            LogMsg::JsonPatch(_) | LogMsg::Ready => continue,
         }
-    })
+    }
 }
 
 async fn read_execution_logs_for_execution(
@@ -404,4 +449,93 @@ fn new_spinner(message: &'static str) -> ProgressBar {
     pb.set_message(message);
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt as _;
+    use utils::execution_logs::ExecutionLogWriter;
+
+    use super::*;
+
+    async fn scratch_db() -> DBService {
+        // The stream only touches the pool for SessionId/MessageId messages,
+        // which this test never sends.
+        DBService {
+            pool: sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
+        }
+    }
+
+    fn scripted(
+        messages: Vec<LogMsg>,
+    ) -> futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>> {
+        futures::stream::iter(messages.into_iter().map(Ok)).boxed()
+    }
+
+    #[tokio::test]
+    async fn byte_cap_stops_the_process_tree_once() {
+        // The H1 defect: hitting the cap used to drop the line and let the
+        // agent keep running, so it burned tokens and disk while producing a
+        // log nobody was recording. The first blocked append must stop the
+        // owned process tree - and only once, however many lines follow.
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ExecutionLogWriter::with_max_bytes(dir.path().join("proc.jsonl"), 24)
+            .await
+            .unwrap();
+
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counter = stops.clone();
+        let on_log_limit: LogLimitStop = Box::new(move || {
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        stream_logs_to_writer(
+            writer,
+            scripted(vec![
+                LogMsg::Stdout("a".repeat(64)),
+                LogMsg::Stdout("b".repeat(64)),
+                LogMsg::Stdout("c".repeat(64)),
+                LogMsg::Finished,
+            ]),
+            scratch_db().await,
+            Uuid::new_v4(),
+            Some(on_log_limit),
+        )
+        .await;
+
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn logs_under_the_cap_never_stop_the_process() {
+        // The mirror invariant: a healthy execution must not be killed by the
+        // machinery that exists to kill runaway ones.
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ExecutionLogWriter::with_max_bytes(dir.path().join("proc.jsonl"), 1024 * 1024)
+            .await
+            .unwrap();
+
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counter = stops.clone();
+        let on_log_limit: LogLimitStop = Box::new(move || {
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        stream_logs_to_writer(
+            writer,
+            scripted(vec![LogMsg::Stdout("small".into()), LogMsg::Finished]),
+            scratch_db().await,
+            Uuid::new_v4(),
+            Some(on_log_limit),
+        )
+        .await;
+
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+    }
 }

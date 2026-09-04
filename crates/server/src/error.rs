@@ -21,6 +21,7 @@ use services::services::{
     config::{ConfigError, EditorOpenError},
     container::ContainerError,
     file::FileError,
+    host_admission::{AdmissionError, AdmissionRefusal},
     remote_client::RemoteClientError,
     repo::RepoError as RepoServiceError,
 };
@@ -51,6 +52,10 @@ pub enum ApiError {
     Deployment(#[from] DeploymentError),
     #[error(transparent)]
     Container(ContainerError),
+    /// Host admission refused the spawn. Distinct from `Container` because it
+    /// is retryable: it answers with 503 + a structured refusal, not a 500.
+    #[error(transparent)]
+    HostAdmission(AdmissionError),
     #[error(transparent)]
     Executor(#[from] ExecutorError),
     #[error(transparent)]
@@ -167,6 +172,7 @@ impl From<ContainerError> for ApiError {
             ContainerError::ExecutionProcess(e) => ApiError::ExecutionProcess(e),
             ContainerError::ExecutorError(e) => ApiError::Executor(e),
             ContainerError::Worktree(e) => e.into(),
+            ContainerError::HostAdmission(e) => ApiError::HostAdmission(e),
             other => ApiError::Container(other),
         }
     }
@@ -325,8 +331,33 @@ fn remote_client_error(err: &RemoteClientError) -> ErrorInfo {
     }
 }
 
+/// 503 + structured refusal + `Retry-After`. Admission refusals are the one
+/// error class a caller can act on mechanically, so they never collapse into
+/// the message-only envelope every other variant uses.
+fn host_admission_response(err: &AdmissionError) -> Response {
+    let refusal = err.refusal();
+    let retry_after = refusal.retry_after_seconds.max(0);
+    tracing::warn!(
+        resource = ?refusal.resource,
+        available = refusal.available,
+        reserve = refusal.reserve,
+        "spawn refused by host admission"
+    );
+    let message = refusal.safe_message.clone();
+    let body = ApiResponse::<(), AdmissionRefusal>::error_with_message_and_data(&message, refusal);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
+        Json(body),
+    )
+        .into_response()
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::HostAdmission(err) = &self {
+            return host_admission_response(err);
+        }
         let info = match &self {
             ApiError::Repo(RepoError::Database(_)) => ErrorInfo::internal("RepoError"),
             ApiError::Repo(RepoError::NotFound) => {
@@ -504,6 +535,13 @@ impl IntoResponse for ApiError {
 
             ApiError::Deployment(_) => ErrorInfo::internal("DeploymentError"),
             ApiError::Container(_) => ErrorInfo::internal("ContainerError"),
+            // Answered by the early return in `into_response`; this arm only
+            // keeps the match exhaustive.
+            ApiError::HostAdmission(err) => ErrorInfo::with_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "HostAdmissionError",
+                err.to_string(),
+            ),
             ApiError::Executor(_) => ErrorInfo::internal("ExecutorError"),
             ApiError::CommandBuilder(_) => ErrorInfo::internal("CommandBuildError"),
             ApiError::Database(_) => ErrorInfo::internal("DatabaseError"),
@@ -667,6 +705,37 @@ mod tests {
                 .status(),
             StatusCode::TOO_EARLY
         );
+    }
+
+    #[tokio::test]
+    async fn admission_refusal_is_retryable_and_carries_the_numbers() {
+        // A refusal without a type is a dead end: the caller must be able to
+        // see 503 + Retry-After + the available/reserve numbers rather than a
+        // 500 with a prose message.
+        let response = ApiError::HostAdmission(AdmissionError::DiskExhausted {
+            available: 1_024,
+            reserve: 4_096,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("30")
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["error_data"]["resource"], "disk");
+        assert_eq!(body["error_data"]["available"], 1_024);
+        assert_eq!(body["error_data"]["reserve"], 4_096);
+        assert_eq!(body["error_data"]["retry_after_seconds"], 30);
     }
 
     #[test]

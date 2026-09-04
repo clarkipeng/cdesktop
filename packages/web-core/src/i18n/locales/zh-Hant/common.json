@@ -930,10 +930,5 @@
     "sidebar": {
       "nav": "定時任務"
     }
-  },
-  "agents": {
-    "sidebar": {
-      "nav": "Agents"
-    }
   }
 }

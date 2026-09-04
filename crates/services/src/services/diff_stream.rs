@@ -39,12 +39,35 @@ pub struct DiffStats {
     pub lines_removed: usize,
 }
 
+/// Ceiling on concurrent one-shot diff-stat computations across the process.
+/// Each computation fans blocking `git` children over a workspace's repos, so
+/// an unbounded caller could exhaust the process table (the ~196-child
+/// incident). Callers queue on this semaphore instead of racing.
+const MAX_CONCURRENT_DIFF_STATS: usize = 6;
+
+/// The process-global limiter is built from this constructor, so a test can
+/// exhaust an identical semaphore of its own instead of stealing permits from
+/// live callers.
+fn new_diff_stats_semaphore() -> tokio::sync::Semaphore {
+    tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFF_STATS)
+}
+
+static DIFF_STATS_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(new_diff_stats_semaphore);
+
 /// Computes diff stats for a workspace by comparing against target branches.
+///
+/// Blocking `git` work is bounded by a process-global semaphore so concurrent
+/// callers can never spawn more than `MAX_CONCURRENT_DIFF_STATS` git children
+/// at once.
 pub async fn compute_diff_stats(
     pool: &SqlitePool,
     git: &GitService,
     workspace: &Workspace,
 ) -> Option<DiffStats> {
+    // Held for the lifetime of this computation; the semaphore is never closed,
+    // so acquire only fails on poisoning, which we treat as "skip".
+    let _permit = DIFF_STATS_SEMAPHORE.acquire().await.ok()?;
     // Per-reader decision (OFF mode): fall through to read against `Repo.path`.
     // A diff against the checked-out branch's working tree is meaningful for the
     // user's real repo, so the diff stats pane works identically in both modes.
@@ -844,4 +867,29 @@ fn setup_git_watcher(
     }
 
     Some((debouncer, rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_stats_semaphore_caps_concurrent_git_work() {
+        // Regression guard for the process-table incident: no more than
+        // MAX_CONCURRENT_DIFF_STATS computations may run their blocking git
+        // work at once.
+        //
+        // Uses its own semaphore from the same constructor as the
+        // process-global one. Draining the global would starve any concurrent
+        // caller for the rest of the test binary's life and make this test's
+        // own result depend on who else happened to hold a permit.
+        let semaphore = new_diff_stats_semaphore();
+        let held: Vec<_> = (0..MAX_CONCURRENT_DIFF_STATS)
+            .map(|_| semaphore.try_acquire().expect("permit within the cap"))
+            .collect();
+
+        assert!(semaphore.try_acquire().is_err());
+        drop(held);
+        assert!(semaphore.try_acquire().is_ok());
+    }
 }

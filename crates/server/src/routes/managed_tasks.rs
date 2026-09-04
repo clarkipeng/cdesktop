@@ -7,7 +7,9 @@ use axum::{
     routing::put,
 };
 use db::models::{
-    managed_task_effect::{ManagedTaskEffect, ManagedTaskEffectError, NewManagedTaskEffect},
+    managed_task_effect::{
+        FinishManagedTaskEffect, ManagedTaskEffect, ManagedTaskEffectError, NewManagedTaskEffect,
+    },
     requests::CreateAndStartWorkspaceRequest,
     session::{Session, SessionError},
     workspace::{Workspace, WorkspaceError},
@@ -130,6 +132,7 @@ async fn create_or_return(
             workspace_id,
             session_id,
             owner_instance_id: *INSTANCE_ID,
+            lease_id: Uuid::new_v4(),
         },
         |workspace_id, session_id| async move {
             match launch {
@@ -198,8 +201,19 @@ async fn create_or_return(
 
     let record = match launch_result {
         Ok(()) => {
-            ManagedTaskEffect::finish(&deployment.db().pool, task_id, epoch, "active", true, None)
-                .await?
+            ManagedTaskEffect::finish(
+                &deployment.db().pool,
+                FinishManagedTaskEffect {
+                    task_id,
+                    epoch,
+                    owner_instance_id: *INSTANCE_ID,
+                    lease_id: record.lease_id,
+                    state: "active",
+                    effect_created: true,
+                    reason: None,
+                },
+            )
+            .await?
         }
         Err(error) => {
             tracing::error!(%task_id, epoch, "managed task launch failed: {error}");
@@ -209,11 +223,15 @@ async fn create_or_return(
             let effect_created = native_effect_exists(&deployment, &current).await?;
             ManagedTaskEffect::finish(
                 &deployment.db().pool,
-                task_id,
-                epoch,
-                if effect_created { "active" } else { "lost" },
-                effect_created,
-                (!effect_created).then_some("native_launch_failed"),
+                FinishManagedTaskEffect {
+                    task_id,
+                    epoch,
+                    owner_instance_id: *INSTANCE_ID,
+                    lease_id: record.lease_id,
+                    state: if effect_created { "active" } else { "lost" },
+                    effect_created,
+                    reason: (!effect_created).then_some("native_launch_failed"),
+                },
             )
             .await?
         }
@@ -241,20 +259,11 @@ async fn reconcile(
     deployment: &DeploymentImpl,
     record: ManagedTaskEffect,
 ) -> Result<ManagedTaskEffect, ApiError> {
-    if record.state != "pending" || record.owner_instance_id == *INSTANCE_ID {
-        return Ok(record);
-    }
-    let effect_created = native_effect_exists(deployment, &record).await?;
-    ManagedTaskEffect::finish(
-        &deployment.db().pool,
-        record.task_id,
-        record.epoch,
-        if effect_created { "active" } else { "lost" },
-        effect_created,
-        (!effect_created).then_some("owner_restarted_before_effect_was_observed"),
-    )
-    .await
-    .map_err(ApiError::from)
+    // A pending effect belongs exclusively to its owner and lease. Another
+    // live server may only report that retryable pending state; it must never
+    // infer a restart from a concurrent request and publish a false terminal.
+    let _ = deployment;
+    Ok(record)
 }
 
 async fn native_effect_exists(
@@ -322,6 +331,7 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             session_id,
             owner_instance_id: Uuid::new_v4(),
+            lease_id: Uuid::new_v4(),
         }
     }
 
@@ -373,9 +383,20 @@ mod tests {
         .unwrap();
         assert!(first.inserted);
         let first_session_id = first.record.session_id;
-        ManagedTaskEffect::finish(&pool, task_id, 1, "active", true, None)
-            .await
-            .unwrap();
+        ManagedTaskEffect::finish(
+            &pool,
+            FinishManagedTaskEffect {
+                task_id,
+                epoch: 1,
+                owner_instance_id: first.record.owner_instance_id,
+                lease_id: first.record.lease_id,
+                state: "active",
+                effect_created: true,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let retry = reserve_and_launch(&pool, effect(task_id, Uuid::new_v4()), {
             let launches = launches.clone();

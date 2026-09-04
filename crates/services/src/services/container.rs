@@ -45,13 +45,14 @@ use executors::{
             patch::{fix_patch_ops, is_add_or_replace, patch_entry_path},
         },
     },
+    outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
     profile::{ExecutorConfig, ExecutorProfileId},
     provider::ProviderInjection,
 };
 use futures::{StreamExt, future, stream::BoxStream};
 use git::{GitService, GitServiceError};
 use json_patch::Patch;
-use sqlx::Error as SqlxError;
+use sqlx::{Error as SqlxError, SqlitePool};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, RwLock},
@@ -96,10 +97,36 @@ pub enum ContainerError {
     ExecutionProcess(#[from] ExecutionProcessError),
     #[error("Io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    HostAdmission(#[from] crate::services::host_admission::AdmissionError),
+    #[error("The host already has the maximum number of running coding agents")]
+    CodingAgentCapacity,
     #[error("Failed to kill process: {0}")]
     KillFailed(std::io::Error),
     #[error(transparent)]
     Other(#[from] AnyhowError), // Catches any unclassified errors
+}
+
+/// Typed terminal for a spawn that never started.
+///
+/// Host admission and other capacity refusals are transient by construction:
+/// nothing about the task is wrong, the host was full. Classifying them as
+/// `TaskFailed` would tell a retrying caller to give up.
+pub fn start_error_outcome(error: &ContainerError) -> NormalizedExecutionOutcome {
+    match error {
+        ContainerError::HostAdmission(admission) => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
+                .with_provider_code("local_host_admission")
+                .with_retry_after_seconds(admission.retry_after_seconds())
+        }
+        ContainerError::CodingAgentCapacity => {
+            NormalizedExecutionOutcome::new(ExecutionOutcomeClass::RateLimitedTransient)
+                .with_provider_code("coding_agent_capacity")
+                .with_retry_after_seconds(1)
+        }
+        _ => NormalizedExecutionOutcome::new(ExecutionOutcomeClass::TaskFailed)
+            .with_provider_code("local_start_failed"),
+    }
 }
 
 #[async_trait]
@@ -402,11 +429,6 @@ pub trait ContainerService {
         if ExecutionProcess::has_running_coding_agent_for_session(pool, session_id).await? {
             return Ok(None);
         }
-        let max_running = max_running_agents();
-        if ExecutionProcess::count_running_coding_agents(pool).await? >= max_running {
-            return Ok(None);
-        }
-
         // Metered approval gate (plan §12): consult the durable policy for
         // the head of the queue before claiming. `ask` creates/awaits its
         // durable approval, `never` blocks with a routes_exhausted record —
@@ -542,6 +564,7 @@ pub trait ContainerService {
                 selected_provider_id.map(|id| id.to_string()),
                 executor_config.model_id.clone(),
             );
+            self.admit_coding_agent(pool).await?;
             self.start_execution_with_id(
                 &workspace,
                 &session,
@@ -554,6 +577,10 @@ pub trait ContainerService {
         }
         .await;
 
+        if matches!(result, Err(ContainerError::CodingAgentCapacity)) {
+            SessionCommand::release_unbound(pool, session_id).await?;
+            return Ok(None);
+        }
         if result.is_err() {
             SessionCommand::finish_execution(pool, execution_id, false).await?;
         }
@@ -1054,6 +1081,21 @@ pub trait ContainerService {
         status: ExecutionProcessStatus,
     ) -> Result<(), ContainerError>;
 
+    /// Start persisting this execution's live log stream to its durable file.
+    ///
+    /// Overridden by implementors that own the child process, so the durable
+    /// writer's byte cap can stop a runaway agent instead of silently dropping
+    /// its output. The default persists without a stop hook.
+    async fn spawn_log_persistence(&self, execution_process: &ExecutionProcess) {
+        execution_process::spawn_stream_raw_logs_to_storage(
+            self.msg_stores().clone(),
+            self.db().clone(),
+            execution_process.id,
+            execution_process.session_id,
+            None,
+        );
+    }
+
     async fn try_commit_changes(&self, ctx: &ExecutionContext) -> Result<bool, ContainerError>;
 
     async fn copy_project_files(
@@ -1478,6 +1520,23 @@ pub trait ContainerService {
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
     ) -> Result<ExecutionProcess, ContainerError> {
+        // Coding-agent admission is centralized here for every direct launch.
+        // Queue dispatch already holds this lock and calls the same primitive
+        // immediately before creating its execution row.
+        if *run_reason == ExecutionProcessRunReason::CodingAgent {
+            let _scheduler = self.scheduler_lock().lock().await;
+            self.admit_coding_agent(&self.db().pool).await?;
+            return self
+                .start_execution_with_id(
+                    workspace,
+                    session,
+                    executor_action,
+                    run_reason,
+                    Uuid::new_v4(),
+                    false,
+                )
+                .await;
+        }
         self.start_execution_with_id(
             workspace,
             session,
@@ -1487,6 +1546,16 @@ pub trait ContainerService {
             false,
         )
         .await
+    }
+
+    /// Must be called while `scheduler_lock` is held. The execution row is
+    /// created before releasing that lock, so a running row is the durable
+    /// reservation for one fleet-wide coding-agent slot.
+    async fn admit_coding_agent(&self, pool: &SqlitePool) -> Result<(), ContainerError> {
+        if ExecutionProcess::count_running_coding_agents(pool).await? >= max_running_agents() {
+            return Err(ContainerError::CodingAgentCapacity);
+        }
+        Ok(())
     }
 
     async fn start_execution_with_id(
@@ -1678,12 +1747,16 @@ pub trait ContainerService {
                 .write()
                 .await
                 .remove(&execution_process.id);
-            // Mark process as failed
-            if let Err(update_error) = ExecutionProcess::update_completion(
+            // Mark process as failed, with a typed outcome. A spawn that was
+            // refused rather than attempted is retryable, and the row has to
+            // say so - an untyped failure reads as "the task is broken".
+            let outcome = start_error_outcome(&start_error);
+            if let Err(update_error) = ExecutionProcess::complete_running_attempt(
                 &self.db().pool,
                 execution_process.id,
                 ExecutionProcessStatus::Failed,
                 None,
+                Some(&outcome),
             )
             .await
             {
@@ -1800,12 +1873,7 @@ pub trait ContainerService {
             }
         }
 
-        execution_process::spawn_stream_raw_logs_to_storage(
-            self.msg_stores().clone(),
-            self.db().clone(),
-            execution_process.id,
-            session.id,
-        );
+        self.spawn_log_persistence(&execution_process).await;
         Ok(execution_process)
     }
 

@@ -10,6 +10,7 @@ import {
 } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../lib/cn';
+import { useInViewport } from '../lib/useInViewport';
 import { RunningDots } from './RunningDots';
 
 const formatRelativeElapsed = (dateString: string): string => {
@@ -33,6 +34,16 @@ export interface WorkspaceSummaryProps {
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
+  /**
+   * Diff stats are being fetched for this row. Distinct from "fetched, no
+   * changes" so the pill does not claim a clean workspace it has not measured.
+   */
+  diffStatsLoading?: boolean;
+  /**
+   * Called when this row enters or leaves the viewport. Wired by containers
+   * that fetch diff stats per visible row instead of for every workspace.
+   */
+  onVisibilityChange?: (visible: boolean) => void;
   isActive?: boolean;
   /**
    * True for any session currently mounted in the grid (visually shown as
@@ -66,6 +77,8 @@ export function WorkspaceSummary({
   filesChanged,
   linesAdded,
   linesRemoved,
+  diffStatsLoading = false,
+  onVisibilityChange,
   isActive = false,
   isOpenInGrid = false,
   isRunning = false,
@@ -86,6 +99,7 @@ export function WorkspaceSummary({
   onDragEnd,
 }: WorkspaceSummaryProps) {
   const { t } = useTranslation('common');
+  const rootRef = useInViewport<HTMLDivElement>(onVisibilityChange);
   const hasChanges = filesChanged !== undefined && filesChanged > 0;
   const isFailed =
     latestProcessStatus === 'failed' || latestProcessStatus === 'killed';
@@ -98,6 +112,7 @@ export function WorkspaceSummary({
 
   return (
     <div
+      ref={rootRef}
       draggable={draggable}
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
@@ -243,18 +258,30 @@ export function WorkspaceSummary({
             {/* Spacer when running (no elapsed time shown) */}
             {isRunning && <span className="flex-1" />}
 
-            {/* File count + lines changed on the right */}
-            {hasChanges && (
-              <span className="shrink-0 text-right flex items-center gap-half">
-                <FileIcon className="size-icon-xs" weight="fill" />
-                <span>{filesChanged}</span>
-                {linesAdded !== undefined && (
-                  <span className="text-success">+{linesAdded}</span>
-                )}
-                {linesRemoved !== undefined && (
-                  <span className="text-error">-{linesRemoved}</span>
-                )}
-              </span>
+            {/*
+              File count + lines changed on the right. Diff stats are fetched
+              per visible row, so until the answer arrives the slot holds a
+              placeholder: showing nothing would read as "no changes" and make
+              the numbers pop in as a layout shift.
+            */}
+            {diffStatsLoading ? (
+              <span
+                aria-hidden
+                className="shrink-0 h-[3px] w-6 rounded-full bg-low opacity-30"
+              />
+            ) : (
+              hasChanges && (
+                <span className="shrink-0 text-right flex items-center gap-half">
+                  <FileIcon className="size-icon-xs" weight="fill" />
+                  <span>{filesChanged}</span>
+                  {linesAdded !== undefined && (
+                    <span className="text-success">+{linesAdded}</span>
+                  )}
+                  {linesRemoved !== undefined && (
+                    <span className="text-error">-{linesRemoved}</span>
+                  )}
+                </span>
+              )
             )}
           </div>
         )}

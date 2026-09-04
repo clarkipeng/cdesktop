@@ -134,6 +134,7 @@ pub enum RenameBranchError {
 pub fn router() -> Router<DeploymentImpl> {
     Router::new()
         .route("/status", get(get_workspace_branch_status))
+        .route("/diff/stats", get(get_workspace_diff_stats))
         .route("/diff/ws", get(stream_diff_ws))
         .route("/merge", post(merge_workspace))
         .route("/push", post(push_workspace_branch))
@@ -160,6 +161,30 @@ async fn resolve_cdesktop_identifier(
         return issue_id.to_string();
     }
     local_workspace_id.to_string()
+}
+
+/// On-demand, single-workspace Git diff stats. This is the explicit refresh
+/// that replaces the removed per-workspace fan-out in the summaries endpoint;
+/// the underlying computation is gated by a global subprocess semaphore.
+///
+/// `null` means the stats could not be computed (no container, unreadable
+/// repo, git failure). It is deliberately distinct from `{0,0,0}`, which means
+/// "computed, and there are no changes" - collapsing the two showed a
+/// confident "no changes" for every workspace whose git truth was unavailable.
+#[axum::debug_handler]
+pub async fn get_workspace_diff_stats(
+    Extension(workspace): Extension<Workspace>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<Option<super::workspace_summary::DiffStats>>>, ApiError> {
+    let stats =
+        super::workspace_summary::compute_workspace_diff_stats(&deployment, &workspace).await;
+    if stats.is_none() {
+        tracing::warn!(
+            workspace_id = %workspace.id,
+            "diff stats unavailable for workspace; reporting null rather than zero changes"
+        );
+    }
+    Ok(ResponseJson(ApiResponse::success(stats)))
 }
 
 #[axum::debug_handler]
