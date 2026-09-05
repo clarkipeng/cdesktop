@@ -16,6 +16,8 @@ pub struct ManagedTaskEffect {
     pub lease_id: Uuid,
     pub effect_created: bool,
     pub reason: Option<String>,
+    pub retryable: bool,
+    pub retry_after_seconds: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -39,6 +41,8 @@ pub struct FinishManagedTaskEffect<'a> {
     pub state: &'a str,
     pub effect_created: bool,
     pub reason: Option<&'a str>,
+    pub retryable: bool,
+    pub retry_after_seconds: Option<i64>,
 }
 
 #[derive(Debug, Error)]
@@ -118,7 +122,7 @@ impl ManagedTaskEffect {
     ) -> Result<Self, sqlx::Error> {
         sqlx::query(
             "UPDATE managed_task_effects
-             SET state = ?, effect_created = ?, reason = ?,
+             SET state = ?, effect_created = ?, reason = ?, retryable = ?, retry_after_seconds = ?,
                  updated_at = datetime('now', 'subsec')
              WHERE task_id = ? AND epoch = ? AND state = 'pending'
                AND owner_instance_id = ? AND lease_id = ?",
@@ -126,6 +130,8 @@ impl ManagedTaskEffect {
         .bind(effect.state)
         .bind(effect.effect_created)
         .bind(effect.reason)
+        .bind(effect.retryable)
+        .bind(effect.retry_after_seconds)
         .bind(effect.task_id)
         .bind(effect.epoch)
         .bind(effect.owner_instance_id)
@@ -248,6 +254,8 @@ mod tests {
                 state: "lost",
                 effect_created: false,
                 reason: Some("foreign"),
+                retryable: false,
+                retry_after_seconds: None,
             },
         )
         .await
@@ -264,6 +272,8 @@ mod tests {
                 state: "active",
                 effect_created: true,
                 reason: None,
+                retryable: false,
+                retry_after_seconds: None,
             },
         )
         .await

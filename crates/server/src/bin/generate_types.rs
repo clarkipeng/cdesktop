@@ -233,6 +233,7 @@ fn generate_types_content() -> String {
         executors::outcome::NormalizedExecutionOutcome::decl(),
         services::services::host_admission::AdmissionResource::decl(),
         services::services::host_admission::AdmissionRefusal::decl(),
+        server::routes::managed_tasks::ManagedTaskEffectResponse::decl(),
         server::routes::metered_approvals::MeteredApprovalResponseRequest::decl(),
         server::routes::execution_routing::ExecutionRoutingSettings::decl(),
         server::routes::execution_routing::ExecutionRoutingRoute::decl(),
