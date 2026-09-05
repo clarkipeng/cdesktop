@@ -10,7 +10,11 @@
 //! that cannot report free disk or its process ceiling admits the spawn rather
 //! than bricking the app on an unreadable `statfs`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use db::models::execution_process::ExecutionProcessRunReason;
 use serde::{Deserialize, Serialize};
@@ -60,15 +64,26 @@ pub struct AdmissionRefusal {
     pub safe_message: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum AdmissionError {
-    #[error("spawn refused: {available} free disk bytes is below the {reserve} byte reserve")]
-    DiskExhausted { available: u64, reserve: u64 },
-    #[error(
-        "spawn refused: {available} live processes plus reserve would exceed the {reserve} process ceiling"
-    )]
-    ProcessExhausted { available: u64, reserve: u64 },
+    DiskExhausted {
+        available: u64,
+        reserve: u64,
+    },
+    ProcessExhausted {
+        available: u64,
+        reserve: u64,
+        culprit: Option<String>,
+    },
 }
+
+impl fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.safe_message())
+    }
+}
+
+impl std::error::Error for AdmissionError {}
 
 impl AdmissionError {
     pub fn resource(&self) -> AdmissionResource {
@@ -102,6 +117,25 @@ impl AdmissionError {
         ADMISSION_RETRY_AFTER_SECONDS
     }
 
+    pub fn safe_message(&self) -> String {
+        match self {
+            Self::DiskExhausted { available, reserve } => format!(
+                "spawn refused: {available} free disk bytes is below the {reserve} byte reserve"
+            ),
+            Self::ProcessExhausted {
+                available,
+                reserve,
+                culprit,
+            } => format!(
+                "spawn refused: {available} live processes plus reserve would exceed the {reserve} process ceiling{}",
+                culprit
+                    .as_ref()
+                    .map(|culprit| format!("; {culprit}"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
     /// Machine-readable refusal for the API boundary.
     pub fn refusal(&self) -> AdmissionRefusal {
         AdmissionRefusal {
@@ -109,21 +143,13 @@ impl AdmissionError {
             available: self.available(),
             reserve: self.reserve(),
             retry_after_seconds: self.retry_after_seconds(),
-            safe_message: match self.resource() {
-                AdmissionResource::Disk => {
-                    "Host is out of free disk; spawn refused. Free space and retry.".to_string()
-                }
-                AdmissionResource::Processes => {
-                    "Host is out of process headroom; spawn refused. Retry once agents finish."
-                        .to_string()
-                }
-            },
+            safe_message: self.safe_message(),
         }
     }
 }
 
 /// Live process ceiling and current host load, resolved from the OS.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProcessHeadroom {
     /// Soft `RLIMIT_NPROC` (per-uid process ceiling).
     pub ceiling: u64,
@@ -135,6 +161,9 @@ pub struct ProcessHeadroom {
     pub per_agent: u64,
     /// Processes kept free for the rest of the host.
     pub reserve: u64,
+    /// The parent with the most direct children, including unreaped zombies.
+    /// This is diagnostic only; zombies never count toward `live_processes`.
+    pub culprit: Option<String>,
 }
 
 /// Pure admission decision. Split from the OS probes so it is exhaustively
@@ -162,6 +191,7 @@ fn admit(
             return Err(AdmissionError::ProcessExhausted {
                 available: h.live_processes,
                 reserve: projected,
+                culprit: h.culprit,
             });
         }
     }
@@ -260,16 +290,20 @@ fn process_headroom(tracked_agents: u64) -> Option<ProcessHeadroom> {
         return None;
     }
     let per_agent = env_u64(PER_AGENT_ENV, DEFAULT_PER_AGENT_PROCESSES);
+    let census = process_census();
     Some(ProcessHeadroom {
         ceiling,
         // Prefer the real host process count: the ceiling is per-uid and every
         // process on the host consumes it, not just the children cdesktop
         // happens to be tracking. Fall back to the tracked-subtree estimate
         // where the OS cannot be asked.
-        live_processes: live_process_count()
+        live_processes: census
+            .as_ref()
+            .map(|census| census.live_processes)
             .unwrap_or_else(|| tracked_agents.saturating_mul(per_agent)),
         per_agent,
         reserve: env_u64(PROCESS_RESERVE_ENV, DEFAULT_PROCESS_RESERVE),
+        culprit: census.and_then(|census| census.culprit),
     })
 }
 
@@ -278,38 +312,130 @@ fn process_headroom(_tracked_agents: u64) -> Option<ProcessHeadroom> {
     None
 }
 
-/// Number of processes currently alive on the host, or `None` when the
-/// platform offers no cheap count (fail-open).
-#[cfg(target_os = "macos")]
-fn live_process_count() -> Option<u64> {
-    // libproc: called with a null buffer, `proc_listallpids` returns the
-    // number of pids it would have written instead of writing any.
-    unsafe extern "C" {
-        fn proc_listallpids(buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
-    }
-    // SAFETY: the null/zero-length form is the documented "just count them"
-    // call and writes nothing.
-    let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 {
-        return None;
-    }
-    Some(count as u64)
+#[derive(Debug, Clone)]
+struct ProcessInfo {
+    pid: u32,
+    parent_pid: u32,
+    state: char,
+    command: String,
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn live_process_count() -> Option<u64> {
-    // /proc is the portable Linux answer; a numeric directory per pid.
+#[derive(Debug)]
+struct ProcessCensus {
+    live_processes: u64,
+    culprit: Option<String>,
+}
+
+fn census_processes(processes: impl IntoIterator<Item = ProcessInfo>) -> ProcessCensus {
+    let processes = processes.into_iter().collect::<Vec<_>>();
+    let commands = processes
+        .iter()
+        .map(|process| (process.pid, process.command.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut children = HashMap::<u32, (u64, u64)>::new();
+    let mut live_processes = 0;
+    for process in &processes {
+        let counts = children.entry(process.parent_pid).or_default();
+        if process.state == 'Z' {
+            counts.1 += 1;
+        } else {
+            live_processes += 1;
+            counts.0 += 1;
+        }
+    }
+    let culprit = children
+        .into_iter()
+        .max_by_key(|(pid, (live, zombies))| (*live + *zombies, std::cmp::Reverse(*pid)))
+        .map(|(pid, (live, zombies))| {
+            let command = commands.get(&pid).copied().unwrap_or("unknown parent");
+            if zombies > 0 {
+                format!(
+                    "{} dead children of {command} (pid {pid})",
+                    grouped_number(zombies)
+                )
+            } else {
+                format!(
+                    "{} child processes of {command} (pid {pid})",
+                    grouped_number(live)
+                )
+            }
+        });
+    ProcessCensus {
+        live_processes,
+        culprit,
+    }
+}
+
+fn grouped_number(value: u64) -> String {
+    let digits = value.to_string();
+    let first_group = digits.len() % 3;
+    let mut result = String::with_capacity(digits.len() + (digits.len() - 1) / 3);
+    if first_group > 0 {
+        result.push_str(&digits[..first_group]);
+    }
+    for group in digits.as_bytes()[first_group..].chunks(3) {
+        if !result.is_empty() {
+            result.push(',');
+        }
+        result.push_str(std::str::from_utf8(group).expect("decimal digits are UTF-8"));
+    }
+    result
+}
+
+/// Number of processes currently alive on the host and the parent consuming
+/// the most children. A `Z` process is already dead and does not consume a
+/// process slot; it remains in the diagnostic to identify the parent that
+/// failed to reap it. Any probe failure returns `None` and admission falls
+/// back to the tracked-subtree estimate.
+#[cfg(target_os = "linux")]
+fn process_census() -> Option<ProcessCensus> {
     let entries = std::fs::read_dir("/proc").ok()?;
-    let count = entries
+    let processes = entries
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let (_, fields) = stat.rsplit_once(')')?;
+            let mut fields = fields.split_whitespace();
+            Some(ProcessInfo {
+                pid,
+                state: fields.next()?.chars().next()?,
+                parent_pid: fields.next()?.parse().ok()?,
+                command: stat.split_once('(')?.1.rsplit_once(')')?.0.to_string(),
+            })
         })
-        .count();
-    (count > 0).then_some(count as u64)
+        .collect::<Vec<_>>();
+    (!processes.is_empty()).then(|| census_processes(processes))
+}
+
+#[cfg(target_os = "macos")]
+fn process_census() -> Option<ProcessCensus> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,state=,comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let processes = String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(ProcessInfo {
+                pid: fields.next()?.parse().ok()?,
+                parent_pid: fields.next()?.parse().ok()?,
+                state: fields.next()?.chars().next()?,
+                command: fields.next()?.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!processes.is_empty()).then(|| census_processes(processes))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_census() -> Option<ProcessCensus> {
+    None
 }
 
 #[cfg(test)]
@@ -322,6 +448,7 @@ mod tests {
             live_processes,
             per_agent: 64,
             reserve: 128,
+            culprit: None,
         }
     }
 
@@ -395,8 +522,73 @@ mod tests {
         // The honest-counting fix: when the platform can answer, the count is
         // the real host process count, which is always at least this test
         // process. `None` (fail-open) is the only other legal answer.
-        if let Some(count) = live_process_count() {
-            assert!(count >= 1, "implausible live process count {count}");
+        if let Some(census) = process_census() {
+            assert!(
+                census.live_processes >= 1,
+                "implausible live process count {}",
+                census.live_processes
+            );
         }
+    }
+
+    #[test]
+    fn zombies_are_excluded_and_their_parent_is_named() {
+        // An unreaped child remains in the process table but is no longer live
+        // nor charged against RLIMIT_NPROC. The refusal names its owner so the
+        // operator can fix the leaking parent instead of guessing.
+        let census = census_processes([
+            ProcessInfo {
+                pid: 693,
+                parent_pid: 1,
+                state: 'S',
+                command: "FwUpdateManagerd".into(),
+            },
+            ProcessInfo {
+                pid: 701,
+                parent_pid: 693,
+                state: 'Z',
+                command: "worker".into(),
+            },
+            ProcessInfo {
+                pid: 702,
+                parent_pid: 693,
+                state: 'Z',
+                command: "worker".into(),
+            },
+            ProcessInfo {
+                pid: 703,
+                parent_pid: 693,
+                state: 'R',
+                command: "worker".into(),
+            },
+        ]);
+
+        assert_eq!(census.live_processes, 2);
+        assert_eq!(
+            census.culprit.as_deref(),
+            Some("2 dead children of FwUpdateManagerd (pid 693)")
+        );
+        let error = admit(
+            Some(10_000),
+            2_000,
+            Some(ProcessHeadroom {
+                ceiling: 1,
+                live_processes: census.live_processes,
+                per_agent: 64,
+                reserve: 128,
+                culprit: census.culprit,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .safe_message()
+                .contains("dead children of FwUpdateManagerd")
+        );
+    }
+
+    #[test]
+    fn formats_culprit_process_counts_for_operators() {
+        assert_eq!(grouped_number(2_212), "2,212");
     }
 }

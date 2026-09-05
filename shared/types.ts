@@ -743,6 +743,8 @@ reserve: bigint, retry_after_seconds: bigint,
  */
 safe_message: string, };
 
+export type ManagedTaskEffectResponse = { state: string, workspace_id: string | null, session_id: string | null, reason: string | null, retryable: boolean, retry_after_seconds?: bigint, created: boolean, };
+
 export type MeteredApprovalResponseRequest = { approved: boolean, reason?: string, };
 
 export type ExecutionRoutingSettings = { enabled: boolean, routes: Array<ExecutionRoutingRoute>, meteredFallback: string, sameRouteRetries: number, transientBackoffSeconds: Array<number>, approvalTimeoutMinutes: number, allRoutesExhausted: string, notifyOnSwap: boolean, exposeAccountAlias: boolean, fallbackOnFreeFailure: boolean, };

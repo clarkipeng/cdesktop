@@ -17,6 +17,7 @@ use db::models::{
 use deployment::Deployment;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ts_rs::TS;
 use utils::response::ApiResponse;
 use uuid::Uuid;
 
@@ -67,12 +68,15 @@ impl ManagedLaunch {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ManagedTaskEffectResponse {
+#[derive(Debug, Serialize, TS)]
+pub struct ManagedTaskEffectResponse {
     state: String,
     workspace_id: Option<Uuid>,
     session_id: Option<Uuid>,
     reason: Option<String>,
+    retryable: bool,
+    #[ts(optional)]
+    retry_after_seconds: Option<u64>,
     created: bool,
 }
 
@@ -211,6 +215,8 @@ async fn create_or_return(
                     state: "active",
                     effect_created: true,
                     reason: None,
+                    retryable: false,
+                    retry_after_seconds: None,
                 },
             )
             .await?
@@ -221,19 +227,7 @@ async fn create_or_return(
                 .await?
                 .ok_or_else(|| ApiError::BadRequest("Managed task effect not found".into()))?;
             let effect_created = native_effect_exists(&deployment, &current).await?;
-            ManagedTaskEffect::finish(
-                &deployment.db().pool,
-                FinishManagedTaskEffect {
-                    task_id,
-                    epoch,
-                    owner_instance_id: *INSTANCE_ID,
-                    lease_id: record.lease_id,
-                    state: if effect_created { "active" } else { "lost" },
-                    effect_created,
-                    reason: (!effect_created).then_some("native_launch_failed"),
-                },
-            )
-            .await?
+            finish_launch_failure(&deployment.db().pool, record, &error, effect_created).await?
         }
     };
 
@@ -308,8 +302,74 @@ fn to_response(record: ManagedTaskEffect, created_by_request: bool) -> ManagedTa
         workspace_id: visible.then_some(record.workspace_id),
         session_id: visible.then_some(record.session_id),
         reason: record.reason,
+        retryable: record.retryable,
+        retry_after_seconds: record
+            .retry_after_seconds
+            .and_then(|seconds| u64::try_from(seconds).ok()),
         created: created_by_request && visible,
     }
+}
+
+struct ManagedLaunchFailure {
+    reason: String,
+    retryable: bool,
+    retry_after_seconds: Option<u64>,
+}
+
+fn managed_launch_failure(error: &ApiError) -> ManagedLaunchFailure {
+    match error {
+        ApiError::HostAdmission(refusal) => {
+            let refusal = refusal.refusal();
+            ManagedLaunchFailure {
+                reason: refusal.safe_message,
+                retryable: true,
+                retry_after_seconds: u64::try_from(refusal.retry_after_seconds).ok(),
+            }
+        }
+        ApiError::MaintenanceDrain(drain) => ManagedLaunchFailure {
+            reason: error.to_string(),
+            retryable: true,
+            retry_after_seconds: Some(drain.retry_after_seconds()),
+        },
+        _ => ManagedLaunchFailure {
+            reason: error.to_string(),
+            retryable: false,
+            retry_after_seconds: None,
+        },
+    }
+}
+
+async fn finish_launch_failure(
+    pool: &sqlx::SqlitePool,
+    record: ManagedTaskEffect,
+    error: &ApiError,
+    effect_created: bool,
+) -> Result<ManagedTaskEffect, sqlx::Error> {
+    let outcome = managed_launch_failure(error);
+    ManagedTaskEffect::finish(
+        pool,
+        FinishManagedTaskEffect {
+            task_id: record.task_id,
+            epoch: record.epoch,
+            owner_instance_id: record.owner_instance_id,
+            lease_id: record.lease_id,
+            state: if effect_created {
+                "active"
+            } else if outcome.retryable {
+                "pending"
+            } else {
+                "lost"
+            },
+            effect_created,
+            reason: (!effect_created).then_some(outcome.reason.as_str()),
+            retryable: !effect_created && outcome.retryable,
+            retry_after_seconds: (!effect_created)
+                .then_some(outcome.retry_after_seconds)
+                .flatten()
+                .and_then(|seconds| i64::try_from(seconds).ok()),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -404,6 +464,8 @@ mod tests {
                 state: "active",
                 effect_created: true,
                 reason: None,
+                retryable: false,
+                retry_after_seconds: None,
             },
         )
         .await
@@ -423,5 +485,122 @@ mod tests {
         assert!(retry.launch_result.is_none());
         assert_eq!(retry.record.session_id, first_session_id);
         assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_refusal_leaves_the_effect_pending_with_the_retry_contract() {
+        // A host-full refusal created no native session, but the reservation is
+        // still the authoritative effect for this task epoch and can be retried.
+        let pool = pool().await;
+        let task_id = Uuid::new_v4();
+        let (record, inserted) = ManagedTaskEffect::begin(&pool, effect(task_id, Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(inserted);
+        let refusal = services::services::host_admission::AdmissionError::ProcessExhausted {
+            available: 2_810,
+            reserve: 3_002,
+            culprit: Some("2,212 dead children of FwUpdateManagerd (pid 693)".into()),
+        };
+        let expected_reason = refusal.refusal().safe_message;
+
+        let finished =
+            finish_launch_failure(&pool, record, &ApiError::HostAdmission(refusal), false)
+                .await
+                .unwrap();
+
+        assert_eq!(finished.state, "pending");
+        assert_eq!(finished.reason.as_deref(), Some(expected_reason.as_str()));
+        assert!(finished.retryable);
+        assert_eq!(finished.retry_after_seconds, Some(30));
+    }
+
+    #[tokio::test]
+    async fn retry_adopts_refusal_reservation_and_fences_in_flight_launch() {
+        let pool = pool().await;
+        let task_id = Uuid::new_v4();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let (record, inserted) = ManagedTaskEffect::begin(&pool, effect(task_id, Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(inserted);
+        let refusal = services::services::host_admission::AdmissionError::ProcessExhausted {
+            available: 2_810,
+            reserve: 3_002,
+            culprit: Some("2,212 dead children of FwUpdateManagerd (pid 693)".into()),
+        };
+        let finished =
+            finish_launch_failure(&pool, record, &ApiError::HostAdmission(refusal), false)
+                .await
+                .unwrap();
+        let original_session_id = finished.session_id;
+        let (launch_started_tx, launch_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let retry = {
+            let launches = launches.clone();
+            let retry_pool = pool.clone();
+            tokio::spawn(async move {
+                reserve_and_launch(
+                    &retry_pool,
+                    effect(task_id, Uuid::new_v4()),
+                    move |_, _| async move {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        let _ = launch_started_tx.send(());
+                        let _ = release_rx.await;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap()
+            })
+        };
+        launch_started_rx.await.unwrap();
+
+        let concurrent = reserve_and_launch(&pool, effect(task_id, Uuid::new_v4()), {
+            let launches = launches.clone();
+            move |_, _| async move {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!concurrent.inserted);
+        assert!(concurrent.launch_result.is_none());
+        assert_eq!(concurrent.record.session_id, original_session_id);
+
+        release_tx.send(()).unwrap();
+        let retry = retry.await.unwrap();
+        assert!(retry.inserted);
+        assert!(retry.launch_result.unwrap().is_ok());
+        assert_eq!(retry.record.session_id, original_session_id);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn definitive_failure_is_lost_with_its_real_reason() {
+        let pool = pool().await;
+        let task_id = Uuid::new_v4();
+        let (record, inserted) = ManagedTaskEffect::begin(&pool, effect(task_id, Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(inserted);
+
+        let finished = finish_launch_failure(
+            &pool,
+            record,
+            &ApiError::BadRequest("requested workspace does not exist".into()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(finished.state, "lost");
+        assert_eq!(
+            finished.reason.as_deref(),
+            Some("Bad request: requested workspace does not exist")
+        );
+        assert!(!finished.retryable);
+        assert_eq!(finished.retry_after_seconds, None);
     }
 }
