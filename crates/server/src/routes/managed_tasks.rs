@@ -516,6 +516,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_adopts_refusal_reservation_and_fences_in_flight_launch() {
+        let pool = pool().await;
+        let task_id = Uuid::new_v4();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let (record, inserted) = ManagedTaskEffect::begin(&pool, effect(task_id, Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(inserted);
+        let refusal = services::services::host_admission::AdmissionError::ProcessExhausted {
+            available: 2_810,
+            reserve: 3_002,
+            culprit: Some("2,212 dead children of FwUpdateManagerd (pid 693)".into()),
+        };
+        let finished =
+            finish_launch_failure(&pool, record, &ApiError::HostAdmission(refusal), false)
+                .await
+                .unwrap();
+        let original_session_id = finished.session_id;
+        let (launch_started_tx, launch_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let retry = {
+            let launches = launches.clone();
+            let retry_pool = pool.clone();
+            tokio::spawn(async move {
+                reserve_and_launch(
+                    &retry_pool,
+                    effect(task_id, Uuid::new_v4()),
+                    move |_, _| async move {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        let _ = launch_started_tx.send(());
+                        let _ = release_rx.await;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap()
+            })
+        };
+        launch_started_rx.await.unwrap();
+
+        let concurrent = reserve_and_launch(&pool, effect(task_id, Uuid::new_v4()), {
+            let launches = launches.clone();
+            move |_, _| async move {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!concurrent.inserted);
+        assert!(concurrent.launch_result.is_none());
+        assert_eq!(concurrent.record.session_id, original_session_id);
+
+        release_tx.send(()).unwrap();
+        let retry = retry.await.unwrap();
+        assert!(retry.inserted);
+        assert!(retry.launch_result.unwrap().is_ok());
+        assert_eq!(retry.record.session_id, original_session_id);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn definitive_failure_is_lost_with_its_real_reason() {
         let pool = pool().await;
         let task_id = Uuid::new_v4();

@@ -60,6 +60,34 @@ impl ManagedTaskEffect {
         pool: &SqlitePool,
         effect: NewManagedTaskEffect<'_>,
     ) -> Result<(Self, bool), ManagedTaskEffectError> {
+        let adopted = sqlx::query(
+            "UPDATE managed_task_effects
+             SET owner_instance_id = ?, lease_id = ?, retryable = 0,
+                 reason = NULL, retry_after_seconds = NULL,
+                 updated_at = datetime('now', 'subsec')
+             WHERE task_id = ? AND epoch = ? AND request_hash = ? AND kind = ?
+               AND state = 'pending' AND retryable = 1",
+        )
+        .bind(effect.owner_instance_id)
+        .bind(effect.lease_id)
+        .bind(effect.task_id)
+        .bind(effect.epoch)
+        .bind(effect.request_hash)
+        .bind(effect.kind)
+        .execute(pool)
+        .await?
+        .rows_affected()
+            == 1;
+
+        if adopted {
+            return Ok((
+                Self::find(pool, effect.task_id, effect.epoch)
+                    .await?
+                    .ok_or(sqlx::Error::RowNotFound)?,
+                true,
+            ));
+        }
+
         let inserted = sqlx::query(
             "INSERT INTO managed_task_effects
              (task_id, epoch, request_hash, kind, workspace_id, session_id, owner_instance_id, lease_id)
