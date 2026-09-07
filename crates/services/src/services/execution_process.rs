@@ -365,6 +365,13 @@ async fn stream_logs_to_writer(
                                 execution_id,
                                 e
                             );
+                            // A write or fsync failure is not a display
+                            // issue: continuing would create an unrecorded
+                            // execution. Use the same exactly-once stop path
+                            // as admission refusal.
+                            if let Some(stop) = on_log_limit.take() {
+                                stop().await;
+                            }
                         }
                     }
                 }

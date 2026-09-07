@@ -357,7 +357,7 @@ pub async fn read_execution_log_range_bytes(
 fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
     let index_path = process_log_frame_index_path(path);
     let frames = stream_intersecting_frames(&index_path, start, end)?;
-    if frames.is_empty() {
+    if !frames_cover_range(&frames, start, end) {
         // A sidecar may be absent or have a torn final write. The Zstd stream
         // remains the owner, so recover from it rather than claiming no logs.
         return read_range_by_streaming_decode(path, start, end);
@@ -395,6 +395,23 @@ fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>>
         })?);
     }
     Ok(output)
+}
+
+fn frames_cover_range(frames: &[LogFrame], start: u64, end: u64) -> bool {
+    if start == end {
+        return true;
+    }
+    let mut covered_until = start;
+    for frame in frames {
+        if frame.start > covered_until || frame.end < frame.start {
+            return false;
+        }
+        covered_until = covered_until.max(frame.end);
+        if covered_until >= end {
+            return true;
+        }
+    }
+    false
 }
 
 fn stream_intersecting_frames(path: &Path, start: u64, end: u64) -> io::Result<Vec<LogFrame>> {
@@ -585,6 +602,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captured_records_keep_the_original_bytes_and_bound_frame_memory() {
+        // Capture metadata must not rewrite the provider payload: migrations
+        // verify this same byte stream by hash before publishing replacements.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proc.jsonl.zst");
+        let payload = format!("{{\"payload\":\"{}\"}}\n", "é".repeat(40_000));
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        assert_eq!(
+            writer.append_jsonl_line(&payload).await.unwrap(),
+            LogAppend::Written
+        );
+        drop(writer);
+
+        assert_eq!(
+            read_execution_log_range_bytes(&path, 0, payload.len() as u64)
+                .await
+                .unwrap(),
+            payload.as_bytes()
+        );
+        let owner = tokio::fs::read(&path).await.unwrap();
+        assert!(
+            owner
+                .windows(b"captured_at".len())
+                .any(|w| w == b"captured_at")
+        );
+        assert!(
+            read_frame_index(&process_log_frame_index_path(&path))
+                .await
+                .unwrap()
+                .len()
+                > 1
+        );
+    }
+
+    #[tokio::test]
     async fn each_published_frame_is_independently_decodable() {
         // A corrupted/new tail must not make previously indexed evidence
         // unreadable after restart.
@@ -629,6 +681,34 @@ mod tests {
         assert_eq!(
             read_execution_log_range(&path, 0, 8).await.unwrap(),
             "recover\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_sidecar_never_hides_a_published_owner_tail() {
+        // A crash after owner fsync but before index publication leaves a
+        // valid frame without its locator. Reopening or reading must retain it
+        // rather than returning a convincing but incomplete prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proc.jsonl.zst");
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        writer.append_control_line("first\n").await.unwrap();
+        writer.append_control_line("second\n").await.unwrap();
+        drop(writer);
+        let index = process_log_frame_index_path(&path);
+        let first_line = tokio::fs::read_to_string(&index)
+            .await
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        tokio::fs::write(&index, format!("{first_line}\n"))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_execution_log_range(&path, 0, 13).await.unwrap(),
+            "first\nsecond\n"
         );
     }
 
