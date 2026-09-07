@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use anyhow;
 use axum::{
     Extension, Router,
-    extract::{Path, Query, State, ws::Message},
+    extract::{Multipart, Path, Query, State, ws::Message},
     http::header,
     middleware::from_fn_with_state,
     response::{IntoResponse, Json as ResponseJson},
@@ -55,6 +55,13 @@ struct StopExecutionProcessRequest {
 struct RawLogRangeQuery {
     start: u64,
     end: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactUploadQuery {
+    /// Original producer-relative path, if it differs from the uploaded name.
+    original_path: Option<String>,
+    producer_ref: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +198,57 @@ async fn get_raw_log_range(
         )
         .body(axum::body::Body::from(bytes))
         .map_err(|error| ApiError::BadRequest(error.to_string()))
+}
+
+/// Durable producer entry point for checkpoints and reports. Artifact bytes
+/// are deduplicated by their attachment hash, while every upload produces an
+/// occurrence row owned by this execution.
+async fn upload_execution_artifact(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<ArtifactUploadQuery>,
+    mut multipart: Multipart,
+) -> Result<ResponseJson<ApiResponse<db::models::execution_artifact::ExecutionArtifact>>, ApiError>
+{
+    while let Some(field) = multipart.next_field().await? {
+        if field.name() != Some("artifact") {
+            continue;
+        }
+        let filename = field.file_name().unwrap_or("artifact.bin").to_owned();
+        let original_path = query.original_path.as_deref().unwrap_or(&filename);
+        let file = deployment
+            .file()
+            .store_stream(field.into_stream(), &filename, None)
+            .await?;
+        let occurrence = deployment
+            .file()
+            .retain_execution_artifact(
+                execution_process.id,
+                original_path,
+                query.producer_ref.as_deref(),
+                &file,
+            )
+            .await?;
+        return Ok(ResponseJson(ApiResponse::success(occurrence)));
+    }
+    Err(ApiError::File(
+        services::services::file::FileError::NotFound,
+    ))
+}
+
+async fn get_execution_artifact(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+    Path(occurrence_id): Path<Uuid>,
+) -> Result<ResponseJson<ApiResponse<db::models::execution_artifact::ExecutionArtifact>>, ApiError>
+{
+    let occurrence = deployment
+        .file()
+        .get_execution_artifact(occurrence_id)
+        .await?
+        .filter(|artifact| artifact.execution_id == execution_process.id)
+        .ok_or_else(|| ApiError::File(services::services::file::FileError::NotFound))?;
+    Ok(ResponseJson(ApiResponse::success(occurrence)))
 }
 
 async fn stream_raw_logs_ws(
@@ -531,6 +589,10 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .route("/repo-states", get(get_execution_process_repo_states))
         .route("/normalized-snapshot", get(get_normalized_log_snapshot))
         .route("/raw-log", get(get_raw_log_range))
+        .route("/artifacts", post(upload_execution_artifact))
+        .route("/artifacts/{occurrence_id}", get(get_execution_artifact))
+        .route("/artifacts", post(upload_execution_artifact))
+        .route("/artifacts/{occurrence_id}", get(get_execution_artifact))
         .route("/raw-logs/ws", get(stream_raw_logs_ws))
         .route("/normalized-logs/ws", get(stream_normalized_logs_ws))
         .layer(from_fn_with_state(
