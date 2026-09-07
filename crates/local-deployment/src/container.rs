@@ -843,12 +843,10 @@ impl LocalContainerService {
         let err = child.inner().stderr.take().expect("no stderr");
 
         // Map stdout bytes -> LogMsg::Stdout
-        let out = ReaderStream::new(out)
-            .map_ok(|chunk| LogMsg::Stdout(String::from_utf8_lossy(&chunk).into_owned()));
+        let out = utils::stream_lines::utf8_chunks(ReaderStream::new(out)).map_ok(LogMsg::Stdout);
 
         // Map stderr bytes -> LogMsg::Stderr
-        let err = ReaderStream::new(err)
-            .map_ok(|chunk| LogMsg::Stderr(String::from_utf8_lossy(&chunk).into_owned()));
+        let err = utils::stream_lines::utf8_chunks(ReaderStream::new(err)).map_ok(LogMsg::Stderr);
 
         let writer = ExecutionLogWriter::new_for_execution(process.session_id, id).await?;
         let container = self.clone();

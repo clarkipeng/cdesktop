@@ -108,6 +108,9 @@ const ZSTD_SKIPPABLE_FRAME_MAGIC: u32 = 0x184D_2A50;
 pub struct ExecutionLogWriter {
     path: PathBuf,
     file: tokio::fs::File,
+    // Lock a separate native control file: Windows byte-range locks on the
+    // owner itself would prevent other handles from reading live evidence.
+    _writer_lock: std::fs::File,
     index: Option<tokio::fs::File>,
     written: u64,
     uncompressed_offset: u64,
@@ -133,18 +136,31 @@ impl ExecutionLogWriter {
         path: PathBuf,
         reserve_bytes: u64,
     ) -> std::io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
-        let file = file.into_std().await;
-        fs2::FileExt::try_lock_exclusive(&file)?;
-        let written = file.metadata()?.len();
+        let owner_path = path.clone();
+        let (file, writer_lock) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let parent = owner_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            crate::durable_fs::create_dir_all(parent)?;
+            let writer_lock = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(owner_path.with_extension("zst.lock"))?;
+            fs2::FileExt::try_lock_exclusive(&writer_lock)?;
+            if !owner_path.exists() {
+                crate::durable_fs::publish_noclobber(
+                    tempfile::NamedTempFile::new_in(parent)?,
+                    &owner_path,
+                )?;
+            }
+            let file = std::fs::OpenOptions::new().append(true).open(owner_path)?;
+            Ok((file, writer_lock))
+        })
+        .await
+        .map_err(io::Error::other)??;
         let file = tokio::fs::File::from_std(file);
+        let written = file.metadata().await?.len();
         let index_path = process_log_frame_index_path(&path);
         let index = tokio::fs::OpenOptions::new()
             .create(true)
@@ -156,13 +172,10 @@ impl ExecutionLogWriter {
         // range. Refuse to append after a torn owner instead of reusing an
         // offset based on a stale sidecar.
         let recovered = scan_owner(&path).await?;
-        file.sync_all().await?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::File::open(parent).await?.sync_all().await?;
-        }
         Ok(Self {
             path,
             file,
+            _writer_lock: writer_lock,
             index,
             written,
             uncompressed_offset: recovered.uncompressed_bytes,

@@ -130,6 +130,14 @@ async fn get_normalized_log_snapshot(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<NormalizedLogSnapshot>>, ApiError> {
+    // A live normalizer may still be processing the last raw message when its
+    // process ends. Only historical replay awaits all normalizers and can
+    // establish a complete bounded view; a live snapshot remains provisional.
+    let live_view = deployment
+        .container()
+        .get_msg_store_by_id(&execution_process.id)
+        .await
+        .is_some();
     let Some(mut stream) = deployment
         .container()
         .stream_normalized_logs(&execution_process.id)
@@ -144,7 +152,8 @@ async fn get_normalized_log_snapshot(
     let mut patch_count = 0;
     let mut skipped_patch_count = 0;
     let mut complete = false;
-    let mut incomplete_reason = None;
+    let mut incomplete_reason = live_view
+        .then(|| "live normalized view is provisional; read again after finalization".to_owned());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
     while patch_count < 100_000 {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

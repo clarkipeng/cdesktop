@@ -7,6 +7,7 @@ pub mod assets;
 pub mod browser;
 pub mod command_ext;
 pub mod diff;
+pub mod durable_fs;
 pub mod execution_logs;
 pub mod http_headers;
 pub mod jwt;

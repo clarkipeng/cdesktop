@@ -98,7 +98,7 @@ impl FileService {
     pub fn new(pool: SqlitePool) -> Result<Self, FileError> {
         let cache_dir = utils::cache_dir().join("attachments");
         let legacy_cache_dir = utils::cache_dir().join("images");
-        fs::create_dir_all(&cache_dir)?;
+        utils::durable_fs::create_dir_all(&cache_dir)?;
         Ok(Self {
             cache_dir,
             legacy_cache_dir,
@@ -223,11 +223,10 @@ impl FileService {
             // A unique physical generation prevents GC of an old row from
             // unlinking a later equal-byte publication. Publish durable bytes
             // before the DB reference; uncertain commits must not delete them.
-            staged
-                .temp
-                .persist_noclobber(cache_dir.join(&staged.data.file_path))
-                .map_err(|error| error.error)?;
-            fs::File::open(cache_dir)?.sync_all()?;
+            utils::durable_fs::publish_noclobber(
+                staged.temp,
+                &cache_dir.join(&staged.data.file_path),
+            )?;
             Ok(staged.data)
         })
         .await
