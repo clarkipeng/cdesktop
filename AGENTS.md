@@ -1,7 +1,8 @@
 # Repository Guidelines
 
-Read [TASTE.md](TASTE.md) first: the founder-set taste that decides judgment calls.
-This file holds only what is specific to this repository. When the two seem to disagree, TASTE.md wins and this file gets fixed.
+Read [TASTE.md](TASTE.md) for how we make decisions before starting work.
+This file gives the repository's commands, workflow, and safety rules; linked docs explain the details.
+Apply TASTE within these rules. Fix conflicting instructions where they are written instead of adding another copy.
 
 ## Project Structure & Module Organization
 - `crates/`: Rust workspace crates - `server` (API + bins), `db` (SQLx models/migrations), `executors`, `services`, `utils`, `git` (Git operations), `api-types` (shared API types for local + remote), `review` (PR review tool), `deployment`, `local-deployment`, `remote`.
@@ -57,3 +58,14 @@ Do not manually edit shared/remote-types.ts, instead edit crates/remote/src/bin/
 ## Security & Config Tips
 - Use `.env` for local overrides; never commit secrets. Key envs: `FRONTEND_PORT`, `BACKEND_PORT`, `HOST` 
 - Dev ports and assets are managed by `scripts/setup-dev-environment.js`.
+
+## Delivery
+
+Open a draft pull request after the relevant local checks pass.
+Review the changes before marking it ready; merge as one commit (squash) once required checks pass.
+
+## Shell commands
+
+Keep descriptions and other text from being run as commands.
+For example, put a pull request description in `description.md`, then use `gh pr create --body-file description.md`.
+That reads the file as text; it does not run code written inside it.
