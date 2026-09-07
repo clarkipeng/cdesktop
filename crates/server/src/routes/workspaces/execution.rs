@@ -149,7 +149,10 @@ pub async fn stop_workspace_execution(
     Extension(workspace): Extension<Workspace>,
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
-    deployment.container().try_stop(&workspace, false).await;
+    deployment
+        .container()
+        .stop_workspace(&workspace, false)
+        .await?;
 
     deployment
         .track_if_analytics_allowed(

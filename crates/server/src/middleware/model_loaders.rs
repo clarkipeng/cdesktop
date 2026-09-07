@@ -99,9 +99,14 @@ pub async fn load_tag_middleware(
     Ok(next.run(request).await)
 }
 
+#[derive(serde::Deserialize)]
+pub struct SessionPath {
+    pub session_id: Uuid,
+}
+
 pub async fn load_session_middleware(
     State(deployment): State<DeploymentImpl>,
-    Path(session_id): Path<Uuid>,
+    Path(SessionPath { session_id }): Path<SessionPath>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {

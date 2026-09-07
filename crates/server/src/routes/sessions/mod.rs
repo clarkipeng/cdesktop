@@ -438,12 +438,17 @@ async fn list_commands(
     )))
 }
 
+#[derive(Deserialize)]
+struct CommandPath {
+    command_id: Uuid,
+}
+
 /// Cancel one durable command before it has a running execution. The model
 /// performs the state transition and running-process check atomically.
 async fn cancel_command(
     Extension(session): Extension<Session>,
     State(deployment): State<DeploymentImpl>,
-    Path(command_id): Path<Uuid>,
+    Path(CommandPath { command_id }): Path<CommandPath>,
 ) -> Result<ResponseJson<ApiResponse<SessionCommand>>, ApiError> {
     match SessionCommand::cancel(&deployment.db().pool, session.id, command_id).await? {
         CancelSessionCommand::Cancelled(command) => Ok(ResponseJson(ApiResponse::success(command))),
@@ -642,6 +647,55 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 #[cfg(test)]
 mod peer_delivery_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nested_cancel_extracts_both_ids_by_name() {
+        let app = Router::new().nest(
+            "/sessions/{session_id}",
+            Router::new().route(
+                "/commands/{command_id}/cancel",
+                post(
+                    |Path(parent): Path<crate::middleware::SessionPath>,
+                     Path(command): Path<CommandPath>| async move {
+                        format!("{}:{}", parent.session_id, command.command_id)
+                    },
+                ),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let session_id = Uuid::new_v4();
+        let command_id = Uuid::new_v4();
+        let response = client
+            .post(format!(
+                "http://{address}/sessions/{session_id}/commands/{command_id}/cancel"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.text().await.unwrap(),
+            format!("{session_id}:{command_id}")
+        );
+        for (parent, command) in [
+            ("invalid".into(), command_id.to_string()),
+            (session_id.to_string(), "invalid".into()),
+        ] {
+            let response = client
+                .post(format!(
+                    "http://{address}/sessions/{parent}/commands/{command}/cancel"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn peer_delivery_refuses_self_before_enqueue() {
