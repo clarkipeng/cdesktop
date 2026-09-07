@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -114,6 +117,7 @@ struct RunningExecution {
     child: Arc<RwLock<AsyncGroupChild>>,
     cancel: Option<CancellationToken>,
     requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
+    cleanup_acknowledged: Arc<AtomicBool>,
     // Every stop caller can await the same monitor, including after its own
     // graceful timeout. No caller can consume or detach another caller's wait.
     completion: MonitorCompletion,
@@ -127,19 +131,36 @@ impl RunningExecution {
     ) -> Result<(), ContainerError> {
         self.requested_stop.lock().await.get_or_insert(status);
         if matches!(self.completion.clone().now_or_never(), Some(Ok(()))) {
-            return Ok(());
+            return self.acknowledged_cleanup();
         }
+        let mut cleanup_unacknowledged = false;
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
             if let Ok(Ok(())) = tokio::time::timeout(grace, self.completion.clone()).await {
                 return Ok(());
             }
+            cleanup_unacknowledged = true;
         }
         command::kill_process_group(&mut *self.child.write().await).await?;
         self.completion
             .clone()
             .await
-            .map_err(|error| ContainerError::Other(anyhow!("exit monitor failed: {error}")))
+            .map_err(|error| ContainerError::Other(anyhow!("exit monitor failed: {error}")))?;
+        if cleanup_unacknowledged {
+            return Err(ContainerError::Other(anyhow!(
+                "executor cleanup was not acknowledged before forced termination"
+            )));
+        }
+        Ok(())
+    }
+
+    fn acknowledged_cleanup(&self) -> Result<(), ContainerError> {
+        if self.cancel.is_some() && !self.cleanup_acknowledged.load(Ordering::SeqCst) {
+            return Err(ContainerError::Other(anyhow!(
+                "executor cleanup was not acknowledged before termination"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -606,6 +627,7 @@ impl LocalContainerService {
         capture: JoinHandle<CaptureOutcome>,
         drain_expired: CancellationToken,
         requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
+        cleanup_acknowledged: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let exec_id = *exec_id;
         let msg_stores = self.msg_stores.clone();
@@ -626,14 +648,9 @@ impl LocalContainerService {
                 // Some coding agent processes do not automatically exit after processing the user request; instead the executor
                 // signals when processing has finished to gracefully kill the process.
                 exit_result = &mut exit_signal_future => {
-                    // Executor signaled completion: kill group and use the provided result
-                    {
-                        let mut child = child.write().await;
-                        if let Err(err) = command::kill_process_group(&mut child).await {
-                            tracing::error!("Failed to kill process group after exit signal: {} {}", exec_id, err);
-                        }
+                    if exit_result.is_ok() {
+                        cleanup_acknowledged.store(true, Ordering::SeqCst);
                     }
-
                     NormalizedProcessOutcome::from_executor_signal(exit_result)
                 }
                 // Process exit
@@ -643,9 +660,22 @@ impl LocalContainerService {
                     )
                 }
             };
+            // Reap the captured process group regardless of whether the
+            // executor protocol or the OS leader exit won the race. The PGID
+            // remains usable after leader exit; start_kill() alone does not
+            // establish that same-group descendants are gone.
+            {
+                let mut child = child.write().await;
+                if let Err(err) = command::kill_process_group(&mut child).await {
+                    tracing::error!(
+                        "Failed to kill process group after completion: {} {}",
+                        exec_id,
+                        err
+                    );
+                }
+            }
             // Descendants must close inherited pipes before the recorder can
             // drain. Process completion is published only after durable capture.
-            let _ = child.write().await.start_kill();
             let captured =
                 finish_raw_capture(capture, drain_expired, RAW_CAPTURE_DRAIN_GRACE).await;
             let recording_failed = !matches!(captured, Ok(CaptureOutcome::Complete));
@@ -659,7 +689,10 @@ impl LocalContainerService {
             let outcome = if recording_failed {
                 NormalizedProcessOutcome::recording_failed()
             } else if let Some(status) = requested_stop.as_ref() {
-                NormalizedProcessOutcome::requested_stop(status.clone())
+                NormalizedProcessOutcome::requested_stop(
+                    status.clone(),
+                    !cleanup_acknowledged.load(Ordering::SeqCst),
+                )
             } else {
                 outcome
             };
@@ -1089,9 +1122,15 @@ enum NormalizedProcessOutcome {
 }
 
 impl NormalizedProcessOutcome {
-    fn requested_stop(status: ExecutionProcessStatus) -> Self {
-        let outcome = (status == ExecutionProcessStatus::Killed)
-            .then(|| NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped));
+    fn requested_stop(status: ExecutionProcessStatus, cleanup_unavailable: bool) -> Self {
+        let outcome = (status == ExecutionProcessStatus::Killed).then(|| {
+            let outcome = NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped);
+            if cleanup_unavailable {
+                outcome.with_provider_code("executor_cleanup_unavailable")
+            } else {
+                outcome
+            }
+        });
         Self::RequestedStop { status, outcome }
     }
     fn from_executor_signal(
@@ -1509,6 +1548,7 @@ impl ContainerService for LocalContainerService {
         let mut running = self.running_executions.write().await;
         let child = Arc::new(RwLock::new(spawned.child));
         let requested_stop = Arc::new(Mutex::new(None));
+        let cleanup_acknowledged = Arc::new(AtomicBool::new(false));
         let capture = tokio::spawn(capture);
         let monitor = self.spawn_exit_monitor(
             &execution_process.id,
@@ -1517,6 +1557,7 @@ impl ContainerService for LocalContainerService {
             capture,
             drain_expired,
             requested_stop.clone(),
+            cleanup_acknowledged.clone(),
         );
         running.insert(
             execution_process.id,
@@ -1524,6 +1565,7 @@ impl ContainerService for LocalContainerService {
                 child,
                 cancel: spawned.cancel,
                 requested_stop,
+                cleanup_acknowledged,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1886,6 +1928,7 @@ mod tests {
                 child: child.clone(),
                 cancel: None,
                 requested_stop: Arc::new(Mutex::new(None)),
+                cleanup_acknowledged: Arc::new(AtomicBool::new(false)),
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1954,6 +1997,7 @@ mod tests {
                 child: Arc::new(RwLock::new(child)),
                 cancel: has_graceful_cancel.then(CancellationToken::new),
                 requested_stop: Arc::new(Mutex::new(None)),
+                cleanup_acknowledged: Arc::new(AtomicBool::new(false)),
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1982,16 +2026,16 @@ mod tests {
                 first.abort();
             }
             drop(producer); // Only now can the recorder seal and release its lease.
-            tokio::time::timeout(Duration::from_secs(5), second)
+            let second = tokio::time::timeout(Duration::from_secs(5), second)
                 .await
                 .unwrap()
-                .unwrap()
                 .unwrap();
+            assert_eq!(second.is_err(), has_graceful_cancel);
             let first = first.await;
             if abandon_first {
                 assert!(first.unwrap_err().is_cancelled());
             } else {
-                first.unwrap().unwrap();
+                assert_eq!(first.unwrap().is_err(), has_graceful_cancel);
             }
             assert!(terminal.load(Ordering::SeqCst));
             assert_eq!(
@@ -2027,6 +2071,7 @@ mod tests {
             child: Arc::new(RwLock::new(child)),
             cancel: Some(CancellationToken::new()),
             requested_stop: Arc::new(Mutex::new(None)),
+            cleanup_acknowledged: Arc::new(AtomicBool::new(false)),
             completion: monitor
                 .map(|result| result.map_err(Arc::new))
                 .boxed()
@@ -2045,7 +2090,8 @@ mod tests {
 
     #[test]
     fn requested_stop_is_killed_and_classified_as_user_stopped() {
-        let outcome = NormalizedProcessOutcome::requested_stop(ExecutionProcessStatus::Killed);
+        let outcome =
+            NormalizedProcessOutcome::requested_stop(ExecutionProcessStatus::Killed, false);
         assert_eq!(
             outcome.status_and_exit_code(),
             (ExecutionProcessStatus::Killed, None)
@@ -2053,6 +2099,17 @@ mod tests {
         assert_eq!(
             outcome.normalized_outcome().unwrap().class,
             ExecutionOutcomeClass::UserStopped
+        );
+
+        let unavailable =
+            NormalizedProcessOutcome::requested_stop(ExecutionProcessStatus::Killed, true);
+        assert_eq!(
+            unavailable
+                .normalized_outcome()
+                .unwrap()
+                .provider_code
+                .as_deref(),
+            Some("executor_cleanup_unavailable")
         );
     }
 

@@ -790,6 +790,8 @@ impl Codex {
         let new_stdout = create_stdout_pipe_writer(&mut child)?;
         let (exit_signal_tx, exit_signal_rx) = tokio::sync::oneshot::channel();
         let cancel = tokio_util::sync::CancellationToken::new();
+        let rpc_cancel = tokio_util::sync::CancellationToken::new();
+        let reader_shutdown = tokio_util::sync::CancellationToken::new();
 
         let auto_approve = matches!(
             (&self.sandbox, &self.ask_for_approval),
@@ -800,7 +802,9 @@ impl Codex {
         let repo_context = env.repo_context.clone();
         let commit_reminder = env.commit_reminder;
         let commit_reminder_prompt = env.commit_reminder_prompt.clone();
-        let cancel_for_task = cancel.clone();
+        let rpc_cancel_for_task = rpc_cancel.clone();
+        let reader_shutdown_for_task = reader_shutdown.clone();
+        let cancel_for_protocol = cancel.clone();
 
         tokio::spawn(async move {
             let exit_signal_tx = ExitSignalSender::new(exit_signal_tx);
@@ -815,16 +819,39 @@ impl Codex {
                 repo_context,
                 commit_reminder,
                 commit_reminder_prompt,
-                cancel_for_task.clone(),
+                rpc_cancel_for_task.clone(),
             );
             let rpc_peer = JsonRpcPeer::spawn(
                 child_stdin,
                 child_stdout,
                 client.clone(),
                 exit_signal_tx.clone(),
-                cancel_for_task,
+                reader_shutdown_for_task.clone(),
             );
             client.connect(rpc_peer);
+
+            // A never-cancelled execution must not be retained by this dormant
+            // waiter after the JSON-RPC reader observes normal completion.
+            let cancellation_client = Arc::downgrade(&client);
+            let reader_closed = client.reader_closed();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel_for_protocol.cancelled() => {}
+                    _ = reader_closed.cancelled() => return,
+                }
+                let Some(cancellation_client) = cancellation_client.upgrade() else {
+                    return;
+                };
+                match cancellation_client.cancel_execution().await {
+                    Ok(()) => reader_shutdown_for_task.cancel(),
+                    Err(error) => {
+                        // Leave the reader and app server alive. The container's
+                        // bounded fallback owns termination and must not mistake
+                        // a failed protocol cleanup for an acknowledgement.
+                        tracing::warn!("Codex cancellation was not acknowledged: {error}");
+                    }
+                }
+            });
 
             let result = async {
                 client.initialize().await?;
