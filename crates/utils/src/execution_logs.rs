@@ -85,6 +85,18 @@ pub enum LogAppend {
     Unavailable,
 }
 
+/// Metadata is written in a Zstd skippable frame beside its raw JSONL bytes.
+/// Consequently a normal Zstd reader sees *exactly* the producer bytes while
+/// recovery can rebuild metadata without trusting the sidecar index.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CapturedLogMetadata {
+    captured_at: Option<chrono::DateTime<chrono::Utc>>,
+    capture_order: u64,
+}
+
+const MAX_FRAME_UNCOMPRESSED_BYTES: usize = 64 * 1024;
+const ZSTD_SKIPPABLE_FRAME_MAGIC: u32 = 0x184D_2A50;
+
 pub struct ExecutionLogWriter {
     path: PathBuf,
     file: tokio::fs::File,
@@ -92,6 +104,7 @@ pub struct ExecutionLogWriter {
     written: u64,
     uncompressed_offset: u64,
     control_bytes: u64,
+    capture_order: u64,
     free_disk_reserve_bytes: u64,
     /// A recording-unavailable marker was attempted for this writer.
     marker_written: bool,
@@ -139,6 +152,7 @@ impl ExecutionLogWriter {
             written,
             uncompressed_offset,
             control_bytes: 0,
+            capture_order: uncompressed_offset,
             free_disk_reserve_bytes: reserve_bytes,
             marker_written: false,
         })
@@ -155,11 +169,25 @@ impl ExecutionLogWriter {
     /// Each append becomes a complete Zstd frame. A crash can therefore only
     /// leave an unindexed tail; previously published ranges remain readable.
     pub async fn append_jsonl_line(&mut self, jsonl_line: &str) -> std::io::Result<LogAppend> {
-        if !self.has_disk_reserve()? {
+        if !self.has_disk_reserve(jsonl_line.len())? {
             self.publish_unavailable_marker().await?;
             return Ok(LogAppend::Unavailable);
         }
-        self.write_frame(jsonl_line).await?;
+        self.write_captured_record(jsonl_line, Some(chrono::Utc::now()))
+            .await?;
+        Ok(LogAppend::Written)
+    }
+
+    /// Legacy records predate capture instrumentation. Their unknown capture
+    /// time is explicit rather than invented during migration.
+    pub async fn append_legacy_jsonl_line(
+        &mut self,
+        jsonl_line: &str,
+    ) -> std::io::Result<LogAppend> {
+        if !self.has_disk_reserve(jsonl_line.len())? {
+            return Ok(LogAppend::Unavailable);
+        }
+        self.write_captured_record(jsonl_line, None).await?;
         Ok(LogAppend::Written)
     }
 
@@ -172,17 +200,54 @@ impl ExecutionLogWriter {
             return Ok(LogAppend::Blocked);
         }
         self.control_bytes = self.control_bytes.saturating_add(len);
-        self.write_frame(jsonl_line).await?;
+        if !self.has_disk_reserve(jsonl_line.len())? {
+            return Ok(LogAppend::Unavailable);
+        }
+        self.write_frame(jsonl_line, None, self.capture_order)
+            .await?;
         Ok(LogAppend::Written)
     }
 
-    fn has_disk_reserve(&self) -> io::Result<bool> {
+    fn has_disk_reserve(&self, incoming_bytes: usize) -> io::Result<bool> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        Ok(fs2::available_space(parent)? >= self.free_disk_reserve_bytes)
+        // Compression can expand incompressible input. Reserve the complete
+        // pending payload plus frame/index overhead before admitting it.
+        let required = self
+            .free_disk_reserve_bytes
+            .saturating_add(incoming_bytes as u64)
+            .saturating_add(8 * 1024);
+        Ok(fs2::available_space(parent)? >= required)
     }
 
-    async fn write_frame(&mut self, jsonl_line: &str) -> std::io::Result<()> {
-        let input = jsonl_line.as_bytes().to_vec();
+    async fn write_frame(
+        &mut self,
+        bytes: &str,
+        captured_at: Option<chrono::DateTime<chrono::Utc>>,
+        capture_order: u64,
+    ) -> std::io::Result<()> {
+        for (segment_index, input) in bytes
+            .as_bytes()
+            .chunks(MAX_FRAME_UNCOMPRESSED_BYTES)
+            .enumerate()
+        {
+            self.write_segment(
+                input,
+                captured_at,
+                capture_order.saturating_add(segment_index as u64),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn write_segment(
+        &mut self,
+        input: &[u8],
+        captured_at: Option<chrono::DateTime<chrono::Utc>>,
+        capture_order: u64,
+    ) -> std::io::Result<()> {
+        let input = input.to_vec();
+        let input_len = input.len() as u64;
         let compressed = tokio::task::spawn_blocking(move || {
             let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
             encoder.include_checksum(true)?;
@@ -191,17 +256,27 @@ impl ExecutionLogWriter {
         })
         .await
         .map_err(io::Error::other)??;
+        let metadata = CapturedLogMetadata {
+            captured_at,
+            capture_order,
+        };
+        let metadata = serde_json::to_vec(&metadata).map_err(io::Error::other)?;
+        let mut skippable = Vec::with_capacity(8 + metadata.len());
+        skippable.extend_from_slice(&ZSTD_SKIPPABLE_FRAME_MAGIC.to_le_bytes());
+        skippable.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        skippable.extend_from_slice(&metadata);
         let offset = self.written;
         self.file.write_all(&compressed).await?;
+        self.file.write_all(&skippable).await?;
         self.file.sync_data().await?;
         let frame = LogFrame {
             start: self.uncompressed_offset,
-            end: self
-                .uncompressed_offset
-                .saturating_add(jsonl_line.len() as u64),
+            end: self.uncompressed_offset.saturating_add(input_len),
             compressed_start: offset,
-            compressed_end: offset.saturating_add(compressed.len() as u64),
-            captured_at: Some(chrono::Utc::now()),
+            compressed_end: offset
+                .saturating_add(compressed.len() as u64)
+                .saturating_add(skippable.len() as u64),
+            captured_at,
         };
         let mut line = serde_json::to_vec(&frame).map_err(io::Error::other)?;
         line.push(b'\n');
@@ -210,6 +285,16 @@ impl ExecutionLogWriter {
         self.written = frame.compressed_end;
         self.uncompressed_offset = frame.end;
         Ok(())
+    }
+
+    async fn write_captured_record(
+        &mut self,
+        jsonl_line: &str,
+        captured_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> io::Result<()> {
+        let order = self.capture_order;
+        self.capture_order = self.capture_order.saturating_add(1);
+        self.write_frame(jsonl_line, captured_at, order).await
     }
 
     async fn publish_unavailable_marker(&mut self) -> std::io::Result<()> {
@@ -239,6 +324,18 @@ pub async fn read_execution_log_file(path: &Path) -> std::io::Result<String> {
 /// stable across compression changes and permit a later external index to
 /// reference evidence without owning a duplicate codec or transcript copy.
 pub async fn read_execution_log_range(path: &Path, start: u64, end: u64) -> io::Result<String> {
+    String::from_utf8(read_execution_log_range_bytes(path, start, end).await?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Reads exact original bytes. This is the native integration contract: ranges
+/// are offsets in the decompressed producer stream, not UTF-8 character
+/// positions or compressed offsets.
+pub async fn read_execution_log_range_bytes(
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> io::Result<Vec<u8>> {
     if end < start {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -257,7 +354,7 @@ pub async fn read_execution_log_range(path: &Path, start: u64, end: u64) -> io::
         .map_err(io::Error::other)?
 }
 
-fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<String> {
+fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
     let index_path = process_log_frame_index_path(path);
     let frames = stream_intersecting_frames(&index_path, start, end)?;
     if frames.is_empty() {
@@ -297,7 +394,7 @@ fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<String> 
             )
         })?);
     }
-    String::from_utf8(output).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(output)
 }
 
 fn stream_intersecting_frames(path: &Path, start: u64, end: u64) -> io::Result<Vec<LogFrame>> {
@@ -326,7 +423,7 @@ fn stream_intersecting_frames(path: &Path, start: u64, end: u64) -> io::Result<V
     Ok(frames)
 }
 
-fn read_range_by_streaming_decode(path: &Path, start: u64, end: u64) -> io::Result<String> {
+fn read_range_by_streaming_decode(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
     let mut decoder = zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?;
     let mut offset = 0u64;
     let mut output = Vec::with_capacity((end - start) as usize);
@@ -347,7 +444,30 @@ fn read_range_by_streaming_decode(path: &Path, start: u64, end: u64) -> io::Resu
             break;
         }
     }
-    String::from_utf8(output).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(output)
+}
+
+/// Streams a decompressed owner into SHA-256 without materialising it. Used by
+/// migration before publication so legacy bytes are never pruned on a merely
+/// plausible conversion.
+pub async fn execution_log_sha256(path: &Path) -> io::Result<[u8; 32]> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use sha2::Digest;
+
+        let mut decoder = zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?;
+        let mut digest = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = decoder.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(digest.finalize().into());
+            }
+            digest.update(&buffer[..read]);
+        }
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 async fn uncompressed_len_by_streaming_decode(path: &Path) -> io::Result<u64> {

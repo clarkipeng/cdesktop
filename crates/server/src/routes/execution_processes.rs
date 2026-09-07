@@ -4,6 +4,7 @@ use anyhow;
 use axum::{
     Extension, Router,
     extract::{Path, Query, State, ws::Message},
+    http::header,
     middleware::from_fn_with_state,
     response::{IntoResponse, Json as ResponseJson},
     routing::{get, post},
@@ -48,6 +49,12 @@ struct StopExecutionProcessRequest {
     /// Caller-owned, deterministic key used to replay a lost stop response.
     #[serde(default)]
     dedupe_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLogRangeQuery {
+    start: u64,
+    end: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +166,31 @@ async fn get_normalized_log_snapshot(
         skipped_patch_count,
         complete,
     })))
+}
+
+/// Returns exact producer bytes for a bounded decompressed range. The range
+/// namespace is `(execution_process.id, [start, end))`; it remains stable when
+/// Zstd frames or the rebuildable sidecar change.
+async fn get_raw_log_range(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    Query(query): Query<RawLogRangeQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let path = utils::execution_logs::process_log_file_path(
+        execution_process.session_id,
+        execution_process.id,
+    );
+    let bytes =
+        utils::execution_logs::read_execution_log_range_bytes(&path, query.start, query.end)
+            .await?;
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(
+            "x-cdesktop-source-range",
+            format!("[{}, {})", query.start, query.end),
+        )
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 async fn stream_raw_logs_ws(
@@ -498,6 +530,7 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .route("/stop", post(stop_execution_process))
         .route("/repo-states", get(get_execution_process_repo_states))
         .route("/normalized-snapshot", get(get_normalized_log_snapshot))
+        .route("/raw-log", get(get_raw_log_range))
         .route("/raw-logs/ws", get(stream_raw_logs_ws))
         .route("/normalized-logs/ws", get(stream_normalized_logs_ws))
         .layer(from_fn_with_state(

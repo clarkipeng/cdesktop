@@ -19,8 +19,8 @@ use sqlx::SqlitePool;
 use tokio::{sync::RwLock, task::JoinHandle};
 use utils::{
     execution_logs::{
-        ExecutionLogWriter, LogAppend, legacy_process_log_file_path_in_root, process_log_file_path,
-        read_execution_log_file,
+        ExecutionLogWriter, LogAppend, execution_log_sha256, legacy_process_log_file_path_in_root,
+        process_log_file_path, read_execution_log_file,
     },
     log_msg::LogMsg,
     msg_store::MsgStore,
@@ -122,7 +122,7 @@ pub async fn migrate_execution_logs_to_files() -> Result<()> {
                         line.push('\n');
                     }
                     source_hash.update(line.as_bytes());
-                    match writer.append_jsonl_line(&line).await? {
+                    match writer.append_legacy_jsonl_line(&line).await? {
                         LogAppend::Written => {}
                         LogAppend::Blocked | LogAppend::Unavailable => {
                             anyhow::bail!(
@@ -141,8 +141,7 @@ pub async fn migrate_execution_logs_to_files() -> Result<()> {
                 }
 
                 drop(writer);
-                let published = read_execution_log_file(&temp_path).await?;
-                if Sha256::digest(published.as_bytes()) != source_hash.finalize() {
+                if execution_log_sha256(&temp_path).await? != source_hash.finalize().as_slice() {
                     anyhow::bail!(
                         "cannot migrate execution {}: decompressed hash mismatch",
                         p.execution_id

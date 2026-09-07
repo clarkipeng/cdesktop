@@ -9,6 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use db::models::file::{File, WorkspaceAttachment};
 use deployment::Deployment;
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use services::services::file::FileError;
 use tokio::fs::File as TokioFile;

@@ -208,7 +208,7 @@ impl FileService {
         original_path: &str,
         producer_ref: Option<&str>,
         file: &File,
-    ) -> Result<(), FileError> {
+    ) -> Result<ExecutionArtifact, FileError> {
         ExecutionArtifact::create(
             &self.pool,
             execution_id,
@@ -216,8 +216,17 @@ impl FileService {
             original_path,
             producer_ref,
         )
-        .await?;
-        Ok(())
+        .await
+        .map_err(FileError::Database)
+    }
+
+    pub async fn get_execution_artifact(
+        &self,
+        occurrence_id: Uuid,
+    ) -> Result<Option<ExecutionArtifact>, FileError> {
+        ExecutionArtifact::find_by_id(&self.pool, occurrence_id)
+            .await
+            .map_err(FileError::Database)
     }
 
     pub async fn delete_orphaned_files(&self) -> Result<(), FileError> {
