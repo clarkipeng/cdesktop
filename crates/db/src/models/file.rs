@@ -154,7 +154,7 @@ impl File {
             "DELETE FROM attachments WHERE id = ?
              AND NOT EXISTS (SELECT 1 FROM workspace_attachments WHERE attachment_id = attachments.id)
              AND NOT EXISTS (SELECT 1 FROM execution_artifacts WHERE attachment_id = attachments.id)
-             RETURNING *",
+             RETURNING id, file_path, original_name, mime_type, size_bytes, hash, created_at, updated_at",
         )
         .bind(id)
         .fetch_optional(executor)

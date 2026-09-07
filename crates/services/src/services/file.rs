@@ -106,6 +106,13 @@ struct StagedUpload {
     data: CreateFile,
 }
 
+/// SQL preparation precedes filesystem publication. No reference write may be
+/// deferred until after publish_upload; only the transaction commit follows it.
+struct PreparedUpload {
+    file: File,
+    staged: Option<StagedUpload>,
+}
+
 impl FileService {
     pub fn new(pool: SqlitePool) -> Result<Self, FileError> {
         let cache_dir = utils::cache_dir().join("attachments");
@@ -150,7 +157,8 @@ impl FileService {
             .stage_upload(stream, original_filename, max_size_bytes)
             .await?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (file, _) = self.publish_upload(&mut tx, staged).await?;
+        let prepared = Self::prepare_upload(&mut tx, staged).await?;
+        let (file, _) = self.publish_upload(prepared).await?;
         tx.commit().await?;
         Ok(file)
     }
@@ -220,31 +228,39 @@ impl FileService {
         })
     }
 
-    async fn publish_upload(
-        &self,
+    async fn prepare_upload(
         conn: &mut sqlx::SqliteConnection,
         staged: StagedUpload,
-    ) -> Result<(File, PublicationDurability), FileError> {
-        if let Some(existing) = File::find_by_hash(&mut *conn, &staged.data.hash).await? {
-            // Never acknowledge retention of missing or corrupt original bytes.
-            let durability = self.verify_cached_file(&existing).await?;
-            return Ok((existing, durability));
+    ) -> Result<PreparedUpload, FileError> {
+        if let Some(file) = File::find_by_hash(&mut *conn, &staged.data.hash).await? {
+            return Ok(PreparedUpload { file, staged: None });
         }
-        let cache_dir = self.cache_dir.clone();
-        let (data, durability) =
-            tokio::task::spawn_blocking(move || -> Result<_, std::io::Error> {
-                // A unique physical generation prevents GC of an old row from
-                // unlinking a later equal-byte publication. Publish durable bytes
-                // before the DB reference; uncertain commits must not delete them.
-                let durability = utils::durable_fs::publish_noclobber(
-                    staged.temp,
-                    &cache_dir.join(&staged.data.file_path),
-                )?;
-                Ok((staged.data, durability))
+        Ok(PreparedUpload {
+            file: File::create(conn, &staged.data).await?,
+            staged: Some(staged),
+        })
+    }
+
+    async fn publish_upload(
+        &self,
+        prepared: PreparedUpload,
+    ) -> Result<(File, PublicationDurability), FileError> {
+        let PreparedUpload { file, staged } = prepared;
+        let durability = if let Some(staged) = staged {
+            let destination = self.cache_dir.join(&file.file_path);
+            tokio::task::spawn_blocking(move || {
+                // A unique physical generation prevents stale GC unlinking a
+                // later equal-byte publication. The prepared SQL is uncommitted;
+                // durable bytes still precede COMMIT. Keep uncertain outcomes.
+                utils::durable_fs::publish_noclobber(staged.temp, &destination)
             })
             .await
-            .map_err(std::io::Error::other)??;
-        Ok((File::create(conn, &data).await?, durability))
+            .map_err(std::io::Error::other)??
+        } else {
+            // Never acknowledge missing or corrupt original bytes on dedup.
+            self.verify_cached_file(&file).await?
+        };
+        Ok((file, durability))
     }
 
     async fn verify_cached_file(&self, file: &File) -> Result<PublicationDurability, FileError> {
@@ -342,8 +358,9 @@ impl FileService {
         E: std::fmt::Display,
     {
         let staged = self.stage_upload(stream, original_filename, None).await?;
-        // Upload first, then serialize publication with GC and other writers.
-        // No committed attachment can exist without its retained occurrence.
+        // Stage first, then serialize SQL preparation and publication with GC.
+        // Known reference refusal must happen before publishing a blob, while
+        // no committed attachment can exist without its durable retained bytes.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(mut artifact) = ExecutionArtifact::find_by_publication(
             &mut tx,
@@ -362,20 +379,21 @@ impl FileService {
             {
                 return Err(FileError::PublicationConflict);
             }
-            // Reuse the normal blob verification without publishing any new
-            // bytes or occurrence. The staging file drops on every replay.
-            let (file, durability) = self.publish_upload(&mut tx, staged).await?;
+            // Prepare any policy upgrade before verifying the existing bytes;
+            // verification failure rolls it back. Never publish another blob.
             artifact.upgrade_commit_policy(&mut tx).await?;
+            let durability = self.verify_cached_file(&file).await?;
+            drop(staged);
             tx.commit().await?;
             return self
                 .artifact_receipt(artifact, file, durability, confirm)
                 .await;
         }
-        let (file, durability) = self.publish_upload(&mut tx, staged).await?;
+        let prepared = Self::prepare_upload(&mut tx, staged).await?;
         let artifact = ExecutionArtifact::create(
             &mut tx,
             publication.execution_id,
-            file.id,
+            prepared.file.id,
             publication.original_path,
             original_filename,
             publication.producer_ref,
@@ -383,6 +401,7 @@ impl FileService {
         )
         .await
         .map_err(FileError::Database)?;
+        let (file, durability) = self.publish_upload(prepared).await?;
         tx.commit().await?;
         self.artifact_receipt(artifact, file, durability, confirm)
             .await
@@ -823,6 +842,23 @@ mod evidence_tests {
                 .durable_commit,
             "GET must not upgrade historical provenance"
         );
+        let cached_path = service.get_absolute_path(&file);
+        fs::write(&cached_path, b"corrupt old source").unwrap();
+        assert!(
+            publish_receipt(&service, execution, "old", b"old source")
+                .await
+                .is_err()
+        );
+        assert!(
+            !service
+                .get_execution_artifact(occurrence_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .durable_commit,
+            "a prepared upgrade must roll back when byte verification fails"
+        );
+        fs::write(cached_path, b"old source").unwrap();
         let replay = publish_receipt(&service, execution, "old", b"old source")
             .await
             .unwrap();
@@ -879,6 +915,12 @@ mod evidence_tests {
                 .unwrap(),
             0
         );
+        assert_eq!(fs::read_dir(&service.cache_dir).unwrap().count(), 0);
+        assert!(matches!(
+            publish_receipt(&service, execution, "weak", b"retained candidate").await,
+            Err(FileError::Database(sqlx::Error::Protocol(_)))
+        ));
+        assert_eq!(fs::read_dir(&service.cache_dir).unwrap().count(), 0);
     }
 
     #[cfg(not(windows))]
@@ -1012,8 +1054,8 @@ mod evidence_tests {
 
     #[tokio::test]
     async fn failed_occurrence_rolls_back_attachment_publication() {
-        // A failure after durable blob publication but before retention must
-        // never expose a committed unretained attachment as successful evidence.
+        // Refused SQL preparation must leave neither retained rows nor a
+        // published blob generation that a retry could leak again.
         let (_dir, service, _) = fixture().await;
         assert!(
             publish(&service, Uuid::new_v4(), "missing-execution", b"bytes")
@@ -1034,6 +1076,7 @@ mod evidence_tests {
                 .unwrap(),
             0
         );
+        assert_eq!(fs::read_dir(&service.cache_dir).unwrap().count(), 0);
     }
 
     #[tokio::test]
