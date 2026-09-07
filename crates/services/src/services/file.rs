@@ -250,6 +250,13 @@ impl FileService {
         if size != file.size_bytes as u64 || format!("{:x}", hash.finalize()) != file.hash {
             return Err(std::io::Error::other("cached artifact hash mismatch").into());
         }
+        #[cfg(not(windows))]
+        {
+            let path = self.get_absolute_path(file);
+            tokio::task::spawn_blocking(move || utils::durable_fs::confirm_publication(&path))
+                .await
+                .map_err(std::io::Error::other)??;
+        }
         Ok(())
     }
 

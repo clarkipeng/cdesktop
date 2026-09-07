@@ -46,7 +46,7 @@ pub fn publish_noclobber(temp: tempfile::NamedTempFile, destination: &Path) -> i
     {
         temp.persist_noclobber(destination)
             .map_err(|error| error.error)?;
-        sync_parent(destination)
+        sync_parent_chain(destination)
     }
     #[cfg(windows)]
     {
@@ -68,7 +68,7 @@ pub fn confirm_publication(path: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         fs::File::open(path)?.sync_all()?;
-        sync_parent(path)
+        sync_parent_chain(path)
     }
     #[cfg(windows)]
     {
@@ -91,6 +91,40 @@ fn sync_parent(path: &Path) -> io::Result<()> {
             .unwrap_or_else(|| Path::new(".")),
     )?
     .sync_all()
+}
+
+/// An existing directory is not proof that its entry survived a previous
+/// creator's crash. Confirm the entire reachable chain, including intermediate
+/// symlink targets, before acknowledging publication. Native paths must remain
+/// quiescent; this is not protection against an external directory rename.
+#[cfg(not(windows))]
+fn sync_parent_chain(path: &Path) -> io::Result<()> {
+    sync_parent_chain_with(path, |directory| fs::File::open(directory)?.sync_all())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_chain_with(
+    path: &Path,
+    mut sync: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut pending = vec![std::path::absolute(path)?];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(path) = pending.pop() {
+        for entry in path.ancestors() {
+            if !visited.insert(entry.to_owned()) {
+                continue;
+            }
+            if let Some(parent) = entry.parent() {
+                sync(parent)?;
+                if fs::symlink_metadata(entry)?.file_type().is_symlink() {
+                    // canonicalize alone would hide intermediate symlinks and
+                    // leave their own parent entries unconfirmed.
+                    pending.push(parent.join(fs::read_link(entry)?));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -131,6 +165,8 @@ fn move_write_through(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    #[cfg(not(windows))]
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -149,5 +185,66 @@ mod tests {
         retry.write_all(b"different").unwrap();
         assert!(publish_noclobber(retry, &destination).is_err());
         assert_eq!(fs::read(destination).unwrap(), b"first");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn confirmation_visits_existing_ancestors_and_propagates_their_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("legacy/session/processes");
+        fs::create_dir_all(&directory).unwrap();
+        let owner = directory.join("owner");
+        fs::write(&owner, b"already published").unwrap();
+        let mut visited = Vec::new();
+        sync_parent_chain_with(&owner, |directory| {
+            visited.push(directory.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert!(visited.starts_with(&[
+            directory,
+            root.path().join("legacy/session"),
+            root.path().join("legacy"),
+            root.path().to_owned(),
+        ]));
+        assert!(visited.contains(&PathBuf::from("/")));
+        let error = sync_parent_chain_with(&owner, |directory| {
+            if directory == root.path().join("legacy") {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "ancestor refused sync",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmation_includes_intermediate_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for name in ["visible", "intermediate", "target"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        fs::write(root.join("target/owner"), b"original").unwrap();
+        symlink("../target", root.join("intermediate/link")).unwrap();
+        symlink("../intermediate/link", root.join("visible/link")).unwrap();
+        let owner = root.join("visible/link/owner");
+        let mut visited = Vec::new();
+        sync_parent_chain_with(&owner, |directory| {
+            visited.push(directory.canonicalize()?);
+            Ok(())
+        })
+        .unwrap();
+        for name in ["visible", "intermediate", "target"] {
+            assert!(visited.contains(&root.join(name)), "missing {name}");
+        }
+        confirm_publication(&owner).unwrap();
     }
 }

@@ -40,6 +40,7 @@ enum Fault {
     BeforePublish,
     AfterPublish,
     BeforePrune,
+    ConfirmPublication,
 }
 
 pub async fn migrate_execution_logs(
@@ -160,15 +161,20 @@ async fn migrate_inner(
             .collect(),
     );
 
-    let durability_error = if report.published {
-        None // publish_noclobber has just confirmed this exact owner.
-    } else {
-        let path = owner.clone();
-        tokio::task::spawn_blocking(move || utils::durable_fs::confirm_publication(&path))
-            .await?
-            .err()
-            .map(|error| format!("publication durability unavailable: {error}"))
-    };
+    // A successful file rename alone does not confirm pre-existing ancestor
+    // entries. Every prune requires the same complete publication barrier.
+    let path = owner.clone();
+    let durability = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if fault == Some(Fault::ConfirmPublication) {
+            return Err(std::io::Error::other("injected ancestor sync failure"));
+        }
+        utils::durable_fs::confirm_publication(&path)
+    })
+    .await?;
+    let durability_error = durability
+        .err()
+        .map(|error| format!("publication durability unavailable: {error}"));
 
     #[cfg(test)]
     ensure!(fault != Some(Fault::BeforePrune), "injected before prune");
@@ -428,6 +434,50 @@ mod tests {
         }
     }
 
+    fn assert_verified_source(source: &LegacySource) {
+        if cfg!(windows) {
+            assert!(
+                matches!(source, LegacySource::Retained { reason } if reason.contains("publication durability unavailable"))
+            );
+        } else {
+            assert_eq!(*source, LegacySource::Pruned);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_ancestor_confirmation_retains_every_original_on_publish_and_replay() {
+        let fixture = Fixture::new().await;
+        let bytes = "{\"Stdout\":\"retained\"}\n";
+        fixture.sql(bytes).await;
+        fixture.write_plain(bytes).await;
+        for newly_published in [true, false] {
+            let report = migrate_inner(
+                &fixture.pool,
+                fixture.root.path(),
+                fixture.execution,
+                0,
+                Some(Fault::ConfirmPublication),
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.published, newly_published);
+            for source in [&report.sql, &report.plain_file] {
+                assert!(
+                    matches!(source, LegacySource::Retained { reason } if reason.contains("injected ancestor sync failure"))
+                );
+            }
+            assert_eq!(fixture.count().await, 1);
+            assert_eq!(
+                tokio::fs::read_to_string(fixture.plain()).await.unwrap(),
+                bytes
+            );
+            assert!(fixture.owner().exists());
+        }
+        let retry = fixture.migrate().await.unwrap();
+        assert_verified_source(&retry.sql);
+        assert_verified_source(&retry.plain_file);
+    }
+
     #[tokio::test]
     async fn sql_rows_and_insertion_metadata_survive_roundtrip_without_global_prune() {
         let fixture = Fixture::new().await;
@@ -457,10 +507,10 @@ mod tests {
 
         let report = fixture.migrate().await.unwrap();
         assert!(report.published);
-        assert_eq!(report.sql, LegacySource::Pruned);
-        assert_eq!(report.plain_file, LegacySource::Pruned);
-        assert_eq!(fixture.count().await, 0);
-        assert!(!fixture.plain().exists());
+        assert_verified_source(&report.sql);
+        assert_verified_source(&report.plain_file);
+        assert_eq!(fixture.count().await, if cfg!(windows) { 3 } else { 0 });
+        assert_eq!(fixture.plain().exists(), cfg!(windows));
         let summary = scan_owner(&fixture.owner()).await.unwrap();
         assert_eq!(summary.legacy_sql_fingerprint, Some(original.fingerprint));
         assert_eq!(summary.outcome, Some(CaptureOutcome::LegacyUnknown));
@@ -479,7 +529,11 @@ mod tests {
         let replay = fixture.migrate().await.unwrap();
         assert!(!replay.published);
         assert_eq!(replay.owner_sha256, report.owner_sha256);
-        assert_eq!(replay.sql, LegacySource::Absent);
+        if cfg!(windows) {
+            assert_verified_source(&replay.sql);
+        } else {
+            assert_eq!(replay.sql, LegacySource::Absent);
+        }
     }
 
     #[tokio::test]
@@ -496,7 +550,7 @@ mod tests {
         .await
         .unwrap();
         fixture.sql("{\"Stdout\":\"old row\"}\n").await;
-        assert_eq!(fixture.migrate().await.unwrap().sql, LegacySource::Pruned);
+        assert_verified_source(&fixture.migrate().await.unwrap().sql);
     }
 
     #[tokio::test]
@@ -535,13 +589,8 @@ mod tests {
                 .unwrap();
             }
             let retry = fixture.migrate().await.unwrap();
-            if cfg!(windows) && fault != Fault::BeforePublish {
-                assert!(matches!(retry.sql, LegacySource::Retained { .. }));
-                assert!(matches!(retry.plain_file, LegacySource::Retained { .. }));
-            } else {
-                assert_eq!(retry.sql, LegacySource::Pruned);
-                assert_eq!(retry.plain_file, LegacySource::Pruned);
-            }
+            assert_verified_source(&retry.sql);
+            assert_verified_source(&retry.plain_file);
         }
     }
 
@@ -565,7 +614,7 @@ mod tests {
         assert!(fixture.migrate().await.is_err());
         assert_eq!(fixture.count().await, 1);
         drop(lease);
-        assert_eq!(fixture.migrate().await.unwrap().sql, LegacySource::Pruned);
+        assert_verified_source(&fixture.migrate().await.unwrap().sql);
     }
 
     #[tokio::test]
@@ -653,7 +702,7 @@ mod tests {
         assert!(!fixture.owner().exists());
         let report = fixture.migrate().await.unwrap();
         assert_eq!(report.sql, LegacySource::Absent);
-        assert_eq!(report.plain_file, LegacySource::Pruned);
+        assert_verified_source(&report.plain_file);
         assert_eq!(
             scan_owner(&fixture.owner()).await.unwrap().outcome,
             Some(CaptureOutcome::LegacyUnknown)

@@ -188,6 +188,10 @@ impl ExecutionLogWriter {
                     &owner_path,
                 )?;
             }
+            // Reopening after an interrupted publication must not bypass its
+            // ancestor barrier merely because the owner is readable now.
+            #[cfg(not(windows))]
+            crate::durable_fs::confirm_publication(&owner_path)?;
             let file = std::fs::OpenOptions::new().append(true).open(owner_path)?;
             Ok((file, writer_lock))
         })
