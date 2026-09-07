@@ -14,12 +14,12 @@ use db::{
 };
 use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
+use tokio::{sync::RwLock, task::JoinHandle};
 use utils::{
-    assets::prod_asset_dir_path,
     execution_logs::{
-        ExecutionLogWriter, LogAppend, process_log_file_path, process_log_file_path_in_root,
+        ExecutionLogWriter, LogAppend, legacy_process_log_file_path_in_root, process_log_file_path,
         read_execution_log_file,
     },
     log_msg::LogMsg,
@@ -85,24 +85,31 @@ pub async fn migrate_execution_logs_to_files() -> Result<()> {
                 let p = res?;
 
                 let path = process_log_file_path(p.session_id, p.execution_id);
-                if path.exists() {
+                if path.exists()
+                    && utils::execution_logs::process_log_frame_index_path(&path).exists()
+                {
                     if let Some(pb) = &pb {
                         pb.inc(1);
                     }
                     return Ok::<(), anyhow::Error>(());
                 }
 
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+                // Publish only a verified pair. A crash before either rename
+                // leaves the database source authoritative; a crash after
+                // publication leaves it redundant but readable.
+                let temp_path = path.with_extension("zst.tmp");
+                let temp_index_path =
+                    utils::execution_logs::process_log_frame_index_path(&temp_path);
+                let final_index_path = utils::execution_logs::process_log_frame_index_path(&path);
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                let _ = tokio::fs::remove_file(&temp_index_path).await;
+                if !path.exists() {
+                    // An index without its compressed owner was never
+                    // published. The database rows remain authoritative.
+                    let _ = tokio::fs::remove_file(&final_index_path).await;
                 }
-
-                let temp_path = path.with_extension("jsonl.tmp");
-                let mut file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&temp_path)
-                    .await?;
+                let mut writer = ExecutionLogWriter::open(temp_path.clone()).await?;
+                let mut source_hash = Sha256::new();
 
                 let mut logs_stream =
                     ExecutionProcessLogs::stream_log_lines_by_execution_id(&pool, &p.execution_id);
@@ -114,19 +121,35 @@ pub async fn migrate_execution_logs_to_files() -> Result<()> {
                     if !line.ends_with('\n') {
                         line.push('\n');
                     }
-                    file.write_all(line.as_bytes()).await?;
+                    source_hash.update(line.as_bytes());
+                    match writer.append_jsonl_line(&line).await? {
+                        LogAppend::Written => {}
+                        LogAppend::Blocked | LogAppend::Unavailable => {
+                            anyhow::bail!(
+                                "cannot migrate execution {}: recording storage unavailable",
+                                p.execution_id
+                            );
+                        }
+                    }
                 }
 
                 if !has_logs {
-                    let _ = tokio::fs::remove_file(&temp_path).await;
                     if let Some(pb) = &pb {
                         pb.inc(1);
                     }
                     return Ok::<(), anyhow::Error>(());
                 }
 
-                file.sync_all().await?;
-                tokio::fs::rename(temp_path, path).await?;
+                drop(writer);
+                let published = read_execution_log_file(&temp_path).await?;
+                if Sha256::digest(published.as_bytes()) != source_hash.finalize() {
+                    anyhow::bail!(
+                        "cannot migrate execution {}: decompressed hash mismatch",
+                        p.execution_id
+                    );
+                }
+                tokio::fs::rename(&temp_index_path, &final_index_path).await?;
+                tokio::fs::rename(&temp_path, &path).await?;
 
                 let c = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
@@ -324,13 +347,14 @@ async fn stream_logs_to_writer(
 
                     match log_writer.append_jsonl_line(&jsonl_line_with_newline).await {
                         Ok(LogAppend::Written) => {}
-                        Ok(LogAppend::Blocked) => {
-                            // A limit that only drops logs is a log eater: the
-                            // agent keeps burning tokens and disk with nothing
-                            // recorded. The first block stops the process tree.
+                        Ok(LogAppend::Blocked | LogAppend::Unavailable) => {
+                            // Continuing without durable evidence is a loss.
+                            // The first recording refusal stops the process
+                            // tree; terminalization remains on its normal
+                            // exactly-once exit-monitor path.
                             if let Some(stop) = on_log_limit.take() {
                                 tracing::warn!(
-                                    "Execution {} log hit its byte cap; stopping the process tree: blocked(limit)",
+                                    "Execution {} recording stopped; stopping the process tree",
                                     execution_id
                                 );
                                 stop().await;
@@ -410,24 +434,20 @@ async fn read_execution_logs_for_execution(
             || format!("read execution log file for execution {execution_id}"),
         )?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if cfg!(debug_assertions) {
-                // Convenience for local development with a clone of a prod db. Read only access to prod logs.
-                let prod_path =
-                    process_log_file_path_in_root(&prod_asset_dir_path(), session_id, execution_id);
-                match read_execution_log_file(&prod_path).await {
-                    Ok(contents) => return Ok(Some(contents)),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        return Err(err).with_context(|| {
-                            format!(
-                                "read execution log file for execution {execution_id} from {}",
-                                prod_path.display()
-                            )
-                        });
-                    }
-                }
+            // Legacy files remain readable until the verified startup
+            // migration publishes their compressed native replacement.
+            let legacy_path = legacy_process_log_file_path_in_root(
+                &utils::assets::asset_dir(),
+                session_id,
+                execution_id,
+            );
+            match tokio::fs::read_to_string(&legacy_path).await {
+                Ok(contents) => Ok(Some(contents)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error).with_context(|| {
+                    format!("read legacy execution log file for execution {execution_id}")
+                }),
             }
-            Ok(None)
         }
         Err(e) => Err(e).with_context(|| {
             format!(
@@ -475,15 +495,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_cap_stops_the_process_tree_once() {
-        // The H1 defect: hitting the cap used to drop the line and let the
-        // agent keep running, so it burned tokens and disk while producing a
-        // log nobody was recording. The first blocked append must stop the
-        // owned process tree - and only once, however many lines follow.
+    async fn recording_refusal_stops_the_process_tree_once() {
+        // A disk-reserve refusal must not let an agent continue with evidence
+        // silently missing. The owned process tree stops once, however many
+        // messages arrive after recording became unavailable.
         let dir = tempfile::tempdir().unwrap();
-        let writer = ExecutionLogWriter::with_max_bytes(dir.path().join("proc.jsonl"), 24)
-            .await
-            .unwrap();
+        let writer =
+            ExecutionLogWriter::with_free_disk_reserve(dir.path().join("proc.jsonl.zst"), u64::MAX)
+                .await
+                .unwrap();
 
         let stops = Arc::new(AtomicUsize::new(0));
         let counter = stops.clone();
@@ -511,11 +531,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logs_under_the_cap_never_stop_the_process() {
-        // The mirror invariant: a healthy execution must not be killed by the
-        // machinery that exists to kill runaway ones.
+    async fn healthy_recording_never_stops_the_process() {
+        // A healthy execution must not be killed by the evidence writer.
         let dir = tempfile::tempdir().unwrap();
-        let writer = ExecutionLogWriter::with_max_bytes(dir.path().join("proc.jsonl"), 1024 * 1024)
+        let writer = ExecutionLogWriter::open(dir.path().join("proc.jsonl.zst"))
             .await
             .unwrap();
 

@@ -32,6 +32,8 @@ similar = "2"
 dirs = "5.0"
 thiserror = { workspace = true }
 command-group = { version = "5.0", features = ["with-tokio"] }
+fs2 = "0.4"
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

@@ -9,13 +9,11 @@ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use crate::{log_msg::LogMsg, stream_lines::LinesStreamExt};
 
-/// One cap, shared with the durable jsonl writer
-/// (`execution_logs::max_execution_log_bytes`). These used to disagree by
-/// ~6x: the UI mirrored up to 100MB of history that the durable log had
-/// already stopped recording, so a restart silently lost everything past the
-/// file cap. Reading the same number means what the UI shows is what survives.
+/// The UI mirror is deliberately bounded independently from durable evidence.
+/// A reconnect can read the full compressed log; live listeners only need a
+/// recent working set.
 static HISTORY_BYTES: std::sync::LazyLock<usize> =
-    std::sync::LazyLock::new(|| crate::execution_logs::max_execution_log_bytes() as usize);
+    std::sync::LazyLock::new(|| crate::execution_logs::in_memory_log_bytes() as usize);
 
 #[derive(Clone)]
 struct StoredMsg {
@@ -183,13 +181,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn in_memory_history_cap_matches_the_durable_log_cap() {
-        // Regression guard for the split cap: the UI mirror used to hold 100MB
-        // while the durable file stopped at 16MB, so a restart silently lost
-        // ~84MB of history the user had been reading.
+    fn in_memory_history_has_its_own_small_bound() {
+        // Retention and UI memory have different jobs. The latter must stay
+        // bounded even when the former grows until disk admission refuses it.
         assert_eq!(
             *HISTORY_BYTES,
-            crate::execution_logs::DEFAULT_MAX_EXECUTION_LOG_BYTES as usize
+            crate::execution_logs::DEFAULT_IN_MEMORY_LOG_BYTES as usize
         );
     }
 

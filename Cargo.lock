@@ -13391,6 +13391,7 @@ dependencies = [
  "command-group",
  "directories",
  "dirs 5.0.1",
+ "fs2",
  "futures",
  "json-patch 2.0.0",
  "jsonwebtoken",
@@ -13417,6 +13418,7 @@ dependencies = [
  "which",
  "windows-sys 0.61.2",
  "winreg 0.55.0",
+ "zstd",
 ]
 
 [[package]]
