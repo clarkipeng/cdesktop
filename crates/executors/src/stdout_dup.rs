@@ -80,6 +80,7 @@ pub fn spawn_local_output_process()
         child,
         exit_signal: None,
         cancel: None,
+        cancel_confirmed: None,
     };
 
     Ok((spawned, writer))

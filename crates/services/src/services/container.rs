@@ -14,6 +14,7 @@ use db::{
             CreateExecutionProcess, ExecutionContext, ExecutionProcess, ExecutionProcessError,
             ExecutionProcessRunReason, ExecutionProcessStatus,
         },
+        execution_process_outcome::ExecutionProcessOutcome,
         execution_process_repo_state::{
             CreateExecutionProcessRepoState, ExecutionProcessRepoState,
         },
@@ -1122,6 +1123,25 @@ pub trait ContainerService {
         for process in running {
             self.stop_execution(&process, ExecutionProcessStatus::Killed)
                 .await?;
+        }
+        if let Some(id) =
+            ExecutionProcessOutcome::unconfirmed_cleanup_for_workspace(pool, workspace.id).await?
+        {
+            return Err(ContainerError::Other(anyhow!(
+                "execution {id} has unconfirmed tool cleanup"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn confirm_execution_cleanup(&self, id: Uuid) -> Result<(), ContainerError> {
+        if ExecutionProcessOutcome::find_by_execution_process_id(&self.db().pool, id)
+            .await?
+            .is_some_and(|value| value.outcome.0.cleanup_confirmed == Some(false))
+        {
+            return Err(ContainerError::Other(anyhow!(
+                "execution {id} has unconfirmed tool cleanup"
+            )));
         }
         Ok(())
     }

@@ -398,6 +398,9 @@ pub struct SpawnedChild {
     pub exit_signal: Option<ExecutorExitSignal>,
     /// Container → Executor: signals when container wants to cancel the execution
     pub cancel: Option<CancellationToken>,
+    /// Adapters with tools outside the outer process group signal this only
+    /// after their own cleanup protocol succeeds. Process exit is not an ack.
+    pub cancel_confirmed: Option<CancellationToken>,
 }
 
 impl From<AsyncGroupChild> for SpawnedChild {
@@ -406,6 +409,7 @@ impl From<AsyncGroupChild> for SpawnedChild {
             child,
             exit_signal: None,
             cancel: None,
+            cancel_confirmed: None,
         }
     }
 }

@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -117,7 +114,7 @@ struct RunningExecution {
     child: Arc<RwLock<AsyncGroupChild>>,
     cancel: Option<CancellationToken>,
     requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
-    cleanup_acknowledged: Arc<AtomicBool>,
+    cancel_confirmed: Option<CancellationToken>,
     // Every stop caller can await the same monitor, including after its own
     // graceful timeout. No caller can consume or detach another caller's wait.
     completion: MonitorCompletion,
@@ -133,29 +130,26 @@ impl RunningExecution {
         if matches!(self.completion.clone().now_or_never(), Some(Ok(()))) {
             return self.acknowledged_cleanup();
         }
-        let mut cleanup_unacknowledged = false;
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
             if let Ok(Ok(())) = tokio::time::timeout(grace, self.completion.clone()).await {
-                return Ok(());
+                return self.acknowledged_cleanup();
             }
-            cleanup_unacknowledged = true;
         }
         command::kill_process_group(&mut *self.child.write().await).await?;
         self.completion
             .clone()
             .await
             .map_err(|error| ContainerError::Other(anyhow!("exit monitor failed: {error}")))?;
-        if cleanup_unacknowledged {
-            return Err(ContainerError::Other(anyhow!(
-                "executor cleanup was not acknowledged before forced termination"
-            )));
-        }
-        Ok(())
+        self.acknowledged_cleanup()
     }
 
     fn acknowledged_cleanup(&self) -> Result<(), ContainerError> {
-        if self.cancel.is_some() && !self.cleanup_acknowledged.load(Ordering::SeqCst) {
+        if self
+            .cancel_confirmed
+            .as_ref()
+            .is_some_and(|ack| !ack.is_cancelled())
+        {
             return Err(ContainerError::Other(anyhow!(
                 "executor cleanup was not acknowledged before termination"
             )));
@@ -627,7 +621,7 @@ impl LocalContainerService {
         capture: JoinHandle<CaptureOutcome>,
         drain_expired: CancellationToken,
         requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
-        cleanup_acknowledged: Arc<AtomicBool>,
+        cancel_confirmed: Option<CancellationToken>,
     ) -> JoinHandle<()> {
         let exec_id = *exec_id;
         let msg_stores = self.msg_stores.clone();
@@ -648,9 +642,6 @@ impl LocalContainerService {
                 // Some coding agent processes do not automatically exit after processing the user request; instead the executor
                 // signals when processing has finished to gracefully kill the process.
                 exit_result = &mut exit_signal_future => {
-                    if exit_result.is_ok() {
-                        cleanup_acknowledged.store(true, Ordering::SeqCst);
-                    }
                     NormalizedProcessOutcome::from_executor_signal(exit_result)
                 }
                 // Process exit
@@ -689,21 +680,29 @@ impl LocalContainerService {
             let outcome = if recording_failed {
                 NormalizedProcessOutcome::recording_failed()
             } else if let Some(status) = requested_stop.as_ref() {
-                NormalizedProcessOutcome::requested_stop(
-                    status.clone(),
-                    !cleanup_acknowledged.load(Ordering::SeqCst),
-                )
+                NormalizedProcessOutcome::requested_stop(status.clone())
             } else {
                 outcome
             };
             let (status, exit_code) = outcome.status_and_exit_code();
+
+            let mut normalized = outcome.normalized_outcome().cloned();
+            if requested_stop.is_some()
+                && let Some(ack) = &cancel_confirmed
+            {
+                normalized
+                    .get_or_insert_with(|| {
+                        NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped)
+                    })
+                    .cleanup_confirmed = Some(ack.is_cancelled());
+            }
 
             let completed_attempt = match ExecutionProcess::complete_running_attempt(
                 &db.pool,
                 exec_id,
                 status,
                 exit_code,
-                outcome.normalized_outcome(),
+                normalized.as_ref(),
             )
             .await
             {
@@ -1122,15 +1121,9 @@ enum NormalizedProcessOutcome {
 }
 
 impl NormalizedProcessOutcome {
-    fn requested_stop(status: ExecutionProcessStatus, cleanup_unavailable: bool) -> Self {
-        let outcome = (status == ExecutionProcessStatus::Killed).then(|| {
-            let outcome = NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped);
-            if cleanup_unavailable {
-                outcome.with_provider_code("executor_cleanup_unavailable")
-            } else {
-                outcome
-            }
-        });
+    fn requested_stop(status: ExecutionProcessStatus) -> Self {
+        let outcome = (status == ExecutionProcessStatus::Killed)
+            .then(|| NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped));
         Self::RequestedStop { status, outcome }
     }
     fn from_executor_signal(
@@ -1548,7 +1541,6 @@ impl ContainerService for LocalContainerService {
         let mut running = self.running_executions.write().await;
         let child = Arc::new(RwLock::new(spawned.child));
         let requested_stop = Arc::new(Mutex::new(None));
-        let cleanup_acknowledged = Arc::new(AtomicBool::new(false));
         let capture = tokio::spawn(capture);
         let monitor = self.spawn_exit_monitor(
             &execution_process.id,
@@ -1557,7 +1549,7 @@ impl ContainerService for LocalContainerService {
             capture,
             drain_expired,
             requested_stop.clone(),
-            cleanup_acknowledged.clone(),
+            spawned.cancel_confirmed.clone(),
         );
         running.insert(
             execution_process.id,
@@ -1565,7 +1557,7 @@ impl ContainerService for LocalContainerService {
                 child,
                 cancel: spawned.cancel,
                 requested_stop,
-                cleanup_acknowledged,
+                cancel_confirmed: spawned.cancel_confirmed,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1586,6 +1578,7 @@ impl ContainerService for LocalContainerService {
                 "stop requires a terminal status"
             )));
         }
+        self.confirm_execution_cleanup(execution_process.id).await?;
         let running = running_execution_for_stop(
             &self.running_executions,
             &self.scheduler_lock,
@@ -1618,7 +1611,7 @@ impl ContainerService for LocalContainerService {
                 SessionCommand::requeue_killed_execution(&self.db().pool, execution_process.id)
                     .await?;
             }
-            return Ok(());
+            return self.confirm_execution_cleanup(execution_process.id).await;
         };
         running.stop(status, Duration::from_secs(5)).await?;
         // Only the monitor publishes completion and releases capture/UI state.
@@ -1632,7 +1625,7 @@ impl ContainerService for LocalContainerService {
             )));
         }
 
-        Ok(())
+        self.confirm_execution_cleanup(execution_process.id).await
     }
 
     async fn stream_diff(
@@ -1928,7 +1921,7 @@ mod tests {
                 child: child.clone(),
                 cancel: None,
                 requested_stop: Arc::new(Mutex::new(None)),
-                cleanup_acknowledged: Arc::new(AtomicBool::new(false)),
+                cancel_confirmed: None,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1997,7 +1990,7 @@ mod tests {
                 child: Arc::new(RwLock::new(child)),
                 cancel: has_graceful_cancel.then(CancellationToken::new),
                 requested_stop: Arc::new(Mutex::new(None)),
-                cleanup_acknowledged: Arc::new(AtomicBool::new(false)),
+                cancel_confirmed: has_graceful_cancel.then(CancellationToken::new),
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -2071,7 +2064,7 @@ mod tests {
             child: Arc::new(RwLock::new(child)),
             cancel: Some(CancellationToken::new()),
             requested_stop: Arc::new(Mutex::new(None)),
-            cleanup_acknowledged: Arc::new(AtomicBool::new(false)),
+            cancel_confirmed: Some(CancellationToken::new()),
             completion: monitor
                 .map(|result| result.map_err(Arc::new))
                 .boxed()
@@ -2088,10 +2081,42 @@ mod tests {
         assert!(stopped);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_monitor_cannot_acknowledge_detached_tool_cleanup_on_retry() {
+        use command_group::AsyncCommandGroup;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .group_spawn()
+            .unwrap();
+        child.wait().await.unwrap();
+        let confirmed = CancellationToken::new();
+        let running = RunningExecution {
+            child: Arc::new(RwLock::new(child)),
+            cancel: Some(CancellationToken::new()),
+            requested_stop: Arc::new(Mutex::new(None)),
+            cancel_confirmed: Some(confirmed.clone()),
+            completion: futures::future::ready(Ok(())).boxed().shared(),
+        };
+        for _ in 0..2 {
+            assert!(
+                running
+                    .stop(ExecutionProcessStatus::Killed, Duration::from_millis(1))
+                    .await
+                    .is_err()
+            );
+        }
+        // Only the adapter's actual cleanup acknowledgement changes this fact.
+        confirmed.cancel();
+        running
+            .stop(ExecutionProcessStatus::Killed, Duration::from_millis(1))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn requested_stop_is_killed_and_classified_as_user_stopped() {
-        let outcome =
-            NormalizedProcessOutcome::requested_stop(ExecutionProcessStatus::Killed, false);
+        let outcome = NormalizedProcessOutcome::requested_stop(ExecutionProcessStatus::Killed);
         assert_eq!(
             outcome.status_and_exit_code(),
             (ExecutionProcessStatus::Killed, None)
@@ -2099,17 +2124,6 @@ mod tests {
         assert_eq!(
             outcome.normalized_outcome().unwrap().class,
             ExecutionOutcomeClass::UserStopped
-        );
-
-        let unavailable =
-            NormalizedProcessOutcome::requested_stop(ExecutionProcessStatus::Killed, true);
-        assert_eq!(
-            unavailable
-                .normalized_outcome()
-                .unwrap()
-                .provider_code
-                .as_deref(),
-            Some("executor_cleanup_unavailable")
         );
     }
 

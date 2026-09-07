@@ -264,6 +264,7 @@ impl Opencode {
             child,
             exit_signal: Some(exit_signal_rx),
             cancel: Some(cancel),
+            cancel_confirmed: None,
         })
     }
 

@@ -777,6 +777,7 @@ impl ClaudeCode {
             child,
             exit_signal: None,
             cancel: Some(cancel),
+            cancel_confirmed: None,
         })
     }
 }

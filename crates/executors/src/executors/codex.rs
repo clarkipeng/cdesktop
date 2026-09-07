@@ -790,6 +790,8 @@ impl Codex {
         let new_stdout = create_stdout_pipe_writer(&mut child)?;
         let (exit_signal_tx, exit_signal_rx) = tokio::sync::oneshot::channel();
         let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_confirmed = tokio_util::sync::CancellationToken::new();
+        let protocol_confirmed = cancel_confirmed.clone();
         let rpc_cancel = tokio_util::sync::CancellationToken::new();
         let reader_shutdown = tokio_util::sync::CancellationToken::new();
 
@@ -843,7 +845,10 @@ impl Codex {
                     return;
                 };
                 match cancellation_client.cancel_execution().await {
-                    Ok(()) => reader_shutdown_for_task.cancel(),
+                    Ok(()) => {
+                        protocol_confirmed.cancel();
+                        reader_shutdown_for_task.cancel();
+                    }
                     Err(error) => {
                         // Leave the reader and app server alive. The container's
                         // bounded fallback owns termination and must not mistake
@@ -913,6 +918,7 @@ impl Codex {
             child,
             exit_signal: Some(exit_signal_rx),
             cancel: Some(cancel),
+            cancel_confirmed: Some(cancel_confirmed),
         })
     }
 }

@@ -131,6 +131,7 @@ impl AcpAgentHarness {
             child,
             exit_signal: Some(exit_rx),
             cancel: Some(cancel),
+            cancel_confirmed: None,
         })
     }
 
@@ -184,6 +185,7 @@ impl AcpAgentHarness {
             child,
             exit_signal: Some(exit_rx),
             cancel: Some(cancel),
+            cancel_confirmed: None,
         })
     }
 
