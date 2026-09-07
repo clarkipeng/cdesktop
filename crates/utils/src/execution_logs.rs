@@ -1,5 +1,5 @@
 use std::{
-    io,
+    io::{self, BufRead, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -57,6 +57,9 @@ const FREE_DISK_RESERVE_BYTES_ENV: &str = "CDESKTOP_FREE_DISK_RESERVE_BYTES";
 /// exists to stop unbounded agent output; dropping the one line that explains
 /// why the log stopped would make the limit indistinguishable from a crash.
 const CONTROL_OVERDRAFT_BYTES: u64 = 64 * 1024;
+/// Range consumers must page. This keeps a hostile range request from turning
+/// the evidence endpoint into an unbounded allocation.
+pub const MAX_EXECUTION_LOG_RANGE_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn in_memory_log_bytes() -> u64 {
     std::env::var(IN_MEMORY_LOG_BYTES_ENV)
@@ -122,11 +125,13 @@ impl ExecutionLogWriter {
             .append(true)
             .open(&index_path)
             .await?;
-        let uncompressed_offset = read_frame_index(&index_path)
-            .await?
-            .last()
-            .map(|frame| frame.end)
-            .unwrap_or(0);
+        let uncompressed_offset = match read_frame_index(&index_path).await {
+            Ok(frames) if !frames.is_empty() => frames.last().unwrap().end,
+            Ok(_) if written == 0 => 0,
+            // The frame stream remains authoritative. Reopen recovers its
+            // complete byte length before assigning the next stable range.
+            Ok(_) | Err(_) => uncompressed_len_by_streaming_decode(&path).await?,
+        };
         Ok(Self {
             path,
             file,
@@ -178,10 +183,14 @@ impl ExecutionLogWriter {
 
     async fn write_frame(&mut self, jsonl_line: &str) -> std::io::Result<()> {
         let input = jsonl_line.as_bytes().to_vec();
-        let compressed =
-            tokio::task::spawn_blocking(move || zstd::stream::encode_all(&input[..], 3))
-                .await
-                .map_err(io::Error::other)??;
+        let compressed = tokio::task::spawn_blocking(move || {
+            let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
+            encoder.include_checksum(true)?;
+            std::io::Write::write_all(&mut encoder, &input)?;
+            encoder.finish()
+        })
+        .await
+        .map_err(io::Error::other)??;
         let offset = self.written;
         self.file.write_all(&compressed).await?;
         self.file.sync_data().await?;
@@ -219,12 +228,10 @@ impl ExecutionLogWriter {
 }
 
 pub async fn read_execution_log_file(path: &Path) -> std::io::Result<String> {
-    let end = read_frame_index(&process_log_frame_index_path(path))
-        .await?
-        .last()
-        .map(|frame| frame.end)
-        .unwrap_or(0);
-    read_execution_log_range(path, 0, end).await
+    // Kept only for the legacy snapshot adapter. New consumers must use the
+    // paged range API; this intentionally refuses instead of allocating a
+    // whole multi-gigabyte transcript.
+    read_execution_log_range(path, 0, MAX_EXECUTION_LOG_RANGE_BYTES).await
 }
 
 /// Reads the requested uncompressed byte range. Frame locators make ranges
@@ -237,28 +244,130 @@ pub async fn read_execution_log_range(path: &Path, start: u64, end: u64) -> io::
             "range end precedes start",
         ));
     }
-    let frames = read_frame_index(&process_log_frame_index_path(path)).await?;
-    let bytes = tokio::fs::read(path).await?;
-    let mut output = Vec::new();
-    for frame in frames
-        .into_iter()
-        .filter(|frame| frame.end > start && frame.start < end)
-    {
-        let compressed = &bytes[frame.compressed_start as usize..frame.compressed_end as usize];
-        let decoded = tokio::task::spawn_blocking({
-            let compressed = compressed.to_vec();
-            move || zstd::stream::decode_all(&compressed[..])
-        })
+    if end.saturating_sub(start) > MAX_EXECUTION_LOG_RANGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution log range exceeds page limit",
+        ));
+    }
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || read_range_blocking(&path, start, end))
         .await
-        .map_err(io::Error::other)??;
+        .map_err(io::Error::other)?
+}
+
+fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<String> {
+    let index_path = process_log_frame_index_path(path);
+    let frames = stream_intersecting_frames(&index_path, start, end)?;
+    if frames.is_empty() {
+        // A sidecar may be absent or have a torn final write. The Zstd stream
+        // remains the owner, so recover from it rather than claiming no logs.
+        return read_range_by_streaming_decode(path, start, end);
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut output = Vec::with_capacity((end - start) as usize);
+    for frame in frames {
+        if frame.compressed_end < frame.compressed_start
+            || frame.end < frame.start
+            || frame.compressed_end.saturating_sub(frame.compressed_start)
+                > MAX_EXECUTION_LOG_RANGE_BYTES * 2
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid execution log frame index",
+            ));
+        }
+        file.seek(SeekFrom::Start(frame.compressed_start))?;
+        let mut compressed = vec![0; (frame.compressed_end - frame.compressed_start) as usize];
+        file.read_exact(&mut compressed)?;
+        let decoded = zstd::stream::decode_all(&compressed[..])?;
+        if decoded.len() as u64 != frame.end - frame.start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution log frame length mismatch",
+            ));
+        }
         let from = start.saturating_sub(frame.start) as usize;
         let to = (end.min(frame.end) - frame.start) as usize;
-        output.extend_from_slice(&decoded[from..to]);
+        output.extend_from_slice(decoded.get(from..to).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution log range outside frame",
+            )
+        })?);
     }
     String::from_utf8(output).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+fn stream_intersecting_frames(path: &Path, start: u64, end: u64) -> io::Result<Vec<LogFrame>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut frames = Vec::new();
+    for line in io::BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => return Err(error),
+        };
+        let frame: LogFrame = match serde_json::from_str(&line) {
+            Ok(frame) => frame,
+            Err(_) => break,
+        };
+        if frame.end > start && frame.start < end {
+            frames.push(frame);
+        }
+        if frame.start >= end {
+            break;
+        }
+    }
+    Ok(frames)
+}
+
+fn read_range_by_streaming_decode(path: &Path, start: u64, end: u64) -> io::Result<String> {
+    let mut decoder = zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?;
+    let mut offset = 0u64;
+    let mut output = Vec::with_capacity((end - start) as usize);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = decoder.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk_end = offset + read as u64;
+        if chunk_end > start && offset < end {
+            let from = start.saturating_sub(offset) as usize;
+            let to = (end.min(chunk_end) - offset) as usize;
+            output.extend_from_slice(&buffer[from..to]);
+        }
+        offset = chunk_end;
+        if offset >= end {
+            break;
+        }
+    }
+    String::from_utf8(output).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+async fn uncompressed_len_by_streaming_decode(path: &Path) -> io::Result<u64> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut decoder = zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let read = decoder.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(total);
+            }
+            total = total.saturating_add(read as u64);
+        }
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct LogFrame {
     start: u64,
     end: u64,
@@ -376,6 +485,45 @@ mod tests {
                 frame.end - frame.start
             );
         }
+    }
+
+    #[tokio::test]
+    async fn missing_or_torn_sidecar_recovers_from_the_native_frames() {
+        // The index accelerates reads but never owns evidence. A crash while
+        // writing it must not turn existing transcript bytes into an empty log.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proc.jsonl.zst");
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        writer.append_control_line("recover\n").await.unwrap();
+        drop(writer);
+        let index = process_log_frame_index_path(&path);
+        tokio::fs::write(&index, "{torn").await.unwrap();
+        assert_eq!(
+            read_execution_log_range(&path, 0, 8).await.unwrap(),
+            "recover\n"
+        );
+        tokio::fs::remove_file(index).await.unwrap();
+        assert_eq!(
+            read_execution_log_range(&path, 0, 8).await.unwrap(),
+            "recover\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_api_refuses_unbounded_requests() {
+        // Endpoint callers must page rather than allocating their requested
+        // span, regardless of the total retained transcript size.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proc.jsonl.zst");
+        let writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        drop(writer);
+        assert_eq!(
+            read_execution_log_range(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES + 1)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[tokio::test]
