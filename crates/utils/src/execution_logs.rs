@@ -531,30 +531,54 @@ fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>>
         .or_else(|_| read_range_by_streaming_decode(path, start, end))
 }
 
+// Locators have fixed numeric fields plus one timestamp, never payload text.
+const MAX_FRAME_INDEX_LINE_BYTES: usize = 512;
+
 fn read_range_from_index(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
-    let index_path = process_log_frame_index_path(path);
-    let frames = stream_intersecting_frames(&index_path, start, end)?;
-    if !frames_cover_range(&frames, start, end) {
-        // A sidecar may be absent or have a torn final write. The Zstd stream
-        // remains the owner, so recover from it rather than claiming no logs.
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "incomplete execution index",
-        ));
-    }
+    let mut index = io::BufReader::new(std::fs::File::open(process_log_frame_index_path(path))?);
     let mut file = io::BufReader::new(std::fs::File::open(path)?);
     let mut output = Vec::with_capacity((end - start) as usize);
-    for frame in frames {
-        if frame.compressed_end < frame.compressed_start
+    let mut line = Vec::with_capacity(MAX_FRAME_INDEX_LINE_BYTES);
+    let mut previous_end = 0;
+    let mut previous_compressed_end = 0;
+    let mut covered = start;
+    while covered < end {
+        line.clear();
+        let read = (&mut index)
+            .take(MAX_FRAME_INDEX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "incomplete execution index",
+            ));
+        }
+        if read > MAX_FRAME_INDEX_LINE_BYTES || line.last() != Some(&b'\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized or torn execution locator",
+            ));
+        }
+        let frame: LogFrame = serde_json::from_slice(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if frame.start != previous_end
+            || frame.compressed_start != previous_compressed_end
+            || frame.compressed_end <= frame.compressed_start
             || frame.end < frame.start
             || frame.compressed_end.saturating_sub(frame.compressed_start)
                 > MAX_EXECUTION_LOG_RANGE_BYTES * 2
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid execution log frame index",
+                "noncontiguous execution locator",
             ));
         }
+        previous_end = frame.end;
+        previous_compressed_end = frame.compressed_end;
+        if frame.end <= start {
+            continue;
+        }
+
         file.seek(SeekFrom::Start(frame.compressed_start))?;
         let owner = read_owner_frame(&mut file)?;
         if owner.locator.start != frame.start
@@ -564,10 +588,10 @@ fn read_range_from_index(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "execution log frame length mismatch",
+                "execution locator differs from owner",
             ));
         }
-        let from = start.saturating_sub(frame.start) as usize;
+        let from = covered.saturating_sub(frame.start) as usize;
         let to = (end.min(frame.end) - frame.start) as usize;
         output.extend_from_slice(owner.bytes.get(from..to).ok_or_else(|| {
             io::Error::new(
@@ -575,51 +599,9 @@ fn read_range_from_index(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8
                 "execution log range outside frame",
             )
         })?);
+        covered = end.min(frame.end);
     }
     Ok(output)
-}
-
-fn frames_cover_range(frames: &[LogFrame], start: u64, end: u64) -> bool {
-    if start == end {
-        return true;
-    }
-    let mut covered_until = start;
-    for (index, frame) in frames.iter().enumerate() {
-        if (index == 0 && frame.start > start)
-            || (index > 0 && frame.start != covered_until)
-            || frame.end <= covered_until
-        {
-            return false;
-        }
-        covered_until = frame.end;
-        if covered_until >= end {
-            return true;
-        }
-    }
-    false
-}
-
-fn stream_intersecting_frames(path: &Path, start: u64, end: u64) -> io::Result<Vec<LogFrame>> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let mut frames = Vec::new();
-    for line in io::BufReader::new(file).lines() {
-        let line = line?;
-        let frame: LogFrame = match serde_json::from_str(&line) {
-            Ok(frame) => frame,
-            Err(_) => break,
-        };
-        if frame.end > start && frame.start < end {
-            frames.push(frame);
-        }
-        if frame.start >= end {
-            break;
-        }
-    }
-    Ok(frames)
 }
 
 fn read_range_by_streaming_decode(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
@@ -1011,6 +993,52 @@ mod tests {
         assert_eq!(
             read_execution_log_range(&path, 0, 8).await.unwrap(),
             "recover\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_cache_locators_cannot_expand_a_bounded_range() {
+        // The old cache collector accepted coverage from the first locator but
+        // copied every duplicate, returning far more bytes than requested.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.zst");
+        let mut writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+            .await
+            .unwrap();
+        writer.append_control_line("source\n").await.unwrap();
+        drop(writer);
+        let index = process_log_frame_index_path(&path);
+        let locator = tokio::fs::read_to_string(&index).await.unwrap();
+        tokio::fs::write(&index, locator.repeat(10_000))
+            .await
+            .unwrap();
+        let bytes = read_execution_log_range_bytes(&path, 0, 7).await.unwrap();
+        assert_eq!(bytes.len(), 7);
+        assert_eq!(bytes, b"source\n");
+    }
+
+    #[tokio::test]
+    async fn oversized_cache_line_is_rejected_before_parsing_and_falls_back_to_owner() {
+        // Valid JSON with enormous whitespace is still an invalid cache record;
+        // reading a disposable locator must never allocate its entire line.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.zst");
+        let mut writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+            .await
+            .unwrap();
+        writer.append_control_line("source\n").await.unwrap();
+        drop(writer);
+        let index = process_log_frame_index_path(&path);
+        let locator = tokio::fs::read_to_string(&index).await.unwrap();
+        let oversized = format!("{}{}\n", locator.trim_end(), " ".repeat(1024 * 1024));
+        tokio::fs::write(&index, oversized).await.unwrap();
+        assert_eq!(
+            read_range_from_index(&path, 0, 7).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_execution_log_range_bytes(&path, 0, 7).await.unwrap(),
+            b"source\n"
         );
     }
 
