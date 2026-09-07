@@ -139,6 +139,7 @@ async fn handle_scratch_ws(
                     }
                     Some(Err(e)) => {
                         tracing::error!("scratch stream error: {}", e);
+                        let _ = socket.close_for_refresh().await;
                         break;
                     }
                     None => break,

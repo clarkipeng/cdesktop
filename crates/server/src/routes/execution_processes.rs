@@ -649,6 +649,7 @@ async fn handle_execution_processes_by_session_ws(
                     }
                     Some(Err(e)) => {
                         tracing::error!("stream error: {}", e);
+                        let _ = socket.close_for_refresh().await;
                         break;
                     }
                     None => break,

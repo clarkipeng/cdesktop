@@ -73,6 +73,7 @@ async fn handle_workspace_sessions_ws(
                     }
                     Some(Err(e)) => {
                         tracing::error!("stream error: {}", e);
+                        let _ = socket.close_for_refresh().await;
                         break;
                     }
                     None => break,
@@ -176,6 +177,7 @@ async fn handle_workspaces_ws(
                     }
                     Some(Err(e)) => {
                         tracing::error!("stream error: {}", e);
+                        let _ = socket.close_for_refresh().await;
                         break;
                     }
                     None => break,
