@@ -419,53 +419,65 @@ mod tests {
 
     #[tokio::test]
     async fn drain_expiry_finishes_the_accepted_record_before_sealing_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("capture.jsonl.zst");
-        let writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+        // Neither a silent held-open pipe nor an endlessly ready producer may
+        // starve cancellation. The latter makes cancellation-first load-bearing.
+        for tail in [
+            futures::stream::pending().boxed(),
+            futures::stream::repeat_with(|| Ok(LogMsg::Stdout("flood".into()))).boxed(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("capture.jsonl.zst");
+            let writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+                .await
+                .unwrap();
+            let store = Arc::new(MsgStore::new());
+            let drain = tokio_util::sync::CancellationToken::new();
+            let signal = drain.clone();
+            // The select's cancellation arm was already polled when the producer
+            // hands off this record and expires the drain. It is now capture-owned.
+            let stream = futures::stream::once(async move {
+                signal.cancel();
+                Ok(LogMsg::Stdout("accepted".into()))
+            })
+            .chain(tail)
+            .boxed();
+            let stops = Arc::new(AtomicUsize::new(0));
+            let counter = stops.clone();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                capture_raw_logs(
+                    writer,
+                    stream,
+                    store.clone(),
+                    drain,
+                    Box::new(move || {
+                        Box::pin(async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        })
+                    }),
+                ),
+            )
             .await
-            .unwrap();
-        let store = Arc::new(MsgStore::new());
-        let drain = tokio_util::sync::CancellationToken::new();
-        let signal = drain.clone();
-        // The select's cancellation arm was already polled when the producer
-        // hands off this record and expires the drain. It is now capture-owned.
-        let stream = futures::stream::once(async move {
-            signal.cancel();
-            Ok(LogMsg::Stdout("accepted".into()))
-        })
-        .chain(futures::stream::pending())
-        .boxed();
-        let stops = Arc::new(AtomicUsize::new(0));
-        let counter = stops.clone();
-        capture_raw_logs(
-            writer,
-            stream,
-            store.clone(),
-            drain,
-            Box::new(move || {
-                Box::pin(async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                })
-            }),
-        )
-        .await;
-        assert_eq!(stops.load(Ordering::SeqCst), 1);
-        assert_eq!(store.get_history().len(), 1);
-        assert_eq!(
-            read_execution_log_range(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES)
-                .await
-                .unwrap(),
-            "{\"Stdout\":\"accepted\"}\n"
-        );
-        assert_eq!(
-            utils::execution_logs::scan_owner(&path)
-                .await
-                .unwrap()
-                .outcome,
-            Some(CaptureOutcome::Unavailable)
-        );
-        // Completion released the writer lease, not merely a UI subscription.
-        utils::execution_logs::lock_execution_log(&path).unwrap();
+            .expect("capture must finish promptly after drain expiry");
+            assert_eq!(outcome, CaptureOutcome::Unavailable);
+            assert_eq!(stops.load(Ordering::SeqCst), 1);
+            assert_eq!(store.get_history().len(), 1);
+            assert_eq!(
+                read_execution_log_range(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES)
+                    .await
+                    .unwrap(),
+                "{\"Stdout\":\"accepted\"}\n"
+            );
+            assert_eq!(
+                utils::execution_logs::scan_owner(&path)
+                    .await
+                    .unwrap()
+                    .outcome,
+                Some(CaptureOutcome::Unavailable)
+            );
+            // Completion released the writer lease, not merely a UI subscription.
+            utils::execution_logs::lock_execution_log(&path).unwrap();
+        }
     }
 
     #[tokio::test]

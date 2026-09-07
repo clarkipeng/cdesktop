@@ -58,6 +58,9 @@ does not certify the source prefix; consume contiguous pages from the beginning.
 An empty page at the available end can acquire more frames later. Resume from
 the same cursor. If a tail is torn or corrupt, retain your last confirmed cursor
 and report unavailable evidence; do not turn the error into completion.
+An active writer can also expose a temporarily incomplete frame between its
+body and metadata writes. Retain the cursor on that read error and retry; a
+later successful read distinguishes this from persistent damage.
 
 ## Interpret coverage separately from durability
 
@@ -79,6 +82,11 @@ verifying the original bytes, row metadata and native publication barrier.
 Capture records native text-output messages, not arbitrary binary stdout or a
 reconstruction of provider inputs. Unknown input provenance and usage attribution
 must remain unknown. Live normalised/UI views remain provisional.
+
+A requested stop can finish as a typed `local_recording_unavailable` failure if
+capture cannot finish; recording failure takes precedence over a killed outcome.
+Native pipe drain has a grace period, but accepted storage writes are awaited,
+not abandoned. This is not a total deadline for stop completion on a hung disk.
 
 ## Retain artifacts before removing their originals
 
