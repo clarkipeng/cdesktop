@@ -48,10 +48,34 @@ pub(crate) fn fork_params_from(thread_id: String, params: ThreadStartParams) -> 
     }
 }
 
+/// Carry the effective launch configuration into a native continuation.
+///
+/// `thread/resume` reopens the recorded thread in place. It deliberately does
+/// not supply `history` or `path`: both can select a different source of
+/// history, while the recorded thread id is the one authoritative identity.
+pub(crate) fn resume_params_from(
+    thread_id: String,
+    params: ThreadStartParams,
+) -> ThreadResumeParams {
+    ThreadResumeParams {
+        thread_id,
+        model: params.model,
+        model_provider: params.model_provider,
+        cwd: params.cwd,
+        approval_policy: params.approval_policy,
+        sandbox: params.sandbox,
+        config: params.config,
+        base_instructions: params.base_instructions,
+        developer_instructions: params.developer_instructions,
+        service_tier: params.service_tier,
+        ..Default::default()
+    }
+}
+
 use async_trait::async_trait;
 use codex_app_server_protocol::{
     AskForApproval as V2AskForApproval, ReviewTarget, SandboxMode as V2SandboxMode,
-    ThreadForkParams, ThreadStartParams, UserInput,
+    ThreadForkParams, ThreadResumeParams, ThreadStartParams, UserInput,
 };
 use derivative::Derivative;
 use schemars::JsonSchema;
@@ -652,6 +676,7 @@ impl Codex {
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
         let params = self.build_thread_start_params(current_dir, env);
+        let append_prompt = self.append_prompt.get();
         let resume_session = resume_session.map(|s| s.to_string());
 
         self.spawn_app_server(
@@ -661,6 +686,7 @@ impl Codex {
             move |client, _| async move {
                 match action {
                     CodexSessionAction::Chat { prompt } => {
+                        let prompt = AppendPrompt(append_prompt).combine_prompt(&prompt);
                         Self::launch_codex_agent(params, resume_session, prompt, client).await
                     }
                     CodexSessionAction::Review { target } => {
@@ -691,22 +717,13 @@ impl Codex {
                 (response.thread.id, response.model)
             }
             Some(session_id) => {
-                // Fork is the codex app-server's only resume primitive, and it
-                // materializes a copy of the prior rollout inside the codex
-                // binary (cdesktop cannot reference history in place).
-                //
-                // The storage guard (`ensure_fork_allowed`) only *limits* that
-                // copying: a per-rollout size cap, a free-disk reserve and a
-                // process-global fork-rate breaker. It does not garbage-collect
-                // rollouts, does not deduplicate history, and does not make an
-                // over-cap session resumable - such a session is refused, not
-                // recovered. The real fix is rollout GC plus content-addressed
-                // history: clarkipeng/cdesktop#29, upstream
-                // cdesktop-ai/cdesktop#16.
+                // An ordinary follow-up continues the recorded native thread.
+                // Branch and review paths keep using `thread/fork`, where the
+                // new thread identity is the isolation boundary.
                 let response = client
-                    .thread_fork(fork_params_from(session_id, thread_start_params))
+                    .thread_resume(resume_params_from(session_id, thread_start_params))
                     .await?;
-                tracing::debug!("forked thread, new thread_id={}", response.thread.id);
+                tracing::debug!("resumed thread, thread_id={}", response.thread.id);
                 (response.thread.id, response.model)
             }
         };
@@ -870,5 +887,419 @@ impl Codex {
             exit_signal: Some(exit_signal_rx),
             cancel: Some(cancel),
         })
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use async_trait::async_trait;
+    use codex_app_server_protocol::{
+        ClientRequest, JSONRPCError, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse,
+        RequestId,
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+        sync::mpsc,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::{jsonrpc::JsonRpcCallbacks, *};
+
+    #[test]
+    fn resume_uses_the_recorded_thread_without_copying_history() {
+        let params = ThreadStartParams {
+            model: Some("gpt-test".to_string()),
+            cwd: Some("/tmp/cdesktop".to_string()),
+            approval_policy: Some(V2AskForApproval::Never),
+            sandbox: Some(V2SandboxMode::WorkspaceWrite),
+            config: Some(HashMap::from([("x".to_string(), Value::Bool(true))])),
+            base_instructions: Some("stable guidance".to_string()),
+            developer_instructions: Some("developer guidance".to_string()),
+            service_tier: Some(Some("fast".to_string())),
+            ..Default::default()
+        };
+
+        let resume = resume_params_from("thread-1".to_string(), params);
+
+        assert_eq!(resume.thread_id, "thread-1");
+        assert!(resume.history.is_none());
+        assert!(resume.path.is_none());
+        assert_eq!(resume.cwd.as_deref(), Some("/tmp/cdesktop"));
+        assert_eq!(resume.base_instructions.as_deref(), Some("stable guidance"));
+        assert_eq!(
+            resume.developer_instructions.as_deref(),
+            Some("developer guidance")
+        );
+    }
+
+    #[test]
+    fn append_guidance_preserves_default_base_instructions_at_the_protocol_seam() {
+        let codex = codex_with_guidance(None, None, Some("changed guidance"));
+        let params = codex.build_thread_start_params(&std::env::temp_dir(), &test_env());
+        let request = ClientRequest::ThreadStart {
+            request_id: RequestId::Integer(1),
+            params,
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+
+        assert!(encoded["params"]["baseInstructions"].is_null());
+        assert!(encoded["params"]["developerInstructions"].is_null());
+
+        let explicit_base = codex_with_guidance(None, Some("explicit base"), Some("guidance"))
+            .build_thread_start_params(&std::env::temp_dir(), &test_env());
+        assert_eq!(
+            explicit_base.base_instructions.as_deref(),
+            Some("explicit base")
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_and_cleared_append_guidance_changes_only_the_new_turn_input() {
+        let original = run_follow_up(
+            codex_with_guidance(None, None, Some("original guidance")),
+            "first task",
+        )
+        .await;
+        let changed = run_follow_up(
+            codex_with_guidance(None, None, Some("changed guidance")),
+            "second task",
+        )
+        .await;
+        let cleared = run_follow_up(codex_with_guidance(None, None, None), "third task").await;
+
+        for requests in [&original, &changed, &cleared] {
+            assert!(requests[1]["params"]["baseInstructions"].is_null());
+            assert!(requests[1]["params"]["developerInstructions"].is_null());
+            assert!(
+                requests[2]["params"]["collaborationMode"]["settings"]["developer_instructions"]
+                    .is_null()
+            );
+        }
+        assert_eq!(
+            original[2]["params"]["input"][0]["text"],
+            "first taskoriginal guidance"
+        );
+        assert_eq!(
+            changed[2]["params"]["input"][0]["text"],
+            "second taskchanged guidance"
+        );
+        assert_eq!(cleared[2]["params"]["input"][0]["text"], "third task");
+    }
+
+    fn codex_with_guidance(
+        developer_instructions: Option<&str>,
+        base_instructions: Option<&str>,
+        append_prompt: Option<&str>,
+    ) -> Codex {
+        Codex {
+            append_prompt: AppendPrompt(append_prompt.map(str::to_string)),
+            sandbox: None,
+            ask_for_approval: None,
+            oss: None,
+            model: None,
+            model_reasoning_effort: None,
+            model_reasoning_summary: None,
+            model_reasoning_summary_format: None,
+            profile: None,
+            base_instructions: base_instructions.map(str::to_string),
+            include_apply_patch_tool: None,
+            model_provider: None,
+            compact_prompt: None,
+            developer_instructions: developer_instructions.map(str::to_string),
+            plan: false,
+            cmd: CmdOverrides::default(),
+            approvals: None,
+        }
+    }
+
+    fn test_env() -> ExecutionEnv {
+        ExecutionEnv::new(Default::default(), false, String::new())
+    }
+
+    #[tokio::test]
+    async fn ordinary_continuations_emit_resume_then_a_new_turn_without_forking() {
+        let first =
+            run_follow_up(codex_with_guidance(None, None, None), "first continuation").await;
+        let second =
+            run_follow_up(codex_with_guidance(None, None, None), "second continuation").await;
+        let requests = [first, second].concat();
+
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("account/read"),
+                Some("thread/resume"),
+                Some("turn/start"),
+                Some("account/read"),
+                Some("thread/resume"),
+                Some("turn/start"),
+            ]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["method"] != "thread/fork")
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request["method"] != "account/read")
+                .all(|request| { request["params"]["threadId"] == "thread-1" })
+        );
+        assert_eq!(
+            requests[2]["params"]["input"][0]["text"],
+            "first continuation"
+        );
+        assert_eq!(
+            requests[5]["params"]["input"][0]["text"],
+            "second continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_start_is_not_replayed_by_the_continuation_path() {
+        let (client, mut requests, cancel, shutdown, server) = fake_app_server(false);
+        let launch = tokio::spawn(Codex::launch_codex_agent(
+            ThreadStartParams::default(),
+            Some("thread-1".to_string()),
+            "interrupted continuation".to_string(),
+            client.clone(),
+        ));
+
+        let mut captured = Vec::new();
+        for _ in 0..3 {
+            captured.push(requests.recv().await.unwrap());
+        }
+        cancel.cancel();
+        let error = launch.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("turn/start request cancelled"));
+        assert_eq!(
+            captured
+                .iter()
+                .map(|request| request["method"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("account/read"),
+                Some("thread/resume"),
+                Some("turn/start")
+            ]
+        );
+
+        drop(client);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    async fn run_follow_up(codex: Codex, prompt: &str) -> Vec<Value> {
+        let (client, mut requests, cancel, shutdown, server) = fake_app_server(true);
+        Codex::launch_codex_agent(
+            codex.build_thread_start_params(&std::env::temp_dir(), &test_env()),
+            Some("thread-1".to_string()),
+            codex.append_prompt.combine_prompt(prompt),
+            client.clone(),
+        )
+        .await
+        .unwrap();
+        let mut captured = Vec::new();
+        for _ in 0..3 {
+            captured.push(requests.recv().await.unwrap());
+        }
+        drop(client);
+        cancel.cancel();
+        shutdown.cancel();
+        server.await.unwrap();
+        captured
+    }
+
+    fn fake_app_server(
+        respond_to_turn_start: bool,
+    ) -> (
+        Arc<AppServerClient>,
+        mpsc::UnboundedReceiver<Value>,
+        CancellationToken,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client_stdin, server_stdin) = tokio::io::duplex(16 * 1024);
+        let (server_stdout, client_stdout) = tokio::io::duplex(16 * 1024);
+        let (captured_tx, captured_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let (exit_tx, _exit_rx) = tokio::sync::oneshot::channel();
+        let client = AppServerClient::new(
+            LogWriter::new(tokio::io::sink()),
+            None,
+            false,
+            false,
+            Default::default(),
+            false,
+            String::new(),
+            cancel.clone(),
+        );
+        client.connect(JsonRpcPeer::spawn(
+            client_stdin,
+            client_stdout,
+            Arc::new(TestCallbacks),
+            ExitSignalSender::new(exit_tx),
+            shutdown.clone(),
+        ));
+
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            let mut input = BufReader::new(server_stdin);
+            let mut output = BufWriter::new(server_stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = tokio::select! {
+                    _ = server_shutdown.cancelled() => break,
+                    read = input.read_line(&mut line) => read.unwrap(),
+                };
+                if read == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                captured_tx.send(request.clone()).unwrap();
+                if request["method"] == "turn/start" && !respond_to_turn_start {
+                    continue;
+                }
+                let result = match request["method"].as_str() {
+                    Some("account/read") => serde_json::json!({
+                        "account": null,
+                        "requiresOpenaiAuth": false,
+                    }),
+                    Some("thread/resume") => fake_resume_result(),
+                    Some("turn/start") => serde_json::json!({
+                        "turn": {
+                            "id": "turn-1",
+                            "items": [],
+                            "itemsView": "notLoaded",
+                            "status": "inProgress",
+                            "error": null,
+                            "startedAt": null,
+                            "completedAt": null,
+                            "durationMs": null,
+                        }
+                    }),
+                    method => panic!("unexpected app-server method: {method:?}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                });
+                output
+                    .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                    .await
+                    .unwrap();
+                output.write_all(b"\n").await.unwrap();
+                output.flush().await.unwrap();
+            }
+        });
+
+        (client, captured_rx, cancel, shutdown, server)
+    }
+
+    struct TestCallbacks;
+
+    #[async_trait]
+    impl JsonRpcCallbacks for TestCallbacks {
+        async fn on_request(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _request: JSONRPCRequest,
+        ) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+
+        async fn on_response(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _response: &JSONRPCResponse,
+        ) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+
+        async fn on_error(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _error: &JSONRPCError,
+        ) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+
+        async fn on_notification(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _notification: JSONRPCNotification,
+        ) -> Result<bool, ExecutorError> {
+            Ok(false)
+        }
+
+        async fn on_non_json(&self, _raw: &str) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+    }
+
+    fn fake_resume_result() -> Value {
+        serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "sessionId": "thread-1",
+                "forkedFromId": null,
+                "preview": "",
+                "ephemeral": true,
+                "modelProvider": "test",
+                "createdAt": 0,
+                "updatedAt": 0,
+                "status": { "type": "idle" },
+                "path": null,
+                "cwd": "/tmp",
+                "cliVersion": "test",
+                "source": "vscode",
+                "threadSource": null,
+                "agentNickname": null,
+                "agentRole": null,
+                "gitInfo": null,
+                "name": null,
+                "turns": [],
+            },
+            "model": "gpt-test",
+            "modelProvider": "test",
+            "serviceTier": null,
+            "cwd": "/tmp",
+            "runtimeWorkspaceRoots": [],
+            "instructionSources": [],
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false,
+            },
+            "activePermissionProfile": null,
+            "reasoningEffort": null,
+        })
+    }
+
+    #[test]
+    fn explicit_review_branch_still_emits_a_fork_request() {
+        let request = ClientRequest::ThreadFork {
+            request_id: RequestId::Integer(1),
+            params: fork_params_from("thread-1".to_string(), ThreadStartParams::default()),
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+
+        assert_eq!(encoded["method"], "thread/fork");
+        assert_eq!(encoded["params"]["threadId"], "thread-1");
     }
 }
