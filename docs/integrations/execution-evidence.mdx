@@ -8,6 +8,11 @@ The endpoints below are relative to `/api/execution-processes/{id}`. The executi
 UUID identifies the source; ranges use half-open byte offsets in the serialised
 `LogMsg` stream, not characters or compressed-file positions.
 
+Before enabling this integration, read `GET /api/info` and check for
+`service_capabilities.execution_evidence` version `1`. Leave it disabled on a
+runtime with a missing or unrecognised version. This advertises API support,
+not source coverage or durability; you must still check every evidence response.
+
 <Warning>
   This integration contract is under review and is not activated in the
   installed runtime. HTTP success alone never authorises deleting original
