@@ -14,17 +14,20 @@
 
 ## Review correction
 
-- `append_prompt` becomes native `developer_instructions` on both start and
-  resume, joined after any configured developer guidance. This keeps it out of
-  repeated user-turn input without replacing Codex's default base instructions.
-- Protocol-path fixtures cover repeated resumes, explicit fork isolation,
-  cancellation/restart, turn/usage evidence, absent explicit base guidance,
-  and changed/cleared append guidance.
+- `append_prompt` becomes native turn-scoped collaboration developer guidance,
+  not stored start/resume configuration. This keeps it out of repeated
+  user-turn input, allows changed/cleared guidance on the next turn, and does
+  not replace Codex's default base instructions.
+- A fake JSON-RPC app-server exercises the real `AppServerClient` and
+  `launch_codex_agent` continuation path for repeated resumes,
+  cancellation/restart, absent explicit base guidance, and changed/cleared
+  append guidance. A separate protocol serialization fixture retains the
+  explicit review fork. Native usage de-duplication has its own focused test.
 
 ## Verification
 
 - Passed isolated: `cargo test -p executors --lib` under
-  `evidence-test-isolation.sb` (110 passed).
+  `evidence-test-isolation.sb` (111 passed).
 - Passed: `cargo clippy -p executors --tests -- -D warnings`, `pnpm run format`,
   and `git diff --check`.
 

@@ -19,10 +19,11 @@
   remains applied only to the review isolation path.
 - `/compact` now resumes in place before native compaction. `/fast` no longer
   creates an unused fork. The deliberate review path still forks.
-- Static append-prompt material is joined with configured developer guidance
-  in native `developer_instructions` on start and resume. Follow-ups carry
-  only new task input. `base_instructions` remains unset without an explicit
-  base, so Codex resolves its stored or model-default instructions normally.
+- Static append-prompt material is sent as native turn-scoped collaboration
+  developer guidance, not stored in start/resume thread config. Follow-ups
+  carry only new task input. `base_instructions` remains unset without an
+  explicit base, so Codex resolves its stored or model-default instructions
+  normally; changing or clearing append guidance applies to the next turn.
 
 ## Evidence and limits
 
@@ -33,12 +34,15 @@
   (branch).
 - Local source evidence: no ordinary path retains a `thread_fork` call;
   `thread_fork` is reached only by `codex/review.rs`.
-- Protocol fixtures prove two ordinary continuations emit
-  `thread/resume`/`turn/start` pairs on one thread with zero fork requests;
-  the review fixture emits `thread/fork`. They also prove that absent explicit
-  base guidance remains null at the start-request seam and that changed or
-  cleared append guidance is reflected by resume parameters. Cancellation
-  leaves the turn outcome unknown for reconciliation, rather than retrying it.
+- An in-memory fake JSON-RPC app-server drives the production
+  `AppServerClient` and `launch_codex_agent` path. It proves two ordinary
+  continuations emit `account/read`/`thread/resume`/`turn/start` on one thread
+  with zero forks. A separate protocol serialization fixture keeps the review
+  branch on `thread/fork`. The peer also captures the changed/cleared
+  turn-scoped guidance and cancellation of an unresolved `turn/start`, which
+  returns without replaying it. Pinned app-server source shows that null
+  collaboration developer guidance selects the built-in mode setting; no
+  append guidance is stored on resume. The pinned server itself was not run.
 - Normalization keys usage by native thread and turn, so repeated usage updates
   for one turn replace its entry rather than replaying old usage.
 - Measured local copy/startup result: not yet available. No provider/cache or
@@ -49,7 +53,7 @@
 - `git diff --check`: passed.
 - Passed isolated command:
   `/usr/bin/sandbox-exec -f /Users/clarkpeng/conductor/workspaces/sightmesh-v1/ankara/.context/evidence-test-isolation.sb cargo test -p executors --lib`
-  Exit `0`; 110 passed.
+  Exit `0`; 111 passed.
 - `cargo clippy -p executors --tests -- -D warnings`: exit `0`.
 - `pnpm run format`: exit `0` after `pnpm install --frozen-lockfile`; no source
   formatting changes outside this lane.

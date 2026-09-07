@@ -22,8 +22,7 @@ use codex_app_server_protocol::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStdin, ChildStdout},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{Mutex, oneshot},
 };
 use tokio_util::sync::CancellationToken;
@@ -58,21 +57,25 @@ impl ExitSignalSender {
 
 #[derive(Clone)]
 pub struct JsonRpcPeer {
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<PendingResponse>>>>,
     id_counter: Arc<AtomicI64>,
 }
 
 impl JsonRpcPeer {
-    pub fn spawn(
-        stdin: ChildStdin,
-        stdout: ChildStdout,
+    pub fn spawn<W, R>(
+        stdin: W,
+        stdout: R,
         callbacks: Arc<dyn JsonRpcCallbacks>,
         exit_tx: ExitSignalSender,
         cancel: CancellationToken,
-    ) -> Self {
+    ) -> Self
+    where
+        W: AsyncWrite + Send + Unpin + 'static,
+        R: AsyncRead + Send + Unpin + 'static,
+    {
         let peer = Self {
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin: Arc::new(Mutex::new(Box::new(stdin))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             id_counter: Arc::new(AtomicI64::new(1)),
         };

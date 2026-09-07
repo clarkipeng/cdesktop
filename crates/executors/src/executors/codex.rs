@@ -76,7 +76,7 @@ use async_trait::async_trait;
 use codex_app_server_protocol::{
     AskForApproval as V2AskForApproval, ClientRequest, RequestId, ReviewTarget,
     SandboxMode as V2SandboxMode, ThreadForkParams, ThreadResumeParams, ThreadStartParams,
-    TurnStartParams, UserInput,
+    UserInput,
 };
 use derivative::Derivative;
 use schemars::JsonSchema;
@@ -627,16 +627,13 @@ impl Codex {
             approval_policy,
             sandbox,
             config,
-            // `append_prompt` is persistent executor guidance, not new user
-            // input. It belongs in the native developer-instructions layer:
-            // setting base instructions here would replace the model's
-            // default base instructions when no explicit base is configured.
+            // `append_prompt` is supplied with each native turn's
+            // collaboration settings, not this persistent thread config.
+            // That lets a later cleared value take effect without replacing
+            // the model's default base instructions or retaining old guidance.
             base_instructions: self.base_instructions.clone(),
             model_provider,
-            developer_instructions: join_developer_instructions(
-                self.developer_instructions.as_deref(),
-                self.append_prompt.get().as_deref(),
-            ),
+            developer_instructions: self.developer_instructions.clone(),
             service_tier,
             ..Default::default()
         }
@@ -684,6 +681,7 @@ impl Codex {
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
         let params = self.build_thread_start_params(current_dir, env);
+        let append_prompt = self.append_prompt.get();
         let resume_session = resume_session.map(|s| s.to_string());
 
         self.spawn_app_server(
@@ -693,7 +691,14 @@ impl Codex {
             move |client, _| async move {
                 match action {
                     CodexSessionAction::Chat { prompt } => {
-                        Self::launch_codex_agent(params, resume_session, prompt, client).await
+                        Self::launch_codex_agent(
+                            params,
+                            resume_session,
+                            prompt,
+                            append_prompt,
+                            client,
+                        )
+                        .await
                     }
                     CodexSessionAction::Review { target } => {
                         review::launch_codex_review(params, resume_session, target, client).await
@@ -708,6 +713,7 @@ impl Codex {
         thread_start_params: ThreadStartParams,
         resume_session: Option<String>,
         combined_prompt: String,
+        append_prompt: Option<String>,
         client: Arc<AppServerClient>,
     ) -> Result<(), ExecutorError> {
         let account = client.get_account().await?;
@@ -736,7 +742,7 @@ impl Codex {
 
         client.set_resolved_model(resolved_model);
         client.register_session(&thread_id).await?;
-        let collaboration_mode = client.initial_collaboration_mode()?;
+        let collaboration_mode = client.initial_collaboration_mode(append_prompt)?;
         client
             .turn_start_with_mode(
                 thread_id,
@@ -896,18 +902,19 @@ impl Codex {
     }
 }
 
-fn join_developer_instructions(configured: Option<&str>, appended: Option<&str>) -> Option<String> {
-    match (configured, appended) {
-        (Some(configured), Some(appended)) => Some(format!("{configured}\n{appended}")),
-        (Some(configured), None) => Some(configured.to_string()),
-        (None, Some(appended)) => Some(appended.to_string()),
-        (None, None) => None,
-    }
-}
-
 #[cfg(test)]
 mod continuation_tests {
-    use super::*;
+    use async_trait::async_trait;
+    use codex_app_server_protocol::{
+        JSONRPCError, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse,
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+        sync::mpsc,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::{jsonrpc::JsonRpcCallbacks, *};
 
     #[test]
     fn resume_uses_the_recorded_thread_without_copying_history() {
@@ -947,10 +954,7 @@ mod continuation_tests {
         let encoded = serde_json::to_value(request).unwrap();
 
         assert!(encoded["params"]["baseInstructions"].is_null());
-        assert_eq!(
-            encoded["params"]["developerInstructions"],
-            "changed guidance"
-        );
+        assert!(encoded["params"]["developerInstructions"].is_null());
 
         let explicit_base = codex_with_guidance(None, Some("explicit base"), Some("guidance"))
             .build_thread_start_params(&std::env::temp_dir(), &test_env());
@@ -960,68 +964,28 @@ mod continuation_tests {
         );
     }
 
-    #[test]
-    fn changed_and_cleared_append_guidance_are_reflected_in_resume_params() {
-        let original = codex_with_guidance(
-            Some("configured developer guidance"),
-            None,
-            Some("original guidance"),
-        );
-        let original_params = resume_params_from(
-            "thread-1".to_string(),
-            original.build_thread_start_params(&std::env::temp_dir(), &test_env()),
+    #[tokio::test]
+    async fn changed_and_cleared_append_guidance_replaces_the_native_turn_setting() {
+        let original = run_follow_up("first task", Some("original guidance")).await;
+        let changed = run_follow_up("second task", Some("changed guidance")).await;
+        let cleared = run_follow_up("third task", None).await;
+
+        for requests in [&original, &changed, &cleared] {
+            assert!(requests[1]["params"]["baseInstructions"].is_null());
+            assert!(requests[1]["params"]["developerInstructions"].is_null());
+        }
+        assert_eq!(
+            original[2]["params"]["collaborationMode"]["settings"]["developer_instructions"],
+            "original guidance"
         );
         assert_eq!(
-            original_params.developer_instructions.as_deref(),
-            Some("configured developer guidance\noriginal guidance")
+            changed[2]["params"]["collaborationMode"]["settings"]["developer_instructions"],
+            "changed guidance"
         );
-
-        let changed = codex_with_guidance(
-            Some("configured developer guidance"),
-            None,
-            Some("changed guidance"),
+        assert!(
+            cleared[2]["params"]["collaborationMode"]["settings"]["developer_instructions"]
+                .is_null()
         );
-        let changed_params = resume_params_from(
-            "thread-1".to_string(),
-            changed.build_thread_start_params(&std::env::temp_dir(), &test_env()),
-        );
-        let changed_request = serde_json::to_value(ClientRequest::ThreadResume {
-            request_id: RequestId::Integer(1),
-            params: changed_params,
-        })
-        .unwrap();
-        assert_eq!(
-            changed_request["params"]["developerInstructions"],
-            "configured developer guidance\nchanged guidance"
-        );
-
-        let cleared = codex_with_guidance(Some("configured developer guidance"), None, None);
-        let cleared_params = resume_params_from(
-            "thread-1".to_string(),
-            cleared.build_thread_start_params(&std::env::temp_dir(), &test_env()),
-        );
-        let cleared_request = serde_json::to_value(ClientRequest::ThreadResume {
-            request_id: RequestId::Integer(2),
-            params: cleared_params,
-        })
-        .unwrap();
-        assert_eq!(
-            cleared_request["params"]["developerInstructions"],
-            "configured developer guidance"
-        );
-        assert!(cleared_request["params"]["baseInstructions"].is_null());
-
-        let fully_cleared = codex_with_guidance(None, None, None);
-        let fully_cleared_params = resume_params_from(
-            "thread-1".to_string(),
-            fully_cleared.build_thread_start_params(&std::env::temp_dir(), &test_env()),
-        );
-        let fully_cleared_request = serde_json::to_value(ClientRequest::ThreadResume {
-            request_id: RequestId::Integer(3),
-            params: fully_cleared_params,
-        })
-        .unwrap();
-        assert!(fully_cleared_request["params"]["developerInstructions"].is_null());
     }
 
     fn codex_with_guidance(
@@ -1054,53 +1018,279 @@ mod continuation_tests {
         ExecutionEnv::new(Default::default(), false, String::new())
     }
 
-    #[test]
-    fn ordinary_continuations_emit_resume_then_a_new_turn_without_forking() {
-        let params = ThreadStartParams::default();
-        let mut methods = Vec::new();
-
-        for task in ["first continuation", "second continuation"] {
-            let resume = ClientRequest::ThreadResume {
-                request_id: RequestId::Integer(1),
-                params: resume_params_from("thread-1".to_string(), params.clone()),
-            };
-            let turn = ClientRequest::TurnStart {
-                request_id: RequestId::Integer(2),
-                params: TurnStartParams {
-                    thread_id: "thread-1".to_string(),
-                    input: vec![UserInput::Text {
-                        text: task.to_string(),
-                        text_elements: vec![],
-                    }],
-                    ..Default::default()
-                },
-            };
-            methods.push(serde_json::to_value(resume).unwrap());
-            methods.push(serde_json::to_value(turn).unwrap());
-        }
+    #[tokio::test]
+    async fn ordinary_continuations_emit_resume_then_a_new_turn_without_forking() {
+        let first = run_follow_up("first continuation", None).await;
+        let second = run_follow_up("second continuation", None).await;
+        let requests = [first, second].concat();
 
         assert_eq!(
-            methods
+            requests
                 .iter()
                 .map(|request| request["method"].as_str())
                 .collect::<Vec<_>>(),
             vec![
+                Some("account/read"),
                 Some("thread/resume"),
                 Some("turn/start"),
+                Some("account/read"),
                 Some("thread/resume"),
                 Some("turn/start"),
             ]
         );
         assert!(
-            methods
+            requests
                 .iter()
                 .all(|request| request["method"] != "thread/fork")
         );
         assert!(
-            methods
+            requests
                 .iter()
+                .filter(|request| request["method"] != "account/read")
                 .all(|request| { request["params"]["threadId"] == "thread-1" })
         );
+        assert_eq!(
+            requests[2]["params"]["input"][0]["text"],
+            "first continuation"
+        );
+        assert_eq!(
+            requests[5]["params"]["input"][0]["text"],
+            "second continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_start_is_not_replayed_by_the_continuation_path() {
+        let (client, mut requests, cancel, shutdown, server) = fake_app_server(false);
+        let launch = tokio::spawn(Codex::launch_codex_agent(
+            ThreadStartParams::default(),
+            Some("thread-1".to_string()),
+            "interrupted continuation".to_string(),
+            None,
+            client.clone(),
+        ));
+
+        let mut captured = Vec::new();
+        for _ in 0..3 {
+            captured.push(requests.recv().await.unwrap());
+        }
+        cancel.cancel();
+        let error = launch.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("turn/start request cancelled"));
+        assert_eq!(
+            captured
+                .iter()
+                .map(|request| request["method"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("account/read"),
+                Some("thread/resume"),
+                Some("turn/start")
+            ]
+        );
+
+        drop(client);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    async fn run_follow_up(prompt: &str, append_prompt: Option<&str>) -> Vec<Value> {
+        let (client, mut requests, cancel, shutdown, server) = fake_app_server(true);
+        Codex::launch_codex_agent(
+            ThreadStartParams::default(),
+            Some("thread-1".to_string()),
+            prompt.to_string(),
+            append_prompt.map(str::to_string),
+            client.clone(),
+        )
+        .await
+        .unwrap();
+        let mut captured = Vec::new();
+        for _ in 0..3 {
+            captured.push(requests.recv().await.unwrap());
+        }
+        drop(client);
+        cancel.cancel();
+        shutdown.cancel();
+        server.await.unwrap();
+        captured
+    }
+
+    fn fake_app_server(
+        respond_to_turn_start: bool,
+    ) -> (
+        Arc<AppServerClient>,
+        mpsc::UnboundedReceiver<Value>,
+        CancellationToken,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client_stdin, server_stdin) = tokio::io::duplex(16 * 1024);
+        let (server_stdout, client_stdout) = tokio::io::duplex(16 * 1024);
+        let (captured_tx, captured_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let (exit_tx, _exit_rx) = tokio::sync::oneshot::channel();
+        let client = AppServerClient::new(
+            LogWriter::new(tokio::io::sink()),
+            None,
+            false,
+            false,
+            Default::default(),
+            false,
+            String::new(),
+            cancel.clone(),
+        );
+        client.connect(JsonRpcPeer::spawn(
+            client_stdin,
+            client_stdout,
+            Arc::new(TestCallbacks),
+            ExitSignalSender::new(exit_tx),
+            shutdown.clone(),
+        ));
+
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            let mut input = BufReader::new(server_stdin);
+            let mut output = BufWriter::new(server_stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = tokio::select! {
+                    _ = server_shutdown.cancelled() => break,
+                    read = input.read_line(&mut line) => read.unwrap(),
+                };
+                if read == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                captured_tx.send(request.clone()).unwrap();
+                if request["method"] == "turn/start" && !respond_to_turn_start {
+                    continue;
+                }
+                let result = match request["method"].as_str() {
+                    Some("account/read") => serde_json::json!({
+                        "account": null,
+                        "requiresOpenaiAuth": false,
+                    }),
+                    Some("thread/resume") => fake_resume_result(),
+                    Some("turn/start") => serde_json::json!({
+                        "turn": {
+                            "id": "turn-1",
+                            "items": [],
+                            "itemsView": "notLoaded",
+                            "status": "inProgress",
+                            "error": null,
+                            "startedAt": null,
+                            "completedAt": null,
+                            "durationMs": null,
+                        }
+                    }),
+                    method => panic!("unexpected app-server method: {method:?}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                });
+                output
+                    .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                    .await
+                    .unwrap();
+                output.write_all(b"\n").await.unwrap();
+                output.flush().await.unwrap();
+            }
+        });
+
+        (client, captured_rx, cancel, shutdown, server)
+    }
+
+    struct TestCallbacks;
+
+    #[async_trait]
+    impl JsonRpcCallbacks for TestCallbacks {
+        async fn on_request(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _request: JSONRPCRequest,
+        ) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+
+        async fn on_response(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _response: &JSONRPCResponse,
+        ) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+
+        async fn on_error(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _error: &JSONRPCError,
+        ) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+
+        async fn on_notification(
+            &self,
+            _peer: &JsonRpcPeer,
+            _raw: &str,
+            _notification: JSONRPCNotification,
+        ) -> Result<bool, ExecutorError> {
+            Ok(false)
+        }
+
+        async fn on_non_json(&self, _raw: &str) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+    }
+
+    fn fake_resume_result() -> Value {
+        serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "sessionId": "thread-1",
+                "forkedFromId": null,
+                "preview": "",
+                "ephemeral": true,
+                "modelProvider": "test",
+                "createdAt": 0,
+                "updatedAt": 0,
+                "status": { "type": "idle" },
+                "path": null,
+                "cwd": "/tmp",
+                "cliVersion": "test",
+                "source": "vscode",
+                "threadSource": null,
+                "agentNickname": null,
+                "agentRole": null,
+                "gitInfo": null,
+                "name": null,
+                "turns": [],
+            },
+            "model": "gpt-test",
+            "modelProvider": "test",
+            "serviceTier": null,
+            "cwd": "/tmp",
+            "runtimeWorkspaceRoots": [],
+            "instructionSources": [],
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false,
+            },
+            "activePermissionProfile": null,
+            "reasoningEffort": null,
+        })
     }
 
     #[test]

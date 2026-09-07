@@ -246,12 +246,20 @@ impl AppServerClient {
         })
     }
 
-    pub fn initial_collaboration_mode(&self) -> Result<CollaborationMode, ExecutorError> {
-        if self.plan_mode {
-            self.collaboration_mode(ModeKind::Plan)
+    pub fn initial_collaboration_mode(
+        &self,
+        developer_instructions: Option<String>,
+    ) -> Result<CollaborationMode, ExecutorError> {
+        let mut mode = if self.plan_mode {
+            self.collaboration_mode(ModeKind::Plan)?
         } else {
-            self.collaboration_mode(ModeKind::Default)
-        }
+            self.collaboration_mode(ModeKind::Default)?
+        };
+        // This is turn-scoped native developer guidance. Unlike thread-level
+        // config, an absent value clears a prior append prompt on the next
+        // turn rather than leaving it stored in the resumed thread.
+        mode.settings.developer_instructions = developer_instructions;
+        Ok(mode)
     }
 
     pub async fn get_account(&self) -> Result<GetAccountResponse, ExecutorError> {
