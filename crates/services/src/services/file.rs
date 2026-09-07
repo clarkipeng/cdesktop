@@ -3,10 +3,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use db::models::file::{CreateFile, File};
+use bytes::Bytes;
+use db::models::{
+    execution_artifact::ExecutionArtifact,
+    file::{CreateFile, File},
+};
+use futures::{Stream, StreamExt};
 use mime_guess::MimeGuess;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +134,90 @@ impl FileService {
         )
         .await?;
         Ok(file)
+    }
+
+    /// Retains arbitrary-sized input without materialising it in memory. The
+    /// final attachment stays content-addressed; callers record every use as a
+    /// separate occurrence through `retain_execution_artifact`.
+    pub async fn store_stream<S, E>(
+        &self,
+        mut stream: S,
+        original_filename: &str,
+        max_size_bytes: Option<u64>,
+    ) -> Result<File, FileError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let staging_name = format!("{}.upload", Uuid::new_v4());
+        let staging_path = self.cache_dir.join(&staging_name);
+        let mut output = tokio::fs::File::create(&staging_path).await?;
+        let mut hash = Sha256::new();
+        let mut size = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| FileError::Io(std::io::Error::other(error.to_string())))?;
+            size = size.saturating_add(chunk.len() as u64);
+            if let Some(max) = max_size_bytes
+                && size > max
+            {
+                let _ = tokio::fs::remove_file(&staging_path).await;
+                return Err(FileError::TooLarge(size, max));
+            }
+            hash.update(&chunk);
+            output.write_all(&chunk).await?;
+        }
+        output.sync_all().await?;
+        drop(output);
+
+        let hash = format!("{:x}", hash.finalize());
+        if let Some(existing) = File::find_by_hash(&self.pool, &hash).await? {
+            let _ = tokio::fs::remove_file(staging_path).await;
+            return Ok(existing);
+        }
+        let extension = Path::new(original_filename)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("bin");
+        let filename = format!(
+            "{}_{}.{}",
+            Uuid::new_v4(),
+            sanitize_filename(original_filename),
+            extension
+        );
+        tokio::fs::rename(&staging_path, self.cache_dir.join(&filename)).await?;
+        File::create(
+            &self.pool,
+            &CreateFile {
+                file_path: filename,
+                original_name: original_filename.to_owned(),
+                mime_type: MimeGuess::from_path(original_filename)
+                    .first_raw()
+                    .map(str::to_owned),
+                size_bytes: size as i64,
+                hash,
+            },
+        )
+        .await
+        .map_err(FileError::Database)
+    }
+
+    pub async fn retain_execution_artifact(
+        &self,
+        execution_id: Uuid,
+        original_path: &str,
+        producer_ref: Option<&str>,
+        file: &File,
+    ) -> Result<(), FileError> {
+        ExecutionArtifact::create(
+            &self.pool,
+            execution_id,
+            file.id,
+            original_path,
+            producer_ref,
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn delete_orphaned_files(&self) -> Result<(), FileError> {

@@ -143,19 +143,12 @@ impl File {
     }
 
     pub async fn find_orphaned_files(pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error> {
-        sqlx::query_as!(
-            File,
-            r#"SELECT i.id as "id!: Uuid",
-                      i.file_path as "file_path!",
-                      i.original_name as "original_name!",
-                      i.mime_type,
-                      i.size_bytes as "size_bytes!",
-                      i.hash as "hash!",
-                      i.created_at as "created_at!: DateTime<Utc>",
-                      i.updated_at as "updated_at!: DateTime<Utc>"
-               FROM attachments i
-               LEFT JOIN workspace_attachments wa ON i.id = wa.attachment_id
-               WHERE wa.workspace_id IS NULL"#
+        sqlx::query_as::<_, File>(
+            "SELECT i.id, i.file_path, i.original_name, i.mime_type, i.size_bytes, i.hash, i.created_at, i.updated_at
+             FROM attachments i
+             LEFT JOIN workspace_attachments wa ON i.id = wa.attachment_id
+             LEFT JOIN execution_artifacts ea ON i.id = ea.attachment_id
+             WHERE wa.workspace_id IS NULL AND ea.attachment_id IS NULL",
         )
         .fetch_all(pool)
         .await

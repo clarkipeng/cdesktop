@@ -10862,6 +10862,7 @@ dependencies = [
  "api-types",
  "async-trait",
  "backon",
+ "bytes",
  "chrono",
  "dashmap",
  "db",

@@ -201,6 +201,7 @@ impl ExecutionLogWriter {
                 .saturating_add(jsonl_line.len() as u64),
             compressed_start: offset,
             compressed_end: offset.saturating_add(compressed.len() as u64),
+            captured_at: Some(chrono::Utc::now()),
         };
         let mut line = serde_json::to_vec(&frame).map_err(io::Error::other)?;
         line.push(b'\n');
@@ -373,6 +374,8 @@ struct LogFrame {
     end: u64,
     compressed_start: u64,
     compressed_end: u64,
+    #[serde(default)]
+    captured_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn read_frame_index(path: &Path) -> io::Result<Vec<LogFrame>> {
