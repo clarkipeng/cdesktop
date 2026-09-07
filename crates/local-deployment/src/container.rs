@@ -613,6 +613,7 @@ impl LocalContainerService {
 
     /// Spawn a background task that polls the child process for completion and
     /// cleans up the execution entry when it exits.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_exit_monitor(
         &self,
         exec_id: &Uuid,
