@@ -74,9 +74,8 @@ pub(crate) fn resume_params_from(
 
 use async_trait::async_trait;
 use codex_app_server_protocol::{
-    AskForApproval as V2AskForApproval, ClientRequest, RequestId, ReviewTarget,
-    SandboxMode as V2SandboxMode, ThreadForkParams, ThreadResumeParams, ThreadStartParams,
-    UserInput,
+    AskForApproval as V2AskForApproval, ReviewTarget, SandboxMode as V2SandboxMode,
+    ThreadForkParams, ThreadResumeParams, ThreadStartParams, UserInput,
 };
 use derivative::Derivative;
 use schemars::JsonSchema;
@@ -635,10 +634,6 @@ impl Codex {
         }
     }
 
-    fn combine_prompt(&self, prompt: &str) -> String {
-        self.append_prompt.combine_prompt(prompt)
-    }
-
     fn build_config_overrides(&self) -> Option<HashMap<String, Value>> {
         let mut overrides = HashMap::new();
 
@@ -899,7 +894,8 @@ impl Codex {
 mod continuation_tests {
     use async_trait::async_trait;
     use codex_app_server_protocol::{
-        JSONRPCError, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse,
+        ClientRequest, JSONRPCError, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse,
+        RequestId,
     };
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
@@ -1102,7 +1098,7 @@ mod continuation_tests {
         Codex::launch_codex_agent(
             codex.build_thread_start_params(&std::env::temp_dir(), &test_env()),
             Some("thread-1".to_string()),
-            codex.combine_prompt(prompt),
+            codex.append_prompt.combine_prompt(prompt),
             client.clone(),
         )
         .await
