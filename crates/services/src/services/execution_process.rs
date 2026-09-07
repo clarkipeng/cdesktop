@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io::{IsTerminal, Write},
     sync::Arc,
 };
@@ -16,11 +15,11 @@ use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::task::JoinHandle;
 use utils::{
     execution_logs::{
-        ExecutionLogWriter, LogAppend, execution_log_sha256, legacy_process_log_file_path_in_root,
-        process_log_file_path, read_execution_log_file,
+        CaptureOutcome, ExecutionLogWriter, LogAppend, execution_log_sha256,
+        legacy_process_log_file_path_in_root, process_log_file_path,
     },
     log_msg::LogMsg,
     msg_store::MsgStore,
@@ -214,50 +213,84 @@ pub async fn remove_session_process_logs(session_id: Uuid) -> Result<()> {
     }
 }
 
-pub async fn load_raw_log_messages(pool: &SqlitePool, execution_id: Uuid) -> Option<Vec<LogMsg>> {
-    if let Some(jsonl) = read_execution_logs_for_execution(pool, execution_id)
-        .await
-        .inspect_err(|e| {
-            tracing::warn!(
-                "Failed to read execution log file for execution {}: {:#}",
-                execution_id,
-                e
-            );
-        })
-        .ok()
-        .flatten()
-    {
-        let messages = utils::execution_logs::parse_log_jsonl_lossy(execution_id, &jsonl);
-        if !messages.is_empty() {
-            return Some(messages);
-        }
-    }
+pub struct RawLogMessages {
+    pub messages: Vec<LogMsg>,
+    pub complete: bool,
+}
 
-    let db_log_records = match ExecutionProcessLogs::find_by_execution_id(pool, execution_id).await
-    {
-        Ok(records) if !records.is_empty() => records,
-        Ok(_) => return None,
-        Err(e) => {
-            tracing::error!(
-                "Failed to fetch DB logs for execution {}: {}",
-                execution_id,
-                e
-            );
-            return None;
+pub async fn load_raw_log_messages(
+    pool: &SqlitePool,
+    execution_id: Uuid,
+) -> Option<RawLogMessages> {
+    let snapshot = match read_execution_logs_for_execution(pool, execution_id).await {
+        Ok(Some(snapshot)) => snapshot,
+        Err(error) => {
+            tracing::warn!(%execution_id, %error, "execution source unavailable");
+            return None; // A corrupt owner must not silently fall back to stale originals.
+        }
+        Ok(None) => {
+            // Bound both each SQL result and the accumulated UI view. Legacy
+            // capture predates coverage instrumentation, even if all rows fit.
+            let mut rows = sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT substr(CAST(logs AS BLOB), 1, ?2) FROM execution_process_logs WHERE execution_id = ?1 ORDER BY inserted_at, rowid"
+            ).bind(execution_id).bind(utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES as i64 + 1).fetch(pool);
+            let mut bytes = Vec::new();
+            while let Some(row) = rows.next().await {
+                let chunk = match row {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        tracing::warn!(%execution_id, %error, "legacy SQL logs unavailable");
+                        return None;
+                    }
+                };
+                let remaining =
+                    utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES as usize + 1 - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if bytes.len() > utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES as usize {
+                    break;
+                }
+                if !bytes.ends_with(b"\n") {
+                    bytes.push(b'\n');
+                }
+            }
+            if bytes.is_empty() {
+                return None;
+            }
+            legacy_snapshot(bytes).ok()?
         }
     };
+    let mut complete = snapshot.complete;
+    let messages = snapshot
+        .jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json::from_str(line) {
+            Ok(message) => Some(message),
+            Err(error) => {
+                complete = false;
+                tracing::warn!(%execution_id, %error, "invalid record in bounded UI snapshot");
+                None
+            }
+        })
+        .collect();
+    Some(RawLogMessages { messages, complete })
+}
 
-    match ExecutionProcessLogs::parse_logs(&db_log_records) {
-        Ok(msgs) => Some(msgs),
-        Err(e) => {
-            tracing::error!(
-                "Failed to parse DB logs for execution {}: {}",
-                execution_id,
-                e
-            );
-            None
-        }
+fn legacy_snapshot(mut bytes: Vec<u8>) -> std::io::Result<utils::execution_logs::LogSnapshot> {
+    let limit = utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES as usize;
+    if bytes.len() > limit {
+        bytes.truncate(limit);
+        let end = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        bytes.truncate(end);
     }
+    Ok(utils::execution_logs::LogSnapshot {
+        jsonl: String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        complete: false,
+    })
 }
 
 pub async fn append_log_message(session_id: Uuid, execution_id: Uuid, msg: &LogMsg) -> Result<()> {
@@ -279,154 +312,80 @@ pub async fn append_log_message(session_id: Uuid, execution_id: Uuid, msg: &LogM
     Ok(())
 }
 
-/// Invoked once when an execution's durable log hits its byte cap.
-///
-/// The implementor stops the owned process tree. Terminalization deliberately
-/// stays on the normal exit-monitor path so the exactly-once compare-and-set
-/// release keeps being the only writer of the terminal row.
-pub type LogLimitStop = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+/// Requests termination on recording failure. The native exit monitor remains
+/// the owner of terminal state; a recorder must never wait on its own monitor.
+pub type RecordingStop = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
-pub fn spawn_stream_raw_logs_to_storage(
-    msg_stores: Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>,
-    db: DBService,
-    execution_id: Uuid,
-    session_id: Uuid,
-    on_log_limit: Option<LogLimitStop>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let log_writer = match ExecutionLogWriter::new_for_execution(session_id, execution_id).await
-        {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to create log file writer for execution {}: {}",
-                    execution_id,
-                    e
-                );
-                return;
+/// Capture from the producer before the disposable UI mirror. Awaiting each
+/// durable append gives the OS pipe backpressure without a second output queue.
+pub async fn capture_raw_logs(
+    mut writer: ExecutionLogWriter,
+    mut stream: futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>,
+    store: Arc<MsgStore>,
+    on_failure: RecordingStop,
+) {
+    let result: Result<(), std::io::Error> = async {
+        while let Some(message) = stream.next().await {
+            let message = message?;
+            if matches!(message, LogMsg::Finished) {
+                break;
             }
-        };
-
-        let store = {
-            let map = msg_stores.read().await;
-            map.get(&execution_id).cloned()
-        };
-
-        if let Some(store) = store {
-            stream_logs_to_writer(
-                log_writer,
-                store.history_plus_stream(),
-                db,
-                execution_id,
-                on_log_limit,
-            )
-            .await;
+            let mut line = serde_json::to_string(&message).map_err(std::io::Error::other)?;
+            line.push('\n');
+            match writer.append_jsonl_line(&line).await? {
+                LogAppend::Written => store.push(message),
+                LogAppend::Blocked | LogAppend::Unavailable => {
+                    return Err(std::io::Error::other("execution recording unavailable"));
+                }
+            }
         }
-    })
+        writer.finish(CaptureOutcome::Complete).await
+    }
+    .await;
+
+    if let Err(error) = result {
+        tracing::error!(%error, path = %writer.path().display(), "execution recording failed");
+        if let Err(marker_error) = writer.finish(CaptureOutcome::Unavailable).await {
+            tracing::error!(%marker_error, "capture outcome unavailable; owner remains unsealed");
+        }
+        on_failure().await;
+    }
 }
 
-/// Drains `stream` into `log_writer`, firing `on_log_limit` the first time the
-/// writer's byte cap refuses a line.
-///
-/// Split out of the spawn so the byte-cap stop is testable against a small cap
-/// and a scripted stream, with no live child process.
-async fn stream_logs_to_writer(
-    mut log_writer: ExecutionLogWriter,
+/// Observe adapter identities separately from raw capture. The subscription is
+/// created by the caller before the executor starts, not inside the spawned task.
+pub fn spawn_session_metadata_sync(
     mut stream: futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>,
     db: DBService,
     execution_id: Uuid,
-    mut on_log_limit: Option<LogLimitStop>,
-) {
-    while let Some(Ok(msg)) = stream.next().await {
-        match &msg {
-            LogMsg::Stdout(_) | LogMsg::Stderr(_) => match serde_json::to_string(&msg) {
-                Ok(jsonl_line) => {
-                    let mut jsonl_line_with_newline = jsonl_line;
-                    jsonl_line_with_newline.push('\n');
-
-                    match log_writer.append_jsonl_line(&jsonl_line_with_newline).await {
-                        Ok(LogAppend::Written) => {}
-                        Ok(LogAppend::Blocked | LogAppend::Unavailable) => {
-                            // Continuing without durable evidence is a loss.
-                            // The first recording refusal stops the process
-                            // tree; terminalization remains on its normal
-                            // exactly-once exit-monitor path.
-                            if let Some(stop) = on_log_limit.take() {
-                                tracing::warn!(
-                                    "Execution {} recording stopped; stopping the process tree",
-                                    execution_id
-                                );
-                                stop().await;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to append log line for execution {}: {}",
-                                execution_id,
-                                e
-                            );
-                            // A write or fsync failure is not a display
-                            // issue: continuing would create an unrecorded
-                            // execution. Use the same exactly-once stop path
-                            // as admission refusal.
-                            if let Some(stop) = on_log_limit.take() {
-                                stop().await;
-                            }
-                        }
-                    }
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(message) = stream.next().await {
+            let result = match message {
+                Ok(LogMsg::SessionId(id)) => {
+                    CodingAgentTurn::update_agent_session_id(&db.pool, execution_id, &id).await
                 }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to serialize log message for execution {}: {}",
-                        execution_id,
-                        e
-                    );
+                Ok(LogMsg::MessageId(id)) => {
+                    CodingAgentTurn::update_agent_message_id(&db.pool, execution_id, &id).await
                 }
-            },
-            LogMsg::SessionId(agent_session_id) => {
-                if let Err(e) = CodingAgentTurn::update_agent_session_id(
-                    &db.pool,
-                    execution_id,
-                    agent_session_id,
-                )
-                .await
-                {
-                    tracing::error!(
-                        "Failed to update agent_session_id {} for execution process {}: {}",
-                        agent_session_id,
-                        execution_id,
-                        e
-                    );
+                Ok(LogMsg::Finished) => break,
+                Err(error) => {
+                    tracing::error!(%execution_id, %error, "session metadata stream incomplete");
+                    break;
                 }
+                _ => continue,
+            };
+            if let Err(error) = result {
+                tracing::error!(%execution_id, %error, "failed to retain adapter identity");
             }
-            LogMsg::MessageId(agent_message_id) => {
-                if let Err(e) = CodingAgentTurn::update_agent_message_id(
-                    &db.pool,
-                    execution_id,
-                    agent_message_id,
-                )
-                .await
-                {
-                    tracing::error!(
-                        "Failed to update agent_message_id {} for execution process {}: {}",
-                        agent_message_id,
-                        execution_id,
-                        e
-                    );
-                }
-            }
-            LogMsg::Finished => {
-                break;
-            }
-            LogMsg::JsonPatch(_) | LogMsg::Ready => continue,
         }
-    }
+    })
 }
 
 async fn read_execution_logs_for_execution(
     pool: &SqlitePool,
     execution_id: Uuid,
-) -> Result<Option<String>> {
+) -> Result<Option<utils::execution_logs::LogSnapshot>> {
     let session_id = if let Some(process) = ExecutionProcess::find_by_id(pool, execution_id).await?
     {
         process.session_id
@@ -436,9 +395,11 @@ async fn read_execution_logs_for_execution(
     let path = process_log_file_path(session_id, execution_id);
 
     match tokio::fs::metadata(&path).await {
-        Ok(_) => Ok(Some(read_execution_log_file(&path).await.with_context(
-            || format!("read execution log file for execution {execution_id}"),
-        )?)),
+        Ok(_) => Ok(Some(
+            utils::execution_logs::read_execution_log_snapshot(&path)
+                .await
+                .with_context(|| format!("read execution log file for execution {execution_id}"))?,
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Legacy files remain readable until the verified startup
             // migration publishes their compressed native replacement.
@@ -447,8 +408,15 @@ async fn read_execution_logs_for_execution(
                 session_id,
                 execution_id,
             );
-            match tokio::fs::read_to_string(&legacy_path).await {
-                Ok(contents) => Ok(Some(contents)),
+            match tokio::fs::File::open(&legacy_path).await {
+                Ok(file) => {
+                    use tokio::io::AsyncReadExt;
+                    let mut bytes = Vec::new();
+                    file.take(utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .await?;
+                    Ok(Some(legacy_snapshot(bytes)?))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error).with_context(|| {
                     format!("read legacy execution log file for execution {execution_id}")
@@ -482,16 +450,23 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::StreamExt as _;
-    use utils::execution_logs::ExecutionLogWriter;
+    use utils::execution_logs::{ExecutionLogWriter, read_execution_log_file};
 
     use super::*;
 
-    async fn scratch_db() -> DBService {
-        // The stream only touches the pool for SessionId/MessageId messages,
-        // which this test never sends.
-        DBService {
-            pool: sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
-        }
+    #[test]
+    fn legacy_view_reports_unknown_coverage_and_whole_records() {
+        let line = "{\"Stdout\":\"retained\"}\n";
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.extend_from_slice(&vec![
+            b'x';
+            utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES
+                as usize
+        ]);
+        let snapshot = legacy_snapshot(bytes).unwrap();
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.jsonl, line);
+        assert!(!legacy_snapshot(line.as_bytes().to_vec()).unwrap().complete);
     }
 
     fn scripted(
@@ -513,13 +488,13 @@ mod tests {
 
         let stops = Arc::new(AtomicUsize::new(0));
         let counter = stops.clone();
-        let on_log_limit: LogLimitStop = Box::new(move || {
+        let on_log_limit: RecordingStop = Box::new(move || {
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
             })
         });
 
-        stream_logs_to_writer(
+        capture_raw_logs(
             writer,
             scripted(vec![
                 LogMsg::Stdout("a".repeat(64)),
@@ -527,9 +502,8 @@ mod tests {
                 LogMsg::Stdout("c".repeat(64)),
                 LogMsg::Finished,
             ]),
-            scratch_db().await,
-            Uuid::new_v4(),
-            Some(on_log_limit),
+            Arc::new(MsgStore::new()),
+            on_log_limit,
         )
         .await;
 
@@ -546,21 +520,89 @@ mod tests {
 
         let stops = Arc::new(AtomicUsize::new(0));
         let counter = stops.clone();
-        let on_log_limit: LogLimitStop = Box::new(move || {
+        let on_log_limit: RecordingStop = Box::new(move || {
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
             })
         });
 
-        stream_logs_to_writer(
+        capture_raw_logs(
             writer,
             scripted(vec![LogMsg::Stdout("small".into()), LogMsg::Finished]),
-            scratch_db().await,
-            Uuid::new_v4(),
-            Some(on_log_limit),
+            Arc::new(MsgStore::new()),
+            on_log_limit,
         )
         .await;
 
         assert_eq!(stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn producer_bytes_survive_disposable_ui_eviction() {
+        // Capture has no broadcast subscriber: every producer record reaches
+        // the durable owner even when the entire UI history rolls over.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.jsonl.zst");
+        let writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+            .await
+            .unwrap();
+        let store = Arc::new(MsgStore::new());
+        let messages: Vec<_> = (0..48)
+            .map(|i| LogMsg::Stdout(format!("{i}:{}", "a".repeat(64 * 1024))))
+            .collect();
+        let expected = messages
+            .iter()
+            .map(|message| format!("{}\n", serde_json::to_string(message).unwrap()))
+            .collect::<String>();
+        capture_raw_logs(
+            writer,
+            scripted(messages),
+            store.clone(),
+            Box::new(|| Box::pin(async { panic!("healthy capture failed") })),
+        )
+        .await;
+        assert!(
+            store.get_history().len() < 48,
+            "fixture must exceed UI capacity"
+        );
+        assert_eq!(
+            execution_log_sha256(&path).await.unwrap().as_slice(),
+            Sha256::digest(expected.as_bytes()).as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_failure_stops_before_publishing_unrecorded_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.jsonl.zst");
+        let writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+            .await
+            .unwrap();
+        let store = Arc::new(MsgStore::new());
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counter = stops.clone();
+        let stream = futures::stream::iter(vec![
+            Ok(LogMsg::Stdout("retained".into())),
+            Err(std::io::Error::other("pipe failed")),
+            Ok(LogMsg::Stdout("not read".into())),
+        ])
+        .boxed();
+        capture_raw_logs(
+            writer,
+            stream,
+            store.clone(),
+            Box::new(move || {
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        )
+        .await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_eq!(store.get_history().len(), 1);
+        assert_eq!(
+            read_execution_log_file(&path).await.unwrap(),
+            "{\"Stdout\":\"retained\"}\n"
+        );
     }
 }

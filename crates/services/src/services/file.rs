@@ -178,6 +178,9 @@ impl FileService {
             hash.update(&chunk);
             output.write_all(&chunk).await?;
         }
+        // sync_all waits for buffered writes but retains their errors for the
+        // next write/flush. Observe that error before publishing the upload.
+        output.flush().await?;
         output.sync_all().await?;
         drop(output);
 

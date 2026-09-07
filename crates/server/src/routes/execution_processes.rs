@@ -76,6 +76,7 @@ struct NormalizedLogSnapshot {
     patch_count: usize,
     skipped_patch_count: usize,
     complete: bool,
+    incomplete_reason: Option<String>,
 }
 
 fn apply_normalized_message(
@@ -143,6 +144,7 @@ async fn get_normalized_log_snapshot(
     let mut patch_count = 0;
     let mut skipped_patch_count = 0;
     let mut complete = false;
+    let mut incomplete_reason = None;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
     while patch_count < 100_000 {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -157,13 +159,20 @@ async fn get_normalized_log_snapshot(
         let Ok(Some(message)) = next else {
             break;
         };
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                incomplete_reason = Some(error.to_string());
+                continue;
+            }
+        };
         if apply_normalized_message(
             &mut document,
-            message?,
+            message,
             &mut patch_count,
             &mut skipped_patch_count,
         ) {
-            complete = true;
+            complete = incomplete_reason.is_none() && skipped_patch_count == 0;
             break;
         }
     }
@@ -178,6 +187,7 @@ async fn get_normalized_log_snapshot(
         patch_count,
         skipped_patch_count,
         complete,
+        incomplete_reason,
     })))
 }
 
@@ -188,6 +198,14 @@ async fn get_raw_log_range(
     Extension(execution_process): Extension<ExecutionProcess>,
     Query(query): Query<RawLogRangeQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    if query.end < query.start
+        || query.end.saturating_sub(query.start)
+            > utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES
+    {
+        return Err(ApiError::BadRequest(
+            "invalid or oversized execution log range".into(),
+        ));
+    }
     let path = utils::execution_logs::process_log_file_path(
         execution_process.session_id,
         execution_process.id,
@@ -200,10 +218,21 @@ async fn get_raw_log_range(
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .header(
             "x-cdesktop-source-range",
-            format!("[{}, {})", query.start, query.end),
+            format!("[{}, {})", query.start, query.start + bytes.len() as u64),
         )
+        .header("x-cdesktop-source-id", execution_process.id.to_string())
         .body(axum::body::Body::from(bytes))
         .map_err(|error| ApiError::BadRequest(error.to_string()))
+}
+
+/// Capture completion is an owner fact, not a guess from the execution's exit
+/// status or a short range read. Missing/corrupt owners return errors.
+async fn get_raw_log_status(
+    Extension(process): Extension<ExecutionProcess>,
+) -> Result<ResponseJson<ApiResponse<utils::execution_logs::OwnerSummary>>, ApiError> {
+    let path = utils::execution_logs::process_log_file_path(process.session_id, process.id);
+    let status = utils::execution_logs::scan_owner(&path).await?;
+    Ok(ResponseJson(ApiResponse::success(status)))
 }
 
 /// Durable producer entry point for checkpoints and reports. Artifact bytes
@@ -618,6 +647,7 @@ fn execution_routes() -> Router<DeploymentImpl> {
         .route("/repo-states", get(get_execution_process_repo_states))
         .route("/normalized-snapshot", get(get_normalized_log_snapshot))
         .route("/raw-log", get(get_raw_log_range))
+        .route("/raw-log/status", get(get_raw_log_status))
         .route(
             "/artifacts",
             post(upload_execution_artifact).layer(DefaultBodyLimit::disable()),

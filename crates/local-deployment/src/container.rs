@@ -36,7 +36,7 @@ use executors::{
     logs::{NormalizedEntryType, utils::patch::extract_normalized_entry_from_patch},
     outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
 };
-use futures::{FutureExt, TryStreamExt, stream::select};
+use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture, stream::select};
 use git::GitService;
 use serde_json::json;
 use services::services::{
@@ -57,7 +57,10 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::io::ReaderStream;
-use utils::{log_msg::LogMsg, msg_store::MsgStore, text::truncate_to_char_boundary};
+use utils::{
+    execution_logs::ExecutionLogWriter, log_msg::LogMsg, msg_store::MsgStore,
+    text::truncate_to_char_boundary,
+};
 use uuid::Uuid;
 use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 
@@ -88,14 +91,11 @@ pub struct LocalContainerService {
     child_store: Arc<RwLock<HashMap<Uuid, Arc<RwLock<AsyncGroupChild>>>>>,
     cancellation_tokens: Arc<RwLock<HashMap<Uuid, CancellationToken>>>,
     msg_stores: Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>,
-    /// Tracks background tasks that stream logs to the database.
-    /// When stopping execution, we await these to ensure logs are fully persisted.
+    /// Adapter identity synchronization; raw capture is owned by the exit monitor.
     db_stream_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
     exit_monitor_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
-    /// Executions stopped by cdesktop's own log byte cap. Read once by the
-    /// exit monitor so the terminal row carries `local_log_limit` instead of
-    /// the meaningless exit status of a process we killed ourselves.
-    log_limit_hits: Arc<RwLock<HashSet<Uuid>>>,
+    /// Recording failures override the exit status of a process we stopped.
+    recording_failures: Arc<RwLock<HashSet<Uuid>>>,
     workspace_touch_times: Arc<RwLock<HashMap<Uuid, Instant>>>,
     scheduler_lock: Arc<Mutex<()>>,
     config: Arc<RwLock<Config>>,
@@ -137,7 +137,7 @@ impl LocalContainerService {
             msg_stores,
             db_stream_handles,
             exit_monitor_handles,
-            log_limit_hits: Arc::new(RwLock::new(HashSet::new())),
+            recording_failures: Arc::new(RwLock::new(HashSet::new())),
             workspace_touch_times,
             scheduler_lock: Arc::new(Mutex::new(())),
             config,
@@ -567,6 +567,7 @@ impl LocalContainerService {
         &self,
         exec_id: &Uuid,
         exit_signal: Option<ExecutorExitSignal>,
+        capture: JoinHandle<()>,
     ) -> JoinHandle<()> {
         let exec_id = *exec_id;
         let child_store = self.child_store.clone();
@@ -575,7 +576,7 @@ impl LocalContainerService {
         let config = self.config.clone();
         let container = self.clone();
         let analytics = self.analytics.clone();
-        let log_limit_hits = self.log_limit_hits.clone();
+        let recording_failures = self.recording_failures.clone();
 
         let mut process_exit_rx = self.spawn_os_exit_watcher(exec_id);
 
@@ -606,12 +607,17 @@ impl LocalContainerService {
                     )
                 }
             };
-            // cdesktop stopped this process itself because its log hit the
-            // byte cap, so the OS exit says nothing useful. Report the real
-            // reason - still through the same exactly-once CAS below, never a
-            // second terminal writer.
-            let outcome = if log_limit_hits.write().await.remove(&exec_id) {
-                NormalizedProcessOutcome::blocked_by_log_limit()
+            // Descendants must close inherited pipes before the recorder can
+            // drain. Process completion is published only after durable capture.
+            if let Some(child_lock) = child_store.read().await.get(&exec_id).cloned() {
+                let _ = child_lock.write().await.start_kill();
+            }
+            if let Err(error) = capture.await {
+                tracing::error!(%exec_id, %error, "raw capture task failed");
+                recording_failures.write().await.insert(exec_id);
+            }
+            let outcome = if recording_failures.write().await.remove(&exec_id) {
+                NormalizedProcessOutcome::recording_failed()
             } else {
                 outcome
             };
@@ -782,13 +788,6 @@ impl LocalContainerService {
                 let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
             }
 
-            // SIGKILL any orphaned children (e.g. MCP servers) still in the
-            // process group. The executor itself is already done — either it
-            // exited naturally or was killed in the exit-signal branch above.
-            if let Some(child_lock) = child_store.read().await.get(&exec_id).cloned() {
-                let mut child = child_lock.write().await;
-                let _ = child.start_kill();
-            }
             child_store.write().await.remove(&exec_id);
         })
     }
@@ -830,11 +829,12 @@ impl LocalContainerService {
         rx
     }
 
-    async fn track_child_msgs_in_store(
+    async fn prepare_child_log_capture(
         &self,
-        id: Uuid,
+        process: &ExecutionProcess,
         child: &mut AsyncGroupChild,
-    ) -> Result<(), ContainerError> {
+    ) -> Result<BoxFuture<'static, ()>, ContainerError> {
+        let id = process.id;
         let store = self
             .get_msg_store_by_id(&id)
             .await
@@ -850,12 +850,31 @@ impl LocalContainerService {
         let err = ReaderStream::new(err)
             .map_ok(|chunk| LogMsg::Stderr(String::from_utf8_lossy(&chunk).into_owned()));
 
-        // If you have a JSON Patch source, map it to LogMsg::JsonPatch too, then select all three.
-
-        // Merge and forward into the store
-        let merged = select(out, err); // Stream<Item = Result<LogMsg, io::Error>>
-        store.clone().spawn_forwarder(merged);
-        Ok(())
+        let writer = ExecutionLogWriter::new_for_execution(process.session_id, id).await?;
+        let container = self.clone();
+        let stop: execution_process_service::RecordingStop = Box::new(move || {
+            async move {
+                // Never call stop_execution here: it awaits the monitor that
+                // owns this recorder, creating a shutdown cycle.
+                container.recording_failures.write().await.insert(id);
+                if let Some(cancel) = container.cancellation_tokens.read().await.get(&id) {
+                    cancel.cancel();
+                }
+                if let Some(child) = container.get_child_from_store(&id).await
+                    && let Err(error) = child.write().await.start_kill()
+                {
+                    tracing::error!(%id, %error, "failed to stop unrecorded process");
+                }
+            }
+            .boxed()
+        });
+        Ok(execution_process_service::capture_raw_logs(
+            writer,
+            select(out, err).boxed(),
+            store,
+            stop,
+        )
+        .boxed())
     }
 
     /// Create a live diff log stream for ongoing attempts for WebSocket
@@ -1021,22 +1040,6 @@ impl LocalContainerService {
     }
 }
 
-/// Whether the durable log's byte cap should stop this process tree.
-///
-/// Coding agents are unbounded producers: a cap that only drops their output
-/// leaves them running and spending with nothing recorded. Scripts are bounded
-/// work with bounded output, so their logs are capped and marked and the
-/// script is left to finish.
-fn log_limit_stops_process(run_reason: &ExecutionProcessRunReason) -> bool {
-    match run_reason {
-        ExecutionProcessRunReason::CodingAgent => true,
-        ExecutionProcessRunReason::SetupScript
-        | ExecutionProcessRunReason::CleanupScript
-        | ExecutionProcessRunReason::ArchiveScript
-        | ExecutionProcessRunReason::DevServer => false,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum NormalizedProcessOutcome {
     Success {
@@ -1067,15 +1070,13 @@ impl NormalizedProcessOutcome {
         }
     }
 
-    /// cdesktop's own log byte cap stopped the process tree. Mirrors the
-    /// storage-limit outcome (`local_storage_limit`): a local, cdesktop-owned
-    /// limit, not a provider or task failure.
-    fn blocked_by_log_limit() -> Self {
+    /// Recording failed locally; provider success cannot make it a complete record.
+    fn recording_failed() -> Self {
         Self::Failure {
             exit_code: None,
             outcome: Some(
                 NormalizedExecutionOutcome::new(ExecutionOutcomeClass::TaskFailed)
-                    .with_provider_code("local_log_limit"),
+                    .with_provider_code("local_recording_unavailable"),
             ),
         }
     }
@@ -1447,13 +1448,16 @@ impl ContainerService for LocalContainerService {
             ))
         })??;
 
-        if let Err(e) = self
-            .track_child_msgs_in_store(execution_process.id, &mut spawned.child)
+        let capture = match self
+            .prepare_child_log_capture(execution_process, &mut spawned.child)
             .await
         {
-            let _ = command::kill_process_group(&mut spawned.child).await;
-            return Err(e);
-        }
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = command::kill_process_group(&mut spawned.child).await;
+                return Err(error);
+            }
+        };
 
         self.add_child_to_store(execution_process.id, spawned.child)
             .await;
@@ -1465,52 +1469,11 @@ impl ContainerService for LocalContainerService {
         }
 
         // Spawn unified exit monitor: watches OS exit and optional executor signal
-        let hn = self.spawn_exit_monitor(&execution_process.id, spawned.exit_signal);
+        let capture = tokio::spawn(capture);
+        let hn = self.spawn_exit_monitor(&execution_process.id, spawned.exit_signal, capture);
         self.add_exit_monitor_handle(execution_process.id, hn).await;
 
         Ok(())
-    }
-
-    /// Persist logs, and for coding agents arm the byte cap to stop the
-    /// process tree.
-    ///
-    /// A cap that only drops lines is a log eater: the agent keeps running,
-    /// keeps spending, and nothing it does after the cap is recorded. Scripts
-    /// are bounded work with bounded output, so they keep the cap-and-mark
-    /// behaviour and are left to finish.
-    async fn spawn_log_persistence(&self, execution_process: &ExecutionProcess) {
-        let on_log_limit: Option<execution_process_service::LogLimitStop> =
-            if log_limit_stops_process(&execution_process.run_reason) {
-                let container = self.clone();
-                let process = execution_process.clone();
-                Some(Box::new(move || {
-                    Box::pin(async move {
-                        // Mark first: the stop below makes the exit monitor
-                        // fire, and it must already see why.
-                        container.log_limit_hits.write().await.insert(process.id);
-                        if let Err(error) = container
-                            .stop_execution(&process, ExecutionProcessStatus::Failed)
-                            .await
-                        {
-                            tracing::error!(
-                                execution_process_id = %process.id,
-                                %error,
-                                "failed to stop process tree after its log hit the byte cap"
-                            );
-                        }
-                    })
-                }))
-            } else {
-                None
-            };
-
-        execution_process_service::spawn_stream_raw_logs_to_storage(
-            self.msg_stores().clone(),
-            self.db().clone(),
-            execution_process.id,
-            execution_process.session_id,
-            on_log_limit,
-        );
     }
 
     async fn stop_execution(
@@ -1796,35 +1759,21 @@ mod tests {
     }
 
     #[test]
-    fn log_limit_terminal_is_typed_not_unknown() {
+    fn recording_failure_terminal_is_typed_not_unknown() {
         // cdesktop killed this process itself, so the exit status carries no
         // information. Without an explicit outcome the row read as an
         // unclassified failure and the reason for the stop was unrecoverable.
-        let outcome = NormalizedProcessOutcome::blocked_by_log_limit();
+        let outcome = NormalizedProcessOutcome::recording_failed();
         assert_eq!(
             outcome.status_and_exit_code(),
             (ExecutionProcessStatus::Failed, None)
         );
         let normalized = outcome.normalized_outcome().expect("typed outcome");
         assert_eq!(normalized.class, ExecutionOutcomeClass::TaskFailed);
-        assert_eq!(normalized.provider_code.as_deref(), Some("local_log_limit"));
-    }
-
-    #[test]
-    fn only_coding_agents_are_stopped_by_the_log_cap() {
-        // Scripts are bounded producers and are left to finish; unbounded
-        // coding agents are the case the cap exists for.
-        assert!(log_limit_stops_process(
-            &ExecutionProcessRunReason::CodingAgent
-        ));
-        for bounded in [
-            ExecutionProcessRunReason::SetupScript,
-            ExecutionProcessRunReason::CleanupScript,
-            ExecutionProcessRunReason::ArchiveScript,
-            ExecutionProcessRunReason::DevServer,
-        ] {
-            assert!(!log_limit_stops_process(&bounded), "{bounded:?}");
-        }
+        assert_eq!(
+            normalized.provider_code.as_deref(),
+            Some("local_recording_unavailable")
+        );
     }
 
     #[test]

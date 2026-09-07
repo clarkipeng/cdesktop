@@ -24,6 +24,7 @@ struct StoredMsg {
 struct Inner {
     history: VecDeque<StoredMsg>,
     total_bytes: usize,
+    evicted: bool,
 }
 
 pub struct MsgStore {
@@ -44,22 +45,30 @@ impl MsgStore {
             inner: RwLock::new(Inner {
                 history: VecDeque::with_capacity(32),
                 total_bytes: 0,
+                evicted: false,
             }),
             sender,
         }
     }
 
     pub fn push(&self, msg: LogMsg) {
-        let _ = self.sender.send(msg.clone()); // live listeners
         let bytes = msg.approx_bytes();
 
         let mut inner = self.inner.write().unwrap();
+        // Publication and history/subscription snapshots share one lock. A
+        // concurrent subscriber sees every message exactly once, never a gap.
+        let _ = self.sender.send(msg.clone());
         while inner.total_bytes.saturating_add(bytes) > *HISTORY_BYTES {
             if let Some(front) = inner.history.pop_front() {
                 inner.total_bytes = inner.total_bytes.saturating_sub(front.bytes);
+                inner.evicted = true;
             } else {
                 break;
             }
+        }
+        if bytes > *HISTORY_BYTES {
+            inner.evicted = true;
+            return;
         }
         inner.history.push_back(StoredMsg { msg, bytes });
         inner.total_bytes = inner.total_bytes.saturating_add(bytes);
@@ -100,24 +109,38 @@ impl MsgStore {
             .collect()
     }
 
+    pub fn history_complete(&self) -> bool {
+        !self.inner.read().unwrap().evicted
+    }
+
     /// History then live, as `LogMsg`.
     pub fn history_plus_stream(
         &self,
     ) -> futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>> {
-        let (history, rx) = (self.get_history(), self.get_receiver());
+        let (history, rx, evicted) = {
+            let inner = self.inner.read().unwrap();
+            (
+                inner
+                    .history
+                    .iter()
+                    .map(|entry| entry.msg.clone())
+                    .collect::<Vec<_>>(),
+                self.sender.subscribe(),
+                inner.evicted,
+            )
+        };
 
-        let hist = futures::stream::iter(history.into_iter().map(Ok::<_, std::io::Error>));
-        let live = BroadcastStream::new(rx).filter_map(|res| async move {
-            match res {
-                Ok(msg) => Some(Ok(msg)),
-                Err(BroadcastStreamRecvError::Lagged(n)) => {
-                    tracing::error!(
-                        skipped = n,
-                        "MsgStore broadcast lagged. {n} messages dropped for this subscriber"
-                    );
-                    None
-                }
-            }
+        let gap = evicted.then(|| {
+            Err(std::io::Error::other(
+                "UI history evicted; read durable execution evidence for complete output",
+            ))
+        });
+        let hist = futures::stream::iter(gap.into_iter().chain(history.into_iter().map(Ok)));
+        let live = BroadcastStream::new(rx).map(|res| match res {
+            Ok(msg) => Ok(msg),
+            Err(BroadcastStreamRecvError::Lagged(n)) => Err(std::io::Error::other(format!(
+                "UI stream lagged by {n} messages; read durable execution evidence"
+            ))),
         });
 
         Box::pin(hist.chain(live))
@@ -131,6 +154,7 @@ impl MsgStore {
             .filter_map(|res| async move {
                 match res {
                     Ok(LogMsg::Stdout(s)) => Some(Ok(s)),
+                    Err(error) => Some(Err(error)),
                     _ => None,
                 }
             })
@@ -151,6 +175,7 @@ impl MsgStore {
             .filter_map(|res| async move {
                 match res {
                     Ok(LogMsg::Stderr(s)) => Some(Ok(s)),
+                    Err(error) => Some(Err(error)),
                     _ => None,
                 }
             })
@@ -200,5 +225,36 @@ mod tests {
         }
         let inner = store.inner.read().unwrap();
         assert!(inner.total_bytes <= *HISTORY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn history_to_live_handoff_has_no_duplicates_or_holes() {
+        let store = Arc::new(MsgStore::new());
+        let producer = store.clone();
+        let handle = std::thread::spawn(move || {
+            for i in 0..1000 {
+                producer.push_stdout(i.to_string());
+            }
+            producer.push_finished();
+        });
+        let mut stream = store.history_plus_stream();
+        for i in 0..1000 {
+            assert!(
+                matches!(stream.next().await.unwrap().unwrap(), LogMsg::Stdout(text) if text == i.to_string())
+            );
+        }
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            LogMsg::Finished
+        ));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_ui_message_is_bounded_and_reports_a_gap() {
+        let store = MsgStore::new();
+        store.push_stdout("x".repeat(*HISTORY_BYTES + 1));
+        assert!(store.get_history().is_empty());
+        assert!(store.history_plus_stream().next().await.unwrap().is_err());
     }
 }
