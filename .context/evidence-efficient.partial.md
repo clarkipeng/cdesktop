@@ -8,16 +8,17 @@
   or a rollout path.
 - `/compact` resumes the same thread before native compaction instead of
   creating a copied fork. Reviews remain the intentional fork path.
-- Follow-up user input contains only the new task; configured static guidance
-  is passed separately as native thread instructions.
+- Follow-up user input contains the new task plus the current configured
+  `append_prompt` suffix; configured static guidance stays separate as native
+  thread instructions.
 - `/fast` no longer creates an unused fork after changing its existing setting.
 
 ## Review correction
 
-- `append_prompt` becomes native turn-scoped collaboration developer guidance,
-  not stored start/resume configuration. This keeps it out of repeated
-  user-turn input, allows changed/cleared guidance on the next turn, and does
-  not replace Codex's default base instructions.
+- `append_prompt` remains a per-turn user-prompt suffix, not start/resume
+  configuration or collaboration developer guidance. Changed and cleared
+  values affect the current new turn without replacing Codex's default base
+  instructions or rewriting static developer guidance.
 - A fake JSON-RPC app-server exercises the real `AppServerClient` and
   `launch_codex_agent` continuation path for repeated resumes,
   cancellation/restart, absent explicit base guidance, and changed/cleared
@@ -26,7 +27,7 @@
 
 ## Verification
 
-- Passed isolated: `cargo test -p executors --lib` under
+- Passed isolated: `cargo test -p executors --lib` under Suva's
   `evidence-test-isolation.sb` (111 passed).
 - Passed: `cargo clippy -p executors --tests -- -D warnings`, `pnpm run format`,
   and `git diff --check`.
@@ -42,13 +43,15 @@
 - Usage updates retain `thread_id` and `turn_id`, and a second notification for
   the same turn replaces its normalized entry instead of replaying old usage.
 
-## Remaining proof
+## Native proof
 
-- The pinned app-server mock-server test for null collaboration developer
-  guidance has not run. Its local vendor cache lacked dependencies and the
-  isolated attempt was stopped before it could fetch them. Run it in a
-  pre-provisioned sandbox to confirm the built-in mode guidance at that exact
-  boundary before declaring the lane complete.
+- The exact pinned native app-server was built in an isolated temporary vendor
+  checkout and run with a local mock provider, fresh native home, and Suva's
+  sandbox policy. The first start and fresh-process resume both sent null
+  collaboration developer guidance and preserved default base instructions.
+  The mock observed the append suffix only in its first new user turn and a
+  cleared suffix only in the next turn's current user input; old native history
+  was retained once, not replayed by cdesktop.
 
 ## Constraints retained
 

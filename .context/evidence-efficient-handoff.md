@@ -19,32 +19,35 @@
   remains applied only to the review isolation path.
 - `/compact` now resumes in place before native compaction. `/fast` no longer
   creates an unused fork. The deliberate review path still forks.
-- Static append-prompt material is sent as native turn-scoped collaboration
-  developer guidance, not stored in start/resume thread config. Follow-ups
-  carry only new task input. `base_instructions` remains unset without an
-  explicit base, so Codex resolves its stored or model-default instructions
-  normally; changing or clearing append guidance applies to the next turn.
+- `append_prompt` remains its documented per-turn user-prompt suffix. It is
+  neither stored in start/resume thread configuration nor written into native
+  collaboration guidance. A changed or cleared value therefore affects only
+  the new turn; configured developer instructions stay separate.
+  `base_instructions` remains unset without an explicit base, so Codex
+  resolves its stored or model-default instructions normally.
 
 ## Evidence and limits
 
 - The pinned `codex-app-server-protocol` checkout at
   `be6e8eac029b183056b7e4402879f15d2c85f61b` declares
-  `ThreadResume -> thread/resume`; official OpenAI app-server documentation
-  likewise distinguishes `thread/resume` (continue) from `thread/fork`
-  (branch).
+  `ThreadResume -> thread/resume`.
 - Local source evidence: no ordinary path retains a `thread_fork` call;
   `thread_fork` is reached only by `codex/review.rs`.
 - An in-memory fake JSON-RPC app-server drives the production
   `AppServerClient` and `launch_codex_agent` path. It proves two ordinary
   continuations emit `account/read`/`thread/resume`/`turn/start` on one thread
   with zero forks. A separate protocol serialization fixture keeps the review
-  branch on `thread/fork`. The peer also captures the changed/cleared
-  turn-scoped guidance and cancellation of an unresolved `turn/start`, which
-  returns without replaying it. Pinned app-server source shows that null
-  collaboration developer guidance selects the built-in mode setting; no
-  append guidance is stored on resume. The pinned server itself was not run:
-  its isolated test requires dependencies absent from the local vendor cache,
-  and the attempt was stopped before it could fetch them.
+  branch on `thread/fork`. The peer also captures changed/cleared per-turn
+  append input and cancellation of an unresolved `turn/start`, which returns
+  without replaying it.
+- An isolated exact-pinned native `codex-app-server` plus local HTTP mock
+  provider was built outside the worktree. With a fresh temporary `CODEX_HOME`
+  and the Suva sandbox policy, it executed `thread/start`, `turn/start`, a
+  fresh-process `thread/resume`, and another `turn/start`. Both turns sent a
+  null collaboration developer setting and retained the server's default base
+  instructions. The mock saw the configured append suffix only on the first
+  new user turn; the resumed turn contained only its new prompt. Historical
+  input remains native thread history and was not duplicated by cdesktop.
 - Normalization keys usage by native thread and turn, so repeated usage updates
   for one turn replace its entry rather than replaying old usage.
 - Measured local copy/startup result: not yet available. No provider/cache or
@@ -54,11 +57,15 @@
 
 - `git diff --check`: passed.
 - Passed isolated command:
-  `/usr/bin/sandbox-exec -f /Users/clarkpeng/conductor/workspaces/sightmesh-v1/ankara/.context/evidence-test-isolation.sb cargo test -p executors --lib`
+  `/usr/bin/sandbox-exec -f /Users/clarkpeng/conductor/workspaces/sightmesh/suva/.context/evidence-test-isolation.sb cargo test -p executors --lib`
   Exit `0`; 111 passed.
-- `cargo clippy -p executors --tests -- -D warnings`: exit `0`.
-- `pnpm run format`: exit `0` after `pnpm install --frozen-lockfile`; no source
-  formatting changes outside this lane.
+- Passed isolated command:
+  `/usr/bin/sandbox-exec -f /Users/clarkpeng/conductor/workspaces/sightmesh/suva/.context/evidence-test-isolation.sb cargo clippy -p executors --tests -- -D warnings`
+  Exit `0`.
+- Passed native mock proof under the same policy: `python3
+  /tmp/sm-ev-efficient-vendor.lHx9Tw/native_guidance_proof.py
+  /tmp/sm-ev-efficient-vendor.lHx9Tw/target/debug/codex-app-server` with
+  `CODEX_HOME=/tmp/sm-ev-efficient-vendor.lHx9Tw/native-home`; exit `0`.
 - All runtime checks used the required state/network isolation profile where
   applicable. No provider request or live state mutation occurred.
 
@@ -69,10 +76,7 @@ mistaken upstream `cdesktop-ai/cdesktop` PR #21 was closed without deleting the
 fork branch. No merge, provider inference, cdesktop install/activation, or
 service restart was performed.
 
-## Remaining proof
+## Completion
 
-The pinned app-server mock-server test still needs to run in an environment
-with its already-provisioned toolchain and dependency cache. It is the final
-executable confirmation that a null turn collaboration override restores the
-built-in mode guidance. This lane is checkpointed, not complete, until that
-test is recorded.
+The required pinned mock-server proof is recorded above. The live authenticated
+canary remains root-owned and was not run.

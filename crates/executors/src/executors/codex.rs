@@ -627,16 +627,16 @@ impl Codex {
             approval_policy,
             sandbox,
             config,
-            // `append_prompt` is supplied with each native turn's
-            // collaboration settings, not this persistent thread config.
-            // That lets a later cleared value take effect without replacing
-            // the model's default base instructions or retaining old guidance.
             base_instructions: self.base_instructions.clone(),
             model_provider,
             developer_instructions: self.developer_instructions.clone(),
             service_tier,
             ..Default::default()
         }
+    }
+
+    fn combine_prompt(&self, prompt: &str) -> String {
+        self.append_prompt.combine_prompt(prompt)
     }
 
     fn build_config_overrides(&self) -> Option<HashMap<String, Value>> {
@@ -691,14 +691,8 @@ impl Codex {
             move |client, _| async move {
                 match action {
                     CodexSessionAction::Chat { prompt } => {
-                        Self::launch_codex_agent(
-                            params,
-                            resume_session,
-                            prompt,
-                            append_prompt,
-                            client,
-                        )
-                        .await
+                        let prompt = AppendPrompt(append_prompt).combine_prompt(&prompt);
+                        Self::launch_codex_agent(params, resume_session, prompt, client).await
                     }
                     CodexSessionAction::Review { target } => {
                         review::launch_codex_review(params, resume_session, target, client).await
@@ -713,7 +707,6 @@ impl Codex {
         thread_start_params: ThreadStartParams,
         resume_session: Option<String>,
         combined_prompt: String,
-        append_prompt: Option<String>,
         client: Arc<AppServerClient>,
     ) -> Result<(), ExecutorError> {
         let account = client.get_account().await?;
@@ -742,7 +735,7 @@ impl Codex {
 
         client.set_resolved_model(resolved_model);
         client.register_session(&thread_id).await?;
-        let collaboration_mode = client.initial_collaboration_mode(append_prompt)?;
+        let collaboration_mode = client.initial_collaboration_mode()?;
         client
             .turn_start_with_mode(
                 thread_id,
@@ -965,27 +958,36 @@ mod continuation_tests {
     }
 
     #[tokio::test]
-    async fn changed_and_cleared_append_guidance_replaces_the_native_turn_setting() {
-        let original = run_follow_up("first task", Some("original guidance")).await;
-        let changed = run_follow_up("second task", Some("changed guidance")).await;
-        let cleared = run_follow_up("third task", None).await;
+    async fn changed_and_cleared_append_guidance_changes_only_the_new_turn_input() {
+        let original = run_follow_up(
+            codex_with_guidance(None, None, Some("original guidance")),
+            "first task",
+        )
+        .await;
+        let changed = run_follow_up(
+            codex_with_guidance(None, None, Some("changed guidance")),
+            "second task",
+        )
+        .await;
+        let cleared = run_follow_up(codex_with_guidance(None, None, None), "third task").await;
 
         for requests in [&original, &changed, &cleared] {
             assert!(requests[1]["params"]["baseInstructions"].is_null());
             assert!(requests[1]["params"]["developerInstructions"].is_null());
+            assert!(
+                requests[2]["params"]["collaborationMode"]["settings"]["developer_instructions"]
+                    .is_null()
+            );
         }
         assert_eq!(
-            original[2]["params"]["collaborationMode"]["settings"]["developer_instructions"],
-            "original guidance"
+            original[2]["params"]["input"][0]["text"],
+            "first taskoriginal guidance"
         );
         assert_eq!(
-            changed[2]["params"]["collaborationMode"]["settings"]["developer_instructions"],
-            "changed guidance"
+            changed[2]["params"]["input"][0]["text"],
+            "second taskchanged guidance"
         );
-        assert!(
-            cleared[2]["params"]["collaborationMode"]["settings"]["developer_instructions"]
-                .is_null()
-        );
+        assert_eq!(cleared[2]["params"]["input"][0]["text"], "third task");
     }
 
     fn codex_with_guidance(
@@ -1020,8 +1022,10 @@ mod continuation_tests {
 
     #[tokio::test]
     async fn ordinary_continuations_emit_resume_then_a_new_turn_without_forking() {
-        let first = run_follow_up("first continuation", None).await;
-        let second = run_follow_up("second continuation", None).await;
+        let first =
+            run_follow_up(codex_with_guidance(None, None, None), "first continuation").await;
+        let second =
+            run_follow_up(codex_with_guidance(None, None, None), "second continuation").await;
         let requests = [first, second].concat();
 
         assert_eq!(
@@ -1066,7 +1070,6 @@ mod continuation_tests {
             ThreadStartParams::default(),
             Some("thread-1".to_string()),
             "interrupted continuation".to_string(),
-            None,
             client.clone(),
         ));
 
@@ -1094,13 +1097,12 @@ mod continuation_tests {
         server.await.unwrap();
     }
 
-    async fn run_follow_up(prompt: &str, append_prompt: Option<&str>) -> Vec<Value> {
+    async fn run_follow_up(codex: Codex, prompt: &str) -> Vec<Value> {
         let (client, mut requests, cancel, shutdown, server) = fake_app_server(true);
         Codex::launch_codex_agent(
-            ThreadStartParams::default(),
+            codex.build_thread_start_params(&std::env::temp_dir(), &test_env()),
             Some("thread-1".to_string()),
-            prompt.to_string(),
-            append_prompt.map(str::to_string),
+            codex.combine_prompt(prompt),
             client.clone(),
         )
         .await
