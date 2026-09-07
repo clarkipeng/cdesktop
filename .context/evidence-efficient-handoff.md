@@ -4,9 +4,8 @@
 
 - Base: `cf555c5b23b52bbd2f8eb6f10b30af72c68be58f`
 - Branch: `cdt/9e93-sm-ev-efficient`
-- Initial implementation commit: `119d0958af548c05098923a460dfb36a86e4f8a9`.
-- Draft PR: https://github.com/cdesktop-ai/cdesktop/pull/21
-- Fork target when publishing is authorized: `clarkipeng/cdesktop`
+- Fork-only draft PR: https://github.com/clarkipeng/cdesktop/pull/37
+- Publication target: `clarkipeng/cdesktop`
 
 ## Implemented
 
@@ -59,6 +58,7 @@
 
 ## Publication state
 
-The revision is committed and force-pushed to the existing draft PR. No merge,
-provider inference, cdesktop install/activation, or service restart was
-performed.
+The fork branch is published and API-verified against draft PR #37. The
+mistaken upstream `cdesktop-ai/cdesktop` PR #21 was closed without deleting the
+fork branch. No merge, provider inference, cdesktop install/activation, or
+service restart was performed.

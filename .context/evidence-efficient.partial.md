@@ -23,8 +23,10 @@
 
 ## Verification
 
-- Passed: `cargo test -p executors continuation_tests --lib` under
-  `evidence-test-isolation.sb` with a temporary `TMPDIR` (2 passed).
+- Passed isolated: `cargo test -p executors --lib` under
+  `evidence-test-isolation.sb` (110 passed).
+- Passed: `cargo clippy -p executors --tests -- -D warnings`, `pnpm run format`,
+  and `git diff --check`.
 
 ## Completed proof
 
@@ -43,3 +45,10 @@
 - `thread_resume` performs the same start-admission check as a new thread;
   fork-specific reservation remains limited to actual forks.
 - No DB, migration, lockfile, provider, or SightMesh wake files were changed.
+
+## Publication correction
+
+- The only active draft is https://github.com/clarkipeng/cdesktop/pull/37 on
+  `clarkipeng/cdesktop`.
+- The mistakenly opened upstream `cdesktop-ai/cdesktop` PR #21 is closed; its
+  fork branch was not deleted.
