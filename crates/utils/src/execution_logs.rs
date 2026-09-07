@@ -69,7 +69,7 @@ pub(crate) fn in_memory_log_bytes() -> u64 {
         .unwrap_or(DEFAULT_IN_MEMORY_LOG_BYTES)
 }
 
-fn free_disk_reserve_bytes() -> u64 {
+pub fn free_disk_reserve_bytes() -> u64 {
     std::env::var(FREE_DISK_RESERVE_BYTES_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -312,9 +312,9 @@ impl ExecutionLogWriter {
             return Ok(());
         }
         self.marker_written = true;
-        let marker = LogMsg::Stderr(format!(
-            "[cdesktop] execution recording stopped: blocked(disk-reserve)"
-        ));
+        let marker = LogMsg::Stderr(
+            "[cdesktop] execution recording stopped: blocked(disk-reserve)".to_owned(),
+        );
         if let Ok(mut line) = serde_json::to_string(&marker) {
             line.push('\n');
             self.append_control_line(&line).await?;
@@ -432,10 +432,7 @@ fn stream_intersecting_frames(path: &Path, start: u64, end: u64) -> io::Result<V
     };
     let mut frames = Vec::new();
     for line in io::BufReader::new(file).lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => return Err(error),
-        };
+        let line = line?;
         let frame: LogFrame = match serde_json::from_str(&line) {
             Ok(frame) => frame,
             Err(_) => break,
@@ -525,6 +522,7 @@ struct LogFrame {
     captured_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[cfg(test)]
 async fn read_frame_index(path: &Path) -> io::Result<Vec<LogFrame>> {
     match tokio::fs::read_to_string(path).await {
         Ok(contents) => contents

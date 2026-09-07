@@ -54,9 +54,7 @@ fst = "0.4"
 moka = { version = "0.12", features = ["future"] }
 mime_guess = "2.0"
 bytes = "1.0"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"

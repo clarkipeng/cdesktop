@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use anyhow;
 use axum::{
     Extension, Router,
-    extract::{Multipart, Path, Query, State, ws::Message},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State, ws::Message},
     http::header,
     middleware::from_fn_with_state,
     response::{IntoResponse, Json as ResponseJson},
@@ -63,6 +63,11 @@ struct ArtifactUploadQuery {
     original_path: Option<String>,
     producer_ref: Option<String>,
     publication_key: String,
+}
+
+#[derive(Deserialize)]
+struct ArtifactPath {
+    occurrence_id: Uuid,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,18 +225,17 @@ async fn upload_execution_artifact(
             return Err(ApiError::BadRequest("publication_key is required".into()));
         }
         let original_path = query.original_path.as_deref().unwrap_or(&filename);
-        let file = deployment
-            .file()
-            .store_stream(field.into_stream(), &filename, None)
-            .await?;
         let occurrence = deployment
             .file()
-            .retain_execution_artifact(
-                execution_process.id,
-                original_path,
-                query.producer_ref.as_deref(),
-                &query.publication_key,
-                &file,
+            .publish_execution_artifact(
+                field.into_stream(),
+                &filename,
+                services::services::file::ArtifactPublication {
+                    execution_id: execution_process.id,
+                    original_path,
+                    producer_ref: query.producer_ref.as_deref(),
+                    publication_key: &query.publication_key,
+                },
             )
             .await
             .map_err(|error| match error {
@@ -250,16 +254,30 @@ async fn upload_execution_artifact(
 async fn get_execution_artifact(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(deployment): State<DeploymentImpl>,
-    Path(occurrence_id): Path<Uuid>,
+    Path(path): Path<ArtifactPath>,
 ) -> Result<ResponseJson<ApiResponse<db::models::execution_artifact::ExecutionArtifact>>, ApiError>
 {
     let occurrence = deployment
         .file()
-        .get_execution_artifact(occurrence_id)
+        .get_execution_artifact(path.occurrence_id)
         .await?
         .filter(|artifact| artifact.execution_id == execution_process.id)
         .ok_or_else(|| ApiError::File(services::services::file::FileError::NotFound))?;
     Ok(ResponseJson(ApiResponse::success(occurrence)))
+}
+
+async fn get_execution_artifact_file(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+    Path(path): Path<ArtifactPath>,
+) -> Result<axum::response::Response, ApiError> {
+    let occurrence = deployment
+        .file()
+        .get_execution_artifact(path.occurrence_id)
+        .await?
+        .filter(|artifact| artifact.execution_id == execution_process.id)
+        .ok_or_else(|| ApiError::File(services::services::file::FileError::NotFound))?;
+    super::attachments::serve_file(Path(occurrence.attachment_id), State(deployment)).await
 }
 
 async fn stream_raw_logs_ws(
@@ -593,23 +611,31 @@ async fn get_execution_process_repo_states(
     Ok(ResponseJson(ApiResponse::success(repo_states)))
 }
 
-pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
-    let workspace_id_router = Router::new()
+fn execution_routes() -> Router<DeploymentImpl> {
+    Router::new()
         .route("/", get(get_execution_process_by_id))
         .route("/stop", post(stop_execution_process))
         .route("/repo-states", get(get_execution_process_repo_states))
         .route("/normalized-snapshot", get(get_normalized_log_snapshot))
         .route("/raw-log", get(get_raw_log_range))
-        .route("/artifacts", post(upload_execution_artifact))
+        .route(
+            "/artifacts",
+            post(upload_execution_artifact).layer(DefaultBodyLimit::disable()),
+        )
         .route("/artifacts/{occurrence_id}", get(get_execution_artifact))
-        .route("/artifacts", post(upload_execution_artifact))
-        .route("/artifacts/{occurrence_id}", get(get_execution_artifact))
+        .route(
+            "/artifacts/{occurrence_id}/file",
+            get(get_execution_artifact_file),
+        )
         .route("/raw-logs/ws", get(stream_raw_logs_ws))
         .route("/normalized-logs/ws", get(stream_normalized_logs_ws))
-        .layer(from_fn_with_state(
-            deployment.clone(),
-            load_execution_process_middleware,
-        ));
+}
+
+pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
+    let workspace_id_router = execution_routes().layer(from_fn_with_state(
+        deployment.clone(),
+        load_execution_process_middleware,
+    ));
 
     let workspaces_router = Router::new()
         .route("/", get(list_execution_processes_by_session))
@@ -626,6 +652,45 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_routes_have_no_overlapping_handlers() {
+        // Axum rejects duplicate method/path registration only at construction,
+        // so compilation alone cannot prove the native API can start.
+        let _ = execution_routes();
+    }
+
+    #[tokio::test]
+    async fn nested_artifact_paths_extract_parent_and_occurrence_by_name() {
+        // A scalar Path<Uuid> fails when the nested route carries two IDs.
+        // Exercise the real extractor types through Axum, without a deployment
+        // or production DB, on a temporary loopback listener.
+        let app = Router::new().route(
+            "/{id}/artifacts/{occurrence_id}",
+            get(
+                |Path(_parent): Path<crate::middleware::ExecutionProcessPath>,
+                 Path(path): Path<ArtifactPath>| async move {
+                    path.occurrence_id.to_string()
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let parent = Uuid::new_v4();
+        let occurrence = Uuid::new_v4();
+        let response = reqwest::get(format!("http://{address}/{parent}/artifacts/{occurrence}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), occurrence.to_string());
+        let invalid = reqwest::get(format!("http://{address}/invalid/artifacts/{occurrence}"))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn normalized_snapshot_coalesces_streaming_replacements() {

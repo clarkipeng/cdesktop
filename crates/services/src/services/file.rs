@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use mime_guess::MimeGuess;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +31,12 @@ pub enum FileError {
 
     #[error("artifact publication key was already used for different evidence")]
     PublicationConflict,
+
+    #[error("File is retained by a workspace or execution occurrence")]
+    Retained,
+
+    #[error("Insufficient free space to retain evidence safely")]
+    StorageUnavailable,
 
     #[error("Failed to build response: {0}")]
     ResponseBuildError(String),
@@ -57,7 +63,7 @@ fn sanitize_filename(name: &str) -> String {
     // Truncate to reasonable length to avoid filesystem limits
     let max_len = 50;
     if clean.len() > max_len {
-        clean[..max_len].to_string()
+        clean.chars().take(max_len).collect()
     } else if clean.is_empty() {
         "file".to_string()
     } else {
@@ -71,6 +77,21 @@ pub struct FileService {
     legacy_cache_dir: PathBuf,
     pool: SqlitePool,
     max_size_bytes: u64,
+    free_disk_reserve_bytes: u64,
+}
+
+/// Identity of one logical publication, independent of deduplicated bytes.
+pub struct ArtifactPublication<'a> {
+    pub execution_id: Uuid,
+    pub original_path: &'a str,
+    pub producer_ref: Option<&'a str>,
+    pub publication_key: &'a str,
+}
+
+struct StagedUpload {
+    // Drop removes incomplete uploads on errors or cancelled requests.
+    temp: tempfile::NamedTempFile,
+    data: CreateFile,
 }
 
 impl FileService {
@@ -83,6 +104,7 @@ impl FileService {
             legacy_cache_dir,
             pool,
             max_size_bytes: 20 * 1024 * 1024, // 20MB default
+            free_disk_reserve_bytes: utils::execution_logs::free_disk_reserve_bytes(),
         })
     }
 
@@ -91,60 +113,20 @@ impl FileService {
         data: &[u8],
         original_filename: &str,
     ) -> Result<File, FileError> {
-        let file_size = data.len() as u64;
-
-        if file_size > self.max_size_bytes {
-            return Err(FileError::TooLarge(file_size, self.max_size_bytes));
-        }
-
-        let hash = format!("{:x}", Sha256::digest(data));
-
-        let extension = Path::new(original_filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("bin");
-
-        let mime_type = MimeGuess::from_path(original_filename)
-            .first_raw()
-            .map(str::to_string)
-            .or_else(|| {
-                MimeGuess::from_ext(extension)
-                    .first_raw()
-                    .map(str::to_string)
-            });
-
-        let existing_file = File::find_by_hash(&self.pool, &hash).await?;
-
-        if let Some(existing) = existing_file {
-            tracing::debug!("Reusing existing file record with hash {}", hash);
-            return Ok(existing);
-        }
-
-        let clean_name = sanitize_filename(original_filename);
-        let new_filename = format!("{}_{}.{}", Uuid::new_v4(), clean_name, extension);
-        let cached_path = self.cache_dir.join(&new_filename);
-        fs::write(&cached_path, data)?;
-
-        let file = File::create(
-            &self.pool,
-            &CreateFile {
-                file_path: new_filename,
-                original_name: original_filename.to_string(),
-                mime_type,
-                size_bytes: file_size as i64,
-                hash,
-            },
+        self.store_stream(
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::copy_from_slice(data))]),
+            original_filename,
+            Some(self.max_size_bytes),
         )
-        .await?;
-        Ok(file)
+        .await
     }
 
     /// Retains arbitrary-sized input without materialising it in memory. The
-    /// final attachment stays content-addressed; callers record every use as a
-    /// separate occurrence through `retain_execution_artifact`.
+    /// final attachment stays content-addressed. Referenced execution evidence
+    /// uses publish_execution_artifact, which commits its retention atomically.
     pub async fn store_stream<S, E>(
         &self,
-        mut stream: S,
+        stream: S,
         original_filename: &str,
         max_size_bytes: Option<u64>,
     ) -> Result<File, FileError>
@@ -152,19 +134,45 @@ impl FileService {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        let staging_name = format!("{}.upload", Uuid::new_v4());
-        let staging_path = self.cache_dir.join(&staging_name);
-        let mut output = tokio::fs::File::create(&staging_path).await?;
+        let staged = self
+            .stage_upload(stream, original_filename, max_size_bytes)
+            .await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let file = self.publish_upload(&mut tx, staged).await?;
+        tx.commit().await?;
+        Ok(file)
+    }
+
+    async fn stage_upload<S, E>(
+        &self,
+        mut stream: S,
+        original_filename: &str,
+        max_size_bytes: Option<u64>,
+    ) -> Result<StagedUpload, FileError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let temp = tempfile::Builder::new()
+            .prefix(".upload-")
+            .tempfile_in(&self.cache_dir)?;
+        let mut output = tokio::fs::File::from_std(temp.reopen()?);
         let mut hash = Sha256::new();
         let mut size = 0u64;
         while let Some(chunk) = stream.next().await {
             let chunk =
                 chunk.map_err(|error| FileError::Io(std::io::Error::other(error.to_string())))?;
+            if fs2::available_space(&self.cache_dir)?
+                < self
+                    .free_disk_reserve_bytes
+                    .saturating_add(chunk.len() as u64)
+            {
+                return Err(FileError::StorageUnavailable);
+            }
             size = size.saturating_add(chunk.len() as u64);
             if let Some(max) = max_size_bytes
                 && size > max
             {
-                let _ = tokio::fs::remove_file(&staging_path).await;
                 return Err(FileError::TooLarge(size, max));
             }
             hash.update(&chunk);
@@ -173,11 +181,6 @@ impl FileService {
         output.sync_all().await?;
         drop(output);
 
-        let hash = format!("{:x}", hash.finalize());
-        if let Some(existing) = File::find_by_hash(&self.pool, &hash).await? {
-            let _ = tokio::fs::remove_file(staging_path).await;
-            return Ok(existing);
-        }
         let extension = Path::new(original_filename)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -188,48 +191,116 @@ impl FileService {
             sanitize_filename(original_filename),
             extension
         );
-        tokio::fs::rename(&staging_path, self.cache_dir.join(&filename)).await?;
-        File::create(
-            &self.pool,
-            &CreateFile {
+        Ok(StagedUpload {
+            temp,
+            data: CreateFile {
                 file_path: filename,
                 original_name: original_filename.to_owned(),
                 mime_type: MimeGuess::from_path(original_filename)
                     .first_raw()
                     .map(str::to_owned),
-                size_bytes: size as i64,
-                hash,
+                size_bytes: i64::try_from(size).map_err(std::io::Error::other)?,
+                hash: format!("{:x}", hash.finalize()),
             },
-        )
-        .await
-        .map_err(FileError::Database)
+        })
     }
 
-    pub async fn retain_execution_artifact(
+    async fn publish_upload(
         &self,
-        execution_id: Uuid,
-        original_path: &str,
-        producer_ref: Option<&str>,
-        publication_key: &str,
-        file: &File,
-    ) -> Result<ExecutionArtifact, FileError> {
-        let (artifact, publication) = ExecutionArtifact::create_or_replay(
-            &self.pool,
-            execution_id,
+        conn: &mut sqlx::SqliteConnection,
+        staged: StagedUpload,
+    ) -> Result<File, FileError> {
+        if let Some(existing) = File::find_by_hash(&mut *conn, &staged.data.hash).await? {
+            // Never acknowledge retention of missing or corrupt original bytes.
+            self.verify_cached_file(&existing).await?;
+            return Ok(existing);
+        }
+        let cache_dir = self.cache_dir.clone();
+        let data = tokio::task::spawn_blocking(move || -> Result<CreateFile, std::io::Error> {
+            // A unique physical generation prevents GC of an old row from
+            // unlinking a later equal-byte publication. Publish durable bytes
+            // before the DB reference; uncertain commits must not delete them.
+            staged
+                .temp
+                .persist_noclobber(cache_dir.join(&staged.data.file_path))
+                .map_err(|error| error.error)?;
+            fs::File::open(cache_dir)?.sync_all()?;
+            Ok(staged.data)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(File::create(conn, &data).await?)
+    }
+
+    async fn verify_cached_file(&self, file: &File) -> Result<(), FileError> {
+        let mut input = tokio::fs::File::open(self.get_absolute_path(file)).await?;
+        let mut buffer = [0; 64 * 1024];
+        let mut hash = Sha256::new();
+        let mut size = 0u64;
+        loop {
+            let read = input.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+            size += read as u64;
+        }
+        if size != file.size_bytes as u64 || format!("{:x}", hash.finalize()) != file.hash {
+            return Err(std::io::Error::other("cached artifact hash mismatch").into());
+        }
+        Ok(())
+    }
+
+    pub async fn publish_execution_artifact<S, E>(
+        &self,
+        stream: S,
+        original_filename: &str,
+        publication: ArtifactPublication<'_>,
+    ) -> Result<ExecutionArtifact, FileError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let staged = self.stage_upload(stream, original_filename, None).await?;
+        // Upload first, then serialize publication with GC and other writers.
+        // No committed attachment can exist without its retained occurrence.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(artifact) = ExecutionArtifact::find_by_publication(
+            &mut tx,
+            publication.execution_id,
+            publication.publication_key,
+        )
+        .await?
+        {
+            let file = File::find_by_id(&mut *tx, artifact.attachment_id)
+                .await?
+                .ok_or(FileError::NotFound)?;
+            if file.hash != staged.data.hash
+                || artifact.original_path != publication.original_path
+                || artifact.original_name.as_deref() != Some(original_filename)
+                || artifact.producer_ref.as_deref() != publication.producer_ref
+            {
+                return Err(FileError::PublicationConflict);
+            }
+            // Reuse the normal blob verification without publishing any new
+            // bytes or occurrence. The staging file drops on every replay.
+            self.publish_upload(&mut tx, staged).await?;
+            tx.commit().await?;
+            return Ok(artifact);
+        }
+        let file = self.publish_upload(&mut tx, staged).await?;
+        let artifact = ExecutionArtifact::create(
+            &mut tx,
+            publication.execution_id,
             file.id,
-            original_path,
-            producer_ref,
-            publication_key,
+            publication.original_path,
+            original_filename,
+            publication.producer_ref,
+            publication.publication_key,
         )
         .await
         .map_err(FileError::Database)?;
-        if publication == db::models::execution_artifact::ExecutionArtifactPublication::Replayed
-            && (artifact.attachment_id != file.id
-                || artifact.original_path != original_path
-                || artifact.producer_ref.as_deref() != producer_ref)
-        {
-            return Err(FileError::PublicationConflict);
-        }
+        tx.commit().await?;
         Ok(artifact)
     }
 
@@ -285,7 +356,10 @@ impl FileService {
     }
 
     pub async fn delete_file(&self, id: Uuid) -> Result<(), FileError> {
-        if let Some(file) = File::find_by_id(&self.pool, id).await? {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let file = File::delete_unreferenced(&mut *tx, id).await?;
+        tx.commit().await?;
+        if let Some(file) = file {
             let file_path = self.cache_dir.join(&file.file_path);
             if file_path.exists() {
                 fs::remove_file(file_path)?;
@@ -295,8 +369,8 @@ impl FileService {
             if legacy_file_path.exists() {
                 fs::remove_file(legacy_file_path)?;
             }
-
-            File::delete(&self.pool, id).await?;
+        } else if File::find_by_id(&self.pool, id).await?.is_some() {
+            return Err(FileError::Retained);
         }
 
         Ok(())
@@ -395,5 +469,281 @@ impl FileService {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    async fn fixture() -> (tempfile::TempDir, FileService, Uuid) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(dir.path().join("fixture.sqlite"))
+                    .create_if_missing(true)
+                    .foreign_keys(true)
+                    .busy_timeout(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE execution_processes (id BLOB PRIMARY KEY);
+            CREATE TABLE attachments (
+                id BLOB PRIMARY KEY, file_path TEXT NOT NULL, original_name TEXT NOT NULL,
+                mime_type TEXT, size_bytes INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE workspace_attachments (
+                workspace_id BLOB, attachment_id BLOB REFERENCES attachments(id));",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Exercise the shipped occurrence schema, including its real FKs and
+        // durable publication-key uniqueness, not a permissive test substitute.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/20260906000000_add_execution_artifacts.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/20260906000001_add_execution_artifact_publication_key.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/20260906000002_add_execution_artifact_original_name.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let execution_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_processes (id) VALUES (?)")
+            .bind(execution_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cache_dir = dir.path().join("attachments");
+        fs::create_dir(&cache_dir).unwrap();
+        let service = FileService {
+            cache_dir,
+            legacy_cache_dir: dir.path().join("images"),
+            pool,
+            max_size_bytes: 20 * 1024 * 1024,
+            free_disk_reserve_bytes: 0,
+        };
+        (dir, service, execution_id)
+    }
+
+    async fn publish(
+        service: &FileService,
+        execution_id: Uuid,
+        key: &str,
+        bytes: &'static [u8],
+    ) -> Result<ExecutionArtifact, FileError> {
+        service
+            .publish_execution_artifact(
+                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(bytes))]),
+                "checkpoint.md",
+                ArtifactPublication {
+                    execution_id,
+                    original_path: ".context/checkpoint.md",
+                    producer_ref: Some("task/checkpoint"),
+                    publication_key: key,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn lost_response_replays_occurrence_and_equal_bytes_keep_distinct_occurrences() {
+        // An uncertain network response must not create a second fact, while
+        // distinct publications of equal content still retain both facts.
+        let (_dir, service, execution) = fixture().await;
+        let first = publish(&service, execution, "one", b"exact bytes\n")
+            .await
+            .unwrap();
+        let replay = publish(&service, execution, "one", b"exact bytes\n")
+            .await
+            .unwrap();
+        let second = publish(&service, execution, "two", b"exact bytes\n")
+            .await
+            .unwrap();
+        assert_eq!(first.id, replay.id);
+        assert_eq!(first.original_name.as_deref(), Some("checkpoint.md"));
+        assert_eq!(first.captured_at, replay.captured_at);
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.attachment_id, second.attachment_id);
+        assert!(matches!(
+            publish(&service, execution, "one", b"changed").await,
+            Err(FileError::PublicationConflict)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attachments")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        service.delete_orphaned_files().await.unwrap();
+        let file = service
+            .get_file(first.attachment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(service.get_absolute_path(&file)).unwrap(),
+            b"exact bytes\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_rechecks_a_snapshot_after_an_occurrence_retains_the_blob() {
+        // The old GC selected an orphan, then deleted its bytes even if a
+        // publication acquired a reference between selection and deletion.
+        let (_dir, service, execution) = fixture().await;
+        let file = service
+            .store_file(b"retained", "checkpoint.md")
+            .await
+            .unwrap();
+        let selected = File::find_orphaned_files(&service.pool).await.unwrap();
+        assert_eq!(selected[0].id, file.id);
+        let occurrence = publish(&service, execution, "retain", b"retained")
+            .await
+            .unwrap();
+        assert_eq!(occurrence.attachment_id, file.id);
+        assert!(matches!(
+            service.delete_file(selected[0].id).await,
+            Err(FileError::Retained)
+        ));
+        assert_eq!(
+            fs::read(service.get_absolute_path(&file)).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_publications_and_gc_cannot_lose_retained_bytes() {
+        // BEGIN IMMEDIATE and the deleting statement's reference predicate
+        // fence independent pooled writers, not just clones of a Rust mutex.
+        let (_dir, service, execution) = fixture().await;
+        let (first, second, cleanup) = tokio::join!(
+            publish(&service, execution, "concurrent-a", b"shared"),
+            publish(&service, execution, "concurrent-b", b"shared"),
+            service.delete_orphaned_files(),
+        );
+        cleanup.unwrap();
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.attachment_id, second.attachment_id);
+        service.delete_orphaned_files().await.unwrap();
+        let file = service
+            .get_file(first.attachment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(service.get_absolute_path(&file)).unwrap(),
+            b"shared"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_occurrence_rolls_back_attachment_publication() {
+        // A failure after durable blob publication but before retention must
+        // never expose a committed unretained attachment as successful evidence.
+        let (_dir, service, _) = fixture().await;
+        assert!(
+            publish(&service, Uuid::new_v4(), "missing-execution", b"bytes")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attachments")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_artifacts")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_upload_drops_its_staging_file() {
+        // Stream errors leave neither a DB reference nor an accumulating
+        // partial upload on disk. No production cache root is touched.
+        let (_dir, service, _) = fixture().await;
+        let stream = futures::stream::iter([
+            Ok(Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("disconnected")),
+        ]);
+        assert!(
+            service
+                .store_stream(stream, "partial.md", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&service.cache_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_preserves_the_shared_disk_reserve() {
+        // Disabling the HTTP size cap must not let artifact uploads consume
+        // space reserved for recording/control. Refusal leaves no staged file.
+        let (_dir, mut service, execution) = fixture().await;
+        service.free_disk_reserve_bytes = u64::MAX;
+        assert!(matches!(
+            publish(&service, execution, "no-space", b"bytes").await,
+            Err(FileError::StorageUnavailable)
+        ));
+        assert_eq!(fs::read_dir(&service.cache_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn each_occurrence_keeps_its_name_and_replay_rejects_corrupt_cached_bytes() {
+        // A blob's first filename is not the filename of every occurrence;
+        // equal-length corruption must not masquerade as a verified replay.
+        let (_dir, service, execution) = fixture().await;
+        let first = publish(&service, execution, "first-name", b"data")
+            .await
+            .unwrap();
+        let second = service
+            .publish_execution_artifact(
+                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"data"))]),
+                "another.txt",
+                ArtifactPublication {
+                    execution_id: execution,
+                    original_path: "another.txt",
+                    producer_ref: None,
+                    publication_key: "second-name",
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.attachment_id, second.attachment_id);
+        assert_eq!(first.original_name.as_deref(), Some("checkpoint.md"));
+        assert_eq!(second.original_name.as_deref(), Some("another.txt"));
+        let file = service
+            .get_file(first.attachment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        fs::write(service.get_absolute_path(&file), b"oops").unwrap();
+        assert!(matches!(
+            publish(&service, execution, "first-name", b"data").await,
+            Err(FileError::Io(_))
+        ));
     }
 }
