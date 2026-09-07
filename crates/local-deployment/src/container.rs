@@ -114,7 +114,7 @@ struct RunningExecution {
     child: Arc<RwLock<AsyncGroupChild>>,
     cancel: Option<CancellationToken>,
     requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
-    cancel_confirmed: Option<CancellationToken>,
+    cleanup_unverifiable: bool,
     // Every stop caller can await the same monitor, including after its own
     // graceful timeout. No caller can consume or detach another caller's wait.
     completion: MonitorCompletion,
@@ -145,13 +145,9 @@ impl RunningExecution {
     }
 
     fn acknowledged_cleanup(&self) -> Result<(), ContainerError> {
-        if self
-            .cancel_confirmed
-            .as_ref()
-            .is_some_and(|ack| !ack.is_cancelled())
-        {
+        if self.cleanup_unverifiable {
             return Err(ContainerError::Other(anyhow!(
-                "executor cleanup was not acknowledged before termination"
+                "executor cannot verify detached-tool cleanup"
             )));
         }
         Ok(())
@@ -622,7 +618,7 @@ impl LocalContainerService {
         capture: JoinHandle<CaptureOutcome>,
         drain_expired: CancellationToken,
         requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
-        cancel_confirmed: Option<CancellationToken>,
+        cleanup_unverifiable: bool,
     ) -> JoinHandle<()> {
         let exec_id = *exec_id;
         let msg_stores = self.msg_stores.clone();
@@ -688,14 +684,12 @@ impl LocalContainerService {
             let (status, exit_code) = outcome.status_and_exit_code();
 
             let mut normalized = outcome.normalized_outcome().cloned();
-            if requested_stop.is_some()
-                && let Some(ack) = &cancel_confirmed
-            {
+            if requested_stop.is_some() && cleanup_unverifiable {
                 normalized
                     .get_or_insert_with(|| {
                         NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped)
                     })
-                    .cleanup_confirmed = Some(ack.is_cancelled());
+                    .cleanup_confirmed = Some(false);
             }
 
             let completed_attempt = match ExecutionProcess::complete_running_attempt(
@@ -1550,7 +1544,7 @@ impl ContainerService for LocalContainerService {
             capture,
             drain_expired,
             requested_stop.clone(),
-            spawned.cancel_confirmed.clone(),
+            spawned.cleanup_unverifiable,
         );
         running.insert(
             execution_process.id,
@@ -1558,7 +1552,7 @@ impl ContainerService for LocalContainerService {
                 child,
                 cancel: spawned.cancel,
                 requested_stop,
-                cancel_confirmed: spawned.cancel_confirmed,
+                cleanup_unverifiable: spawned.cleanup_unverifiable,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1922,7 +1916,7 @@ mod tests {
                 child: child.clone(),
                 cancel: None,
                 requested_stop: Arc::new(Mutex::new(None)),
-                cancel_confirmed: None,
+                cleanup_unverifiable: false,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1991,7 +1985,7 @@ mod tests {
                 child: Arc::new(RwLock::new(child)),
                 cancel: has_graceful_cancel.then(CancellationToken::new),
                 requested_stop: Arc::new(Mutex::new(None)),
-                cancel_confirmed: has_graceful_cancel.then(CancellationToken::new),
+                cleanup_unverifiable: has_graceful_cancel,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -2065,7 +2059,7 @@ mod tests {
             child: Arc::new(RwLock::new(child)),
             cancel: Some(CancellationToken::new()),
             requested_stop: Arc::new(Mutex::new(None)),
-            cancel_confirmed: Some(CancellationToken::new()),
+            cleanup_unverifiable: true,
             completion: monitor
                 .map(|result| result.map_err(Arc::new))
                 .boxed()
@@ -2091,12 +2085,11 @@ mod tests {
             .group_spawn()
             .unwrap();
         child.wait().await.unwrap();
-        let confirmed = CancellationToken::new();
         let running = RunningExecution {
             child: Arc::new(RwLock::new(child)),
             cancel: Some(CancellationToken::new()),
             requested_stop: Arc::new(Mutex::new(None)),
-            cancel_confirmed: Some(confirmed.clone()),
+            cleanup_unverifiable: true,
             completion: futures::future::ready(Ok(())).boxed().shared(),
         };
         for _ in 0..2 {
@@ -2107,12 +2100,6 @@ mod tests {
                     .is_err()
             );
         }
-        // Only the adapter's actual cleanup acknowledgement changes this fact.
-        confirmed.cancel();
-        running
-            .stop(ExecutionProcessStatus::Killed, Duration::from_millis(1))
-            .await
-            .unwrap();
     }
 
     #[test]

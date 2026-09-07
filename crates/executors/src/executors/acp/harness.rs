@@ -131,7 +131,7 @@ impl AcpAgentHarness {
             child,
             exit_signal: Some(exit_rx),
             cancel: Some(cancel),
-            cancel_confirmed: None,
+            cleanup_unverifiable: false,
         })
     }
 
@@ -185,7 +185,7 @@ impl AcpAgentHarness {
             child,
             exit_signal: Some(exit_rx),
             cancel: Some(cancel),
-            cancel_confirmed: None,
+            cleanup_unverifiable: false,
         })
     }
 

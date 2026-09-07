@@ -790,8 +790,6 @@ impl Codex {
         let new_stdout = create_stdout_pipe_writer(&mut child)?;
         let (exit_signal_tx, exit_signal_rx) = tokio::sync::oneshot::channel();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_confirmed = tokio_util::sync::CancellationToken::new();
-        let protocol_confirmed = cancel_confirmed.clone();
         let rpc_cancel = tokio_util::sync::CancellationToken::new();
         let reader_shutdown = tokio_util::sync::CancellationToken::new();
 
@@ -846,7 +844,6 @@ impl Codex {
                 };
                 match cancellation_client.cancel_execution().await {
                     Ok(()) => {
-                        protocol_confirmed.cancel();
                         reader_shutdown_for_task.cancel();
                     }
                     Err(error) => {
@@ -918,7 +915,9 @@ impl Codex {
             child,
             exit_signal: Some(exit_signal_rx),
             cancel: Some(cancel),
-            cancel_confirmed: Some(cancel_confirmed),
+            // Background-terminal clean acknowledges submission, not OS exit.
+            // Do not turn an accepted interrupt into a detached-tool receipt.
+            cleanup_unverifiable: true,
         })
     }
 }
