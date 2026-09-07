@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    io,
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -36,7 +35,11 @@ use executors::{
     logs::{NormalizedEntryType, utils::patch::extract_normalized_entry_from_patch},
     outcome::{ExecutionOutcomeClass, NormalizedExecutionOutcome},
 };
-use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture, stream::select};
+use futures::{
+    FutureExt, StreamExt, TryStreamExt,
+    future::{BoxFuture, Shared},
+    stream::select,
+};
 use git::GitService;
 use serde_json::json;
 use services::services::{
@@ -58,7 +61,9 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 use utils::{
-    execution_logs::ExecutionLogWriter, log_msg::LogMsg, msg_store::MsgStore,
+    execution_logs::{CaptureOutcome, ExecutionLogWriter},
+    log_msg::LogMsg,
+    msg_store::MsgStore,
     text::truncate_to_char_boundary,
 };
 use uuid::Uuid;
@@ -73,10 +78,10 @@ const RAW_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// unavailable outcome on expiry; its pending writes must finish before we can
 /// publish terminal process state or release its ownership.
 async fn finish_raw_capture(
-    mut capture: JoinHandle<()>,
+    mut capture: JoinHandle<CaptureOutcome>,
     drain_expired: CancellationToken,
     grace: Duration,
-) -> Result<(), tokio::task::JoinError> {
+) -> Result<CaptureOutcome, tokio::task::JoinError> {
     match tokio::time::timeout(grace, &mut capture).await {
         Ok(result) => result,
         Err(_) => {
@@ -102,18 +107,65 @@ fn execution_current_dir(
     }
 }
 
+type MonitorCompletion = Shared<BoxFuture<'static, Result<(), Arc<tokio::task::JoinError>>>>;
+
+#[derive(Clone)]
+struct RunningExecution {
+    child: Arc<RwLock<AsyncGroupChild>>,
+    cancel: Option<CancellationToken>,
+    requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
+    // Every stop caller can await the same monitor, including after its own
+    // graceful timeout. No caller can consume or detach another caller's wait.
+    completion: MonitorCompletion,
+}
+
+impl RunningExecution {
+    async fn stop(
+        &self,
+        status: ExecutionProcessStatus,
+        grace: Duration,
+    ) -> Result<(), ContainerError> {
+        self.requested_stop.lock().await.get_or_insert(status);
+        if matches!(self.completion.clone().now_or_never(), Some(Ok(()))) {
+            return Ok(());
+        }
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+            if let Ok(Ok(())) = tokio::time::timeout(grace, self.completion.clone()).await {
+                return Ok(());
+            }
+        }
+        command::kill_process_group(&mut *self.child.write().await).await?;
+        self.completion
+            .clone()
+            .await
+            .map_err(|error| ContainerError::Other(anyhow!("exit monitor failed: {error}")))
+    }
+}
+
+async fn running_execution_for_stop(
+    entries: &RwLock<HashMap<Uuid, RunningExecution>>,
+    admission: &Mutex<()>,
+    id: &Uuid,
+) -> Option<RunningExecution> {
+    if let Some(running) = entries.read().await.get(id).cloned() {
+        return Some(running);
+    }
+    // A committed Running row may still be in start admission. Recheck after
+    // registration/start failure, and release admission before any monitor wait
+    // because finalization can dispatch another command through the same lock.
+    let _admission = admission.lock().await;
+    entries.read().await.get(id).cloned()
+}
+
 #[derive(Clone)]
 pub struct LocalContainerService {
     db: DBService,
     workspace_manager: WorkspaceManager,
-    child_store: Arc<RwLock<HashMap<Uuid, Arc<RwLock<AsyncGroupChild>>>>>,
-    cancellation_tokens: Arc<RwLock<HashMap<Uuid, CancellationToken>>>,
+    running_executions: Arc<RwLock<HashMap<Uuid, RunningExecution>>>,
     msg_stores: Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>,
     /// Adapter identity synchronization; raw capture is owned by the exit monitor.
     db_stream_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
-    exit_monitor_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
-    /// Recording failures override the exit status of a process we stopped.
-    recording_failures: Arc<RwLock<HashSet<Uuid>>>,
     workspace_touch_times: Arc<RwLock<HashMap<Uuid, Instant>>>,
     scheduler_lock: Arc<Mutex<()>>,
     config: Arc<RwLock<Config>>,
@@ -140,22 +192,17 @@ impl LocalContainerService {
         remote_client: Option<RemoteClient>,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Self {
-        let child_store = Arc::new(RwLock::new(HashMap::new()));
-        let cancellation_tokens = Arc::new(RwLock::new(HashMap::new()));
+        let running_executions = Arc::new(RwLock::new(HashMap::new()));
         let db_stream_handles = Arc::new(RwLock::new(HashMap::new()));
-        let exit_monitor_handles = Arc::new(RwLock::new(HashMap::new()));
         let workspace_touch_times = Arc::new(RwLock::new(HashMap::new()));
         let notification_service = NotificationService::new(config.clone());
 
         let container = LocalContainerService {
             db,
             workspace_manager,
-            child_store,
-            cancellation_tokens,
+            running_executions,
             msg_stores,
             db_stream_handles,
-            exit_monitor_handles,
-            recording_failures: Arc::new(RwLock::new(HashSet::new())),
             workspace_touch_times,
             scheduler_lock: Arc::new(Mutex::new(())),
             config,
@@ -237,29 +284,9 @@ impl LocalContainerService {
         Ok((repositories, workspace_inputs))
     }
 
-    async fn get_child_from_store(&self, id: &Uuid) -> Option<Arc<RwLock<AsyncGroupChild>>> {
-        let map = self.child_store.read().await;
+    async fn running_execution(&self, id: &Uuid) -> Option<RunningExecution> {
+        let map = self.running_executions.read().await;
         map.get(id).cloned()
-    }
-
-    async fn add_child_to_store(&self, id: Uuid, exec: AsyncGroupChild) {
-        let mut map = self.child_store.write().await;
-        map.insert(id, Arc::new(RwLock::new(exec)));
-    }
-
-    async fn remove_child_from_store(&self, id: &Uuid) {
-        let mut map = self.child_store.write().await;
-        map.remove(id);
-    }
-
-    async fn add_cancellation_token(&self, id: Uuid, token: CancellationToken) {
-        let mut map = self.cancellation_tokens.write().await;
-        map.insert(id, token);
-    }
-
-    async fn take_cancellation_token(&self, id: &Uuid) -> Option<CancellationToken> {
-        let mut map = self.cancellation_tokens.write().await;
-        map.remove(id)
     }
 
     async fn add_db_stream_handle(&self, id: Uuid, handle: JoinHandle<()>) {
@@ -269,16 +296,6 @@ impl LocalContainerService {
 
     async fn take_db_stream_handle(&self, id: &Uuid) -> Option<JoinHandle<()>> {
         let mut map = self.db_stream_handles.write().await;
-        map.remove(id)
-    }
-
-    async fn add_exit_monitor_handle(&self, id: Uuid, handle: JoinHandle<()>) {
-        let mut map = self.exit_monitor_handles.write().await;
-        map.insert(id, handle);
-    }
-
-    async fn take_exit_monitor_handle(&self, id: &Uuid) -> Option<JoinHandle<()>> {
-        let mut map = self.exit_monitor_handles.write().await;
         map.remove(id)
     }
 
@@ -584,20 +601,20 @@ impl LocalContainerService {
     fn spawn_exit_monitor(
         &self,
         exec_id: &Uuid,
+        child: Arc<RwLock<AsyncGroupChild>>,
         exit_signal: Option<ExecutorExitSignal>,
-        capture: JoinHandle<()>,
+        capture: JoinHandle<CaptureOutcome>,
         drain_expired: CancellationToken,
+        requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
     ) -> JoinHandle<()> {
         let exec_id = *exec_id;
-        let child_store = self.child_store.clone();
         let msg_stores = self.msg_stores.clone();
         let db = self.db.clone();
         let config = self.config.clone();
         let container = self.clone();
         let analytics = self.analytics.clone();
-        let recording_failures = self.recording_failures.clone();
 
-        let mut process_exit_rx = self.spawn_os_exit_watcher(exec_id);
+        let mut process_exit_rx = Self::spawn_os_exit_watcher(child.clone());
 
         tokio::spawn(async move {
             let mut exit_signal_future = exit_signal
@@ -610,8 +627,8 @@ impl LocalContainerService {
                 // signals when processing has finished to gracefully kill the process.
                 exit_result = &mut exit_signal_future => {
                     // Executor signaled completion: kill group and use the provided result
-                    if let Some(child_lock) = child_store.read().await.get(&exec_id).cloned() {
-                        let mut child = child_lock.write().await ;
+                    {
+                        let mut child = child.write().await;
                         if let Err(err) = command::kill_process_group(&mut child).await {
                             tracing::error!("Failed to kill process group after exit signal: {} {}", exec_id, err);
                         }
@@ -628,17 +645,21 @@ impl LocalContainerService {
             };
             // Descendants must close inherited pipes before the recorder can
             // drain. Process completion is published only after durable capture.
-            if let Some(child_lock) = child_store.read().await.get(&exec_id).cloned() {
-                let _ = child_lock.write().await.start_kill();
-            }
-            if let Err(error) =
-                finish_raw_capture(capture, drain_expired, RAW_CAPTURE_DRAIN_GRACE).await
-            {
+            let _ = child.write().await.start_kill();
+            let captured =
+                finish_raw_capture(capture, drain_expired, RAW_CAPTURE_DRAIN_GRACE).await;
+            let recording_failed = !matches!(captured, Ok(CaptureOutcome::Complete));
+            if let Err(error) = captured {
                 tracing::error!(%exec_id, %error, "raw capture task failed");
-                recording_failures.write().await.insert(exec_id);
             }
-            let outcome = if recording_failures.write().await.remove(&exec_id) {
+            // Linearize stop intent against the terminal CAS. A request that
+            // wins this lock cannot turn into success while it is cancelling.
+            let requested_stop = requested_stop.lock().await;
+            let allow_next_action = !recording_failed && requested_stop.is_none();
+            let outcome = if recording_failed {
                 NormalizedProcessOutcome::recording_failed()
+            } else if let Some(status) = requested_stop.as_ref() {
+                NormalizedProcessOutcome::requested_stop(status.clone())
             } else {
                 outcome
             };
@@ -659,6 +680,7 @@ impl LocalContainerService {
                     false
                 }
             };
+            drop(requested_stop);
 
             if completed_attempt
                 && let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await
@@ -681,7 +703,7 @@ impl LocalContainerService {
                     ExecutionProcessStatus::Running
                 );
 
-                if success || cleanup_done {
+                if allow_next_action && (success || cleanup_done) {
                     // No app-level auto-commit and no auto-chained cleanup: just
                     // start whatever next_action the chain already has, if any.
                     if let Err(e) = container.try_start_next_action(&ctx).await {
@@ -809,24 +831,18 @@ impl LocalContainerService {
                 let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
             }
 
-            child_store.write().await.remove(&exec_id);
+            container.running_executions.write().await.remove(&exec_id);
         })
     }
 
     fn spawn_os_exit_watcher(
-        &self,
-        exec_id: Uuid,
+        child: Arc<RwLock<AsyncGroupChild>>,
     ) -> tokio::sync::oneshot::Receiver<std::io::Result<std::process::ExitStatus>> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<std::process::ExitStatus>>();
-        let child_store = self.child_store.clone();
         tokio::spawn(async move {
             loop {
-                let child_lock = {
-                    let map = child_store.read().await;
-                    map.get(&exec_id).cloned()
-                };
-                if let Some(child_lock) = child_lock {
-                    let mut child_handler = child_lock.write().await;
+                {
+                    let mut child_handler = child.write().await;
                     match child_handler.try_wait() {
                         Ok(Some(status)) => {
                             let _ = tx.send(Ok(status));
@@ -838,11 +854,6 @@ impl LocalContainerService {
                             break;
                         }
                     }
-                } else {
-                    let _ = tx.send(Err(io::Error::other(format!(
-                        "Child handle missing for {exec_id}"
-                    ))));
-                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -855,7 +866,7 @@ impl LocalContainerService {
         process: &ExecutionProcess,
         child: &mut AsyncGroupChild,
         drain_expired: CancellationToken,
-    ) -> Result<BoxFuture<'static, ()>, ContainerError> {
+    ) -> Result<BoxFuture<'static, CaptureOutcome>, ContainerError> {
         let id = process.id;
         let store = self
             .get_msg_store_by_id(&id)
@@ -876,14 +887,13 @@ impl LocalContainerService {
             async move {
                 // Never call stop_execution here: it awaits the monitor that
                 // owns this recorder, creating a shutdown cycle.
-                container.recording_failures.write().await.insert(id);
-                if let Some(cancel) = container.cancellation_tokens.read().await.get(&id) {
-                    cancel.cancel();
-                }
-                if let Some(child) = container.get_child_from_store(&id).await
-                    && let Err(error) = child.write().await.start_kill()
-                {
-                    tracing::error!(%id, %error, "failed to stop unrecorded process");
+                if let Some(running) = container.running_execution(&id).await {
+                    if let Some(cancel) = running.cancel {
+                        cancel.cancel();
+                    }
+                    if let Err(error) = running.child.write().await.start_kill() {
+                        tracing::error!(%id, %error, "failed to stop unrecorded process");
+                    }
                 }
             }
             .boxed()
@@ -1072,9 +1082,18 @@ enum NormalizedProcessOutcome {
         /// provider signal; `None` falls back to `Unknown` at read time.
         outcome: Option<NormalizedExecutionOutcome>,
     },
+    RequestedStop {
+        status: ExecutionProcessStatus,
+        outcome: Option<NormalizedExecutionOutcome>,
+    },
 }
 
 impl NormalizedProcessOutcome {
+    fn requested_stop(status: ExecutionProcessStatus) -> Self {
+        let outcome = (status == ExecutionProcessStatus::Killed)
+            .then(|| NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped));
+        Self::RequestedStop { status, outcome }
+    }
     fn from_executor_signal(
         result: Result<ExecutorExitResult, tokio::sync::oneshot::error::RecvError>,
     ) -> Self {
@@ -1126,13 +1145,17 @@ impl NormalizedProcessOutcome {
         match self {
             Self::Success { exit_code } => (ExecutionProcessStatus::Completed, Some(*exit_code)),
             Self::Failure { exit_code, .. } => (ExecutionProcessStatus::Failed, *exit_code),
+            Self::RequestedStop { status, .. } => (
+                status.clone(),
+                (status == &ExecutionProcessStatus::Completed).then_some(0),
+            ),
         }
     }
 
     fn normalized_outcome(&self) -> Option<&NormalizedExecutionOutcome> {
         match self {
             Self::Success { .. } => None,
-            Self::Failure { outcome, .. } => outcome.as_ref(),
+            Self::Failure { outcome, .. } | Self::RequestedStop { outcome, .. } => outcome.as_ref(),
         }
     }
 }
@@ -1453,7 +1476,7 @@ impl ContainerService for LocalContainerService {
         // (see `host_admission::is_admission_gated`) because refusing the
         // paths that reclaim disk would make an exhausted host unrecoverable.
         if host_admission::is_admission_gated(&execution_process.run_reason) {
-            let tracked_agents = self.child_store.read().await.len() as u64;
+            let tracked_agents = self.running_executions.read().await.len() as u64;
             host_admission::check_spawn_headroom(&current_dir, tracked_agents)?;
         }
 
@@ -1481,24 +1504,32 @@ impl ContainerService for LocalContainerService {
             }
         };
 
-        self.add_child_to_store(execution_process.id, spawned.child)
-            .await;
-
-        // Store cancellation token for graceful shutdown
-        if let Some(cancel) = spawned.cancel {
-            self.add_cancellation_token(execution_process.id, cancel)
-                .await;
-        }
-
-        // Spawn unified exit monitor: watches OS exit and optional executor signal
+        // Register one complete entry before stop/failure observers can see the
+        // child. A fast exit cannot remove it before this insertion either.
+        let mut running = self.running_executions.write().await;
+        let child = Arc::new(RwLock::new(spawned.child));
+        let requested_stop = Arc::new(Mutex::new(None));
         let capture = tokio::spawn(capture);
-        let hn = self.spawn_exit_monitor(
+        let monitor = self.spawn_exit_monitor(
             &execution_process.id,
+            child.clone(),
             spawned.exit_signal,
             capture,
             drain_expired,
+            requested_stop.clone(),
         );
-        self.add_exit_monitor_handle(execution_process.id, hn).await;
+        running.insert(
+            execution_process.id,
+            RunningExecution {
+                child,
+                cancel: spawned.cancel,
+                requested_stop,
+                completion: monitor
+                    .map(|result| result.map_err(Arc::new))
+                    .boxed()
+                    .shared(),
+            },
+        );
 
         Ok(())
     }
@@ -1508,7 +1539,18 @@ impl ContainerService for LocalContainerService {
         execution_process: &ExecutionProcess,
         status: ExecutionProcessStatus,
     ) -> Result<(), ContainerError> {
-        let Some(child) = self.get_child_from_store(&execution_process.id).await else {
+        if status == ExecutionProcessStatus::Running {
+            return Err(ContainerError::Other(anyhow!(
+                "stop requires a terminal status"
+            )));
+        }
+        let running = running_execution_for_stop(
+            &self.running_executions,
+            &self.scheduler_lock,
+            &execution_process.id,
+        )
+        .await;
+        let Some(running) = running else {
             // No child in this server's store means the row is an orphan
             // (previous process, or the child was already reaped). The stop
             // must still reach a terminal state instead of erroring and
@@ -1518,82 +1560,35 @@ impl ContainerService for LocalContainerService {
                 "stopping execution with no live child; terminalizing the orphan row"
             );
             let requeue = status == ExecutionProcessStatus::Killed;
-            ExecutionProcess::update_completion(
+            ExecutionProcess::complete_running_attempt(
                 &self.db().pool,
                 execution_process.id,
                 status,
                 None,
+                None,
             )
             .await?;
-            if requeue {
+            if requeue
+                && ExecutionProcess::find_by_id(&self.db.pool, execution_process.id)
+                    .await?
+                    .is_some_and(|process| process.status == ExecutionProcessStatus::Killed)
+            {
                 SessionCommand::requeue_killed_execution(&self.db().pool, execution_process.id)
                     .await?;
             }
             return Ok(());
         };
-        let exit_code = if status == ExecutionProcessStatus::Completed {
-            Some(0)
-        } else {
-            None
-        };
-
-        // Try graceful cancellation first, then force kill
-        if let Some(cancel) = self.take_cancellation_token(&execution_process.id).await {
-            cancel.cancel();
-
-            // Wait for exit monitor to finish gracefully
-            if let Some(monitor_handle) = self.take_exit_monitor_handle(&execution_process.id).await
-            {
-                match tokio::time::timeout(Duration::from_secs(5), monitor_handle).await {
-                    Ok(_) => {
-                        tracing::debug!("Process {} exited gracefully", execution_process.id);
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            "Graceful shutdown timed out for process {}, force killing",
-                            execution_process.id
-                        );
-                    }
-                }
-            }
+        running.stop(status, Duration::from_secs(5)).await?;
+        // Only the monitor publishes completion and releases capture/UI state.
+        // A logged DB error inside it must not become a successful stop receipt.
+        let process = ExecutionProcess::find_by_id(&self.db.pool, execution_process.id)
+            .await?
+            .ok_or_else(|| ContainerError::Other(anyhow!("execution disappeared during stop")))?;
+        if process.status == ExecutionProcessStatus::Running {
+            return Err(ContainerError::Other(anyhow!(
+                "exit monitor did not publish terminal state"
+            )));
         }
-
-        {
-            let mut child_guard = child.write().await;
-            if let Err(e) = command::kill_process_group(&mut child_guard).await {
-                tracing::error!(
-                    "Failed to stop execution process {}: {}",
-                    execution_process.id,
-                    e
-                );
-                return Err(e);
-            }
-        }
-
-        // Terminal state is the durable record that the stop side effect has
-        // completed. Never publish it before cancellation/kill succeeds: a
-        // keyed-stop replay must not mistake an interrupted intent for a
-        // stopped process after restart.
-        ExecutionProcess::update_completion(&self.db.pool, execution_process.id, status, exit_code)
-            .await?;
-        self.remove_child_from_store(&execution_process.id).await;
-
-        // Mark the process finished in the MsgStore and wait for DB persistence
-        let db_stream_handle = self.take_db_stream_handle(&execution_process.id).await;
-        if let Some(msg) = self.msg_stores.write().await.remove(&execution_process.id) {
-            msg.push_finished();
-        }
-        if let Some(handle) = db_stream_handle {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        }
-
-        tracing::debug!(
-            "Execution process {} stopped successfully",
-            execution_process.id
-        );
-
-        // Record after-head commit OID (best-effort)
-        self.update_after_head_commits(execution_process.id).await;
 
         Ok(())
     }
@@ -1857,6 +1852,208 @@ mod tests {
             "{\"Stdout\":\"retained\"}\n"
         );
         utils::execution_logs::lock_execution_log(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_waits_for_admitted_registration_before_classifying_an_orphan() {
+        use command_group::AsyncCommandGroup;
+
+        let entries = Arc::new(RwLock::new(HashMap::new()));
+        let admission = Arc::new(Mutex::new(()));
+        let id = Uuid::new_v4();
+        let starting = admission.lock().await;
+        let stop_entries = entries.clone();
+        let stop_admission = admission.clone();
+        let mut lookup = tokio::spawn(async move {
+            running_execution_for_stop(&stop_entries, &stop_admission, &id).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut lookup)
+                .await
+                .is_err()
+        );
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .group_spawn()
+            .unwrap();
+        child.wait().await.unwrap();
+        let child = Arc::new(RwLock::new(child));
+        let monitor = tokio::spawn(async {});
+        entries.write().await.insert(
+            id,
+            RunningExecution {
+                child: child.clone(),
+                cancel: None,
+                requested_stop: Arc::new(Mutex::new(None)),
+                completion: monitor
+                    .map(|result| result.map_err(Arc::new))
+                    .boxed()
+                    .shared(),
+            },
+        );
+        drop(starting);
+        let observed = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&observed.child, &child));
+        assert!(
+            admission.try_lock().is_ok(),
+            "lookup must release admission before stop waits"
+        );
+        assert!(
+            running_execution_for_stop(&entries, &admission, &Uuid::new_v4())
+                .await
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_stops_and_a_cancelled_caller_share_capture_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use command_group::AsyncCommandGroup;
+
+        for (has_graceful_cancel, abandon_first) in [(false, false), (true, false), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("owner.zst");
+            let writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+                .await
+                .unwrap();
+            let (producer, receiver) = tokio::sync::mpsc::channel(1);
+            producer
+                .send(LogMsg::Stdout("retained".into()))
+                .await
+                .unwrap();
+            let stream = futures::stream::unfold(receiver, |mut receiver| async {
+                receiver.recv().await.map(|message| (Ok(message), receiver))
+            })
+            .boxed();
+            let capture = tokio::spawn(execution_process_service::capture_raw_logs(
+                writer,
+                stream,
+                Arc::new(MsgStore::new()),
+                CancellationToken::new(),
+                Box::new(|| Box::pin(async { panic!("healthy capture failed") })),
+            ));
+            let terminal = Arc::new(AtomicBool::new(false));
+            let completed = terminal.clone();
+            let monitor = tokio::spawn(async move {
+                assert_eq!(capture.await.unwrap(), CaptureOutcome::Complete);
+                completed.store(true, Ordering::SeqCst);
+            });
+            let mut child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .group_spawn()
+                .unwrap();
+            child.wait().await.unwrap();
+            let running = RunningExecution {
+                child: Arc::new(RwLock::new(child)),
+                cancel: has_graceful_cancel.then(CancellationToken::new),
+                requested_stop: Arc::new(Mutex::new(None)),
+                completion: monitor
+                    .map(|result| result.map_err(Arc::new))
+                    .boxed()
+                    .shared(),
+            };
+            let first_entry = running.clone();
+            let first = tokio::spawn(async move {
+                first_entry
+                    .stop(ExecutionProcessStatus::Killed, Duration::from_millis(10))
+                    .await
+            });
+            let second_entry = running.clone();
+            let second = tokio::spawn(async move {
+                second_entry
+                    .stop(ExecutionProcessStatus::Killed, Duration::from_millis(10))
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!terminal.load(Ordering::SeqCst));
+            assert!(!first.is_finished() && !second.is_finished());
+            assert_eq!(
+                *running.requested_stop.lock().await,
+                Some(ExecutionProcessStatus::Killed)
+            );
+            if abandon_first {
+                first.abort();
+            }
+            drop(producer); // Only now can the recorder seal and release its lease.
+            tokio::time::timeout(Duration::from_secs(5), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let first = first.await;
+            if abandon_first {
+                assert!(first.unwrap_err().is_cancelled());
+            } else {
+                first.unwrap().unwrap();
+            }
+            assert!(terminal.load(Ordering::SeqCst));
+            assert_eq!(
+                utils::execution_logs::scan_owner(&path)
+                    .await
+                    .unwrap()
+                    .outcome,
+                Some(CaptureOutcome::Complete)
+            );
+            assert_eq!(
+                utils::execution_logs::read_execution_log_range(&path, 0, 100)
+                    .await
+                    .unwrap(),
+                "{\"Stdout\":\"retained\"}\n"
+            );
+            utils::execution_logs::lock_execution_log(&path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_monitor_does_not_bypass_force_kill_or_report_stop_success() {
+        use command_group::AsyncCommandGroup;
+
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .group_spawn()
+            .unwrap();
+        let monitor = tokio::spawn(async {
+            panic!("injected monitor failure");
+        });
+        let running = RunningExecution {
+            child: Arc::new(RwLock::new(child)),
+            cancel: Some(CancellationToken::new()),
+            requested_stop: Arc::new(Mutex::new(None)),
+            completion: monitor
+                .map(|result| result.map_err(Arc::new))
+                .boxed()
+                .shared(),
+        };
+        let result = running
+            .stop(ExecutionProcessStatus::Killed, Duration::from_secs(1))
+            .await;
+        let stopped = running.child.write().await.try_wait().unwrap().is_some();
+        if !stopped {
+            running.child.write().await.start_kill().unwrap();
+        }
+        assert!(result.is_err());
+        assert!(stopped);
+    }
+
+    #[test]
+    fn requested_stop_is_killed_and_classified_as_user_stopped() {
+        let outcome = NormalizedProcessOutcome::requested_stop(ExecutionProcessStatus::Killed);
+        assert_eq!(
+            outcome.status_and_exit_code(),
+            (ExecutionProcessStatus::Killed, None)
+        );
+        assert_eq!(
+            outcome.normalized_outcome().unwrap().class,
+            ExecutionOutcomeClass::UserStopped
+        );
     }
 
     #[test]

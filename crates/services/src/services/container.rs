@@ -490,7 +490,7 @@ pub trait ContainerService {
         &self,
         session_id: Uuid,
     ) -> Result<Option<ExecutionProcess>, ContainerError> {
-        let _scheduler = self.scheduler_lock().lock().await;
+        let scheduler = self.scheduler_lock().lock().await;
         let pool = &self.db().pool;
         if ExecutionProcess::has_running_coding_agent_for_session(pool, session_id).await? {
             return Ok(None);
@@ -638,6 +638,7 @@ pub trait ContainerService {
                 &ExecutionProcessRunReason::CodingAgent,
                 execution_id,
                 true,
+                &scheduler,
             )
             .await
         }
@@ -1543,22 +1544,12 @@ pub trait ContainerService {
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
     ) -> Result<ExecutionProcess, ContainerError> {
-        // Coding-agent admission is centralized here for every direct launch.
-        // Queue dispatch already holds this lock and calls the same primitive
-        // immediately before creating its execution row.
+        // Every launch holds this through row creation and native registration.
+        // Stop uses the same barrier before declaring a missing child orphaned.
+        // Queue dispatch already holds it and calls the same primitive directly.
+        let scheduler = self.scheduler_lock().lock().await;
         if *run_reason == ExecutionProcessRunReason::CodingAgent {
-            let _scheduler = self.scheduler_lock().lock().await;
             self.admit_coding_agent(&self.db().pool).await?;
-            return self
-                .start_execution_with_id(
-                    workspace,
-                    session,
-                    executor_action,
-                    run_reason,
-                    Uuid::new_v4(),
-                    false,
-                )
-                .await;
         }
         self.start_execution_with_id(
             workspace,
@@ -1567,6 +1558,7 @@ pub trait ContainerService {
             run_reason,
             Uuid::new_v4(),
             false,
+            &scheduler,
         )
         .await
     }
@@ -1581,6 +1573,9 @@ pub trait ContainerService {
         Ok(())
     }
 
+    /// Launch admission must cover the committed row through native runtime
+    /// registration. Passing its guard keeps every caller inside that boundary.
+    #[allow(clippy::too_many_arguments)] // The guard proves admission; it is not a launch option.
     async fn start_execution_with_id(
         &self,
         workspace: &Workspace,
@@ -1589,6 +1584,7 @@ pub trait ContainerService {
         run_reason: &ExecutionProcessRunReason,
         execution_process_id: Uuid,
         claim_pending_commands: bool,
+        _scheduler: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Hold start admission through the durable row creation. Drain activation
         // takes the matching writer, so no admitted start can appear after drain begins.
@@ -1773,6 +1769,9 @@ pub trait ContainerService {
             .start_execution_inner(workspace, &execution_process, executor_action)
             .await
         {
+            if let Some(handle) = self.take_db_stream_handle(&execution_process.id).await {
+                handle.abort();
+            }
             self.msg_stores()
                 .write()
                 .await

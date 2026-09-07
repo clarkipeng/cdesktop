@@ -147,7 +147,7 @@ pub async fn capture_raw_logs(
     store: Arc<MsgStore>,
     drain_expired: tokio_util::sync::CancellationToken,
     on_failure: RecordingStop,
-) {
+) -> CaptureOutcome {
     let result: Result<(), std::io::Error> = async {
         loop {
             // Cancellation is observed only between completed appends. Never
@@ -186,6 +186,9 @@ pub async fn capture_raw_logs(
             tracing::error!(%marker_error, "capture outcome unavailable; owner remains unsealed");
         }
         on_failure().await;
+        CaptureOutcome::Unavailable
+    } else {
+        CaptureOutcome::Complete
     }
 }
 
@@ -331,7 +334,7 @@ mod tests {
             })
         });
 
-        capture_raw_logs(
+        let outcome = capture_raw_logs(
             writer,
             scripted(vec![
                 LogMsg::Stdout("a".repeat(64)),
@@ -346,6 +349,7 @@ mod tests {
         .await;
 
         assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome, CaptureOutcome::Unavailable);
     }
 
     #[tokio::test]
@@ -364,7 +368,7 @@ mod tests {
             })
         });
 
-        capture_raw_logs(
+        let outcome = capture_raw_logs(
             writer,
             scripted(vec![LogMsg::Stdout("small".into()), LogMsg::Finished]),
             Arc::new(MsgStore::new()),
@@ -374,6 +378,7 @@ mod tests {
         .await;
 
         assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome, CaptureOutcome::Complete);
     }
 
     #[tokio::test]
