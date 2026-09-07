@@ -436,7 +436,7 @@ impl AppServerClient {
                 delivery: None,
             },
         };
-        let response = self.send_request(request, "reviewStart").await?;
+        let response: ReviewStartResponse = self.send_request(request, "reviewStart").await?;
         self.record_turn_started(
             response.review_thread_id.clone(),
             &TurnStartResponse {
