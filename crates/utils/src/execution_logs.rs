@@ -41,6 +41,22 @@ pub fn process_log_frame_index_path(path: &Path) -> PathBuf {
     path.with_extension("zst.frames.jsonl")
 }
 
+/// Shared by capture and explicit legacy migration. The lease is native file
+/// ownership only; dropping it releases the OS lock without changing evidence.
+pub fn lock_execution_log(path: &Path) -> io::Result<std::fs::File> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    crate::durable_fs::create_dir_all(parent)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.with_extension("zst.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
 /// UI history is disposable and deliberately much smaller than retained
 /// evidence. A restart reads the complete compressed owner from disk.
 pub const DEFAULT_IN_MEMORY_LOG_BYTES: u64 = 1024 * 1024;
@@ -92,6 +108,28 @@ struct CapturedLogMetadata {
     capture_order: u64,
     control: bool,
     outcome: Option<CaptureOutcome>,
+    #[serde(default)]
+    legacy_sql_row: Option<LegacySqlRow>,
+}
+
+/// Original SQL insertion metadata is evidence too. Keep it beside the source
+/// bytes before pruning a verified redundant SQL body.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LegacySqlRow {
+    pub row_id: i64,
+    pub inserted_at: String,
+    pub reported_byte_size: i64,
+    pub original_bytes: u64,
+}
+
+impl LegacySqlRow {
+    pub fn hash_header(&self, digest: &mut sha2::Sha256) -> io::Result<()> {
+        use sha2::Digest;
+        let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -103,6 +141,7 @@ pub enum CaptureOutcome {
 }
 
 const MAX_FRAME_UNCOMPRESSED_BYTES: usize = 64 * 1024;
+const MAX_CAPTURE_METADATA_BYTES: usize = 4096;
 const ZSTD_SKIPPABLE_FRAME_MAGIC: u32 = 0x184D_2A50;
 
 pub struct ExecutionLogWriter {
@@ -142,12 +181,7 @@ impl ExecutionLogWriter {
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
-            crate::durable_fs::create_dir_all(parent)?;
-            let writer_lock = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(owner_path.with_extension("zst.lock"))?;
-            fs2::FileExt::try_lock_exclusive(&writer_lock)?;
+            let writer_lock = lock_execution_log(&owner_path)?;
             if !owner_path.exists() {
                 crate::durable_fs::publish_noclobber(
                     tempfile::NamedTempFile::new_in(parent)?,
@@ -202,7 +236,7 @@ impl ExecutionLogWriter {
         if !self.has_control_space(0)? {
             return Err(io::Error::other("cannot persist capture outcome"));
         }
-        self.write_segment(&[], Some(chrono::Utc::now()), true, Some(outcome))
+        self.write_segment(&[], Some(chrono::Utc::now()), true, Some(outcome), None)
             .await?;
         self.sealed = true;
         Ok(())
@@ -221,17 +255,24 @@ impl ExecutionLogWriter {
         Ok(LogAppend::Written)
     }
 
-    /// Legacy records predate capture instrumentation. Their unknown capture
-    /// time is explicit rather than invented during migration.
-    pub async fn append_legacy_jsonl_line(
+    /// Legacy bytes retain unknown capture time and, when present, the original
+    /// SQL row identity/insertion metadata. No newline or UTF-8 rewrite occurs.
+    pub async fn append_legacy_bytes(
         &mut self,
-        jsonl_line: &str,
-    ) -> std::io::Result<LogAppend> {
+        bytes: &[u8],
+        source: Option<&LegacySqlRow>,
+    ) -> io::Result<LogAppend> {
         self.ensure_writable()?;
-        if !self.has_disk_reserve(jsonl_line.len())? {
+        if !self.has_disk_reserve(bytes.len())? {
             return Ok(LogAppend::Unavailable);
         }
-        self.write_captured_record(jsonl_line, None).await?;
+        if bytes.is_empty() {
+            self.write_segment(bytes, None, false, None, source).await?;
+        } else {
+            for chunk in bytes.chunks(MAX_FRAME_UNCOMPRESSED_BYTES) {
+                self.write_segment(chunk, None, false, None, source).await?;
+            }
+        }
         Ok(LogAppend::Written)
     }
 
@@ -287,7 +328,7 @@ impl ExecutionLogWriter {
         control: bool,
     ) -> std::io::Result<()> {
         for input in bytes.as_bytes().chunks(MAX_FRAME_UNCOMPRESSED_BYTES) {
-            self.write_segment(input, captured_at, control, None)
+            self.write_segment(input, captured_at, control, None, None)
                 .await?;
         }
         Ok(())
@@ -299,6 +340,7 @@ impl ExecutionLogWriter {
         captured_at: Option<chrono::DateTime<chrono::Utc>>,
         control: bool,
         outcome: Option<CaptureOutcome>,
+        legacy_sql_row: Option<&LegacySqlRow>,
     ) -> std::io::Result<()> {
         let input = input.to_vec();
         let input_len = input.len() as u64;
@@ -315,14 +357,27 @@ impl ExecutionLogWriter {
             capture_order: self.uncompressed_offset,
             control,
             outcome,
+            legacy_sql_row: legacy_sql_row.cloned(),
         };
         let metadata = serde_json::to_vec(&metadata).map_err(io::Error::other)?;
+        if metadata.len() > MAX_CAPTURE_METADATA_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capture metadata exceeds owner capacity",
+            ));
+        }
         // Metadata has its own checksum while standard Zstd readers continue
         // to return only the original JSONL bytes.
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1)?;
         encoder.include_checksum(true)?;
         std::io::Write::write_all(&mut encoder, &metadata)?;
         let metadata = encoder.finish()?;
+        if metadata.len() > MAX_CAPTURE_METADATA_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "encoded capture metadata exceeds owner capacity",
+            ));
+        }
         let mut skippable = Vec::with_capacity(8 + metadata.len());
         skippable.extend_from_slice(&ZSTD_SKIPPABLE_FRAME_MAGIC.to_le_bytes());
         skippable.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
@@ -612,12 +667,30 @@ pub async fn execution_log_sha256(path: &Path) -> io::Result<[u8; 32]> {
     .map_err(io::Error::other)?
 }
 
+/// Validate legacy JSON without allocating every payload value. Unknown old
+/// capture coverage remains unknown even when the observed bytes are valid.
+pub async fn validate_execution_log_json(path: &Path) -> io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let decoder = zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?;
+        for value in
+            serde_json::Deserializer::from_reader(decoder).into_iter::<serde::de::IgnoredAny>()
+        {
+            value.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 #[derive(Default, Debug, serde::Serialize)]
 pub struct OwnerSummary {
     pub uncompressed_bytes: u64,
     /// None means unsealed, never a claim that the process is still alive.
     pub outcome: Option<CaptureOutcome>,
     pub legacy_capture_metadata: bool,
+    pub legacy_sql_fingerprint: Option<String>,
     #[serde(skip)]
     control_bytes: u64,
 }
@@ -655,7 +728,7 @@ fn read_owner_frame(reader: &mut io::BufReader<std::fs::File>) -> io::Result<Dec
         ));
     }
     let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
-    if size > 4096 {
+    if size > MAX_CAPTURE_METADATA_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "oversized capture metadata",
@@ -666,8 +739,10 @@ fn read_owner_frame(reader: &mut io::BufReader<std::fs::File>) -> io::Result<Dec
     let mut decoder = zstd::stream::read::Decoder::new(&encoded[..])?;
     decoder.window_log_max(23)?;
     let mut metadata = Vec::new();
-    decoder.take(4097).read_to_end(&mut metadata)?;
-    if metadata.len() > 4096 {
+    decoder
+        .take(MAX_CAPTURE_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut metadata)?;
+    if metadata.len() > MAX_CAPTURE_METADATA_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "oversized decoded metadata",
@@ -695,8 +770,13 @@ fn read_owner_frame(reader: &mut io::BufReader<std::fs::File>) -> io::Result<Dec
 pub async fn scan_owner(path: &Path) -> io::Result<OwnerSummary> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
+        use sha2::Digest;
         let mut reader = io::BufReader::new(std::fs::File::open(path)?);
         let mut summary = OwnerSummary::default();
+        let mut sql_digest = sha2::Sha256::new();
+        let mut sql_row: Option<LegacySqlRow> = None;
+        let mut row_bytes = 0;
+        let mut has_other_data = false;
         while !reader.fill_buf()?.is_empty() {
             let frame = read_owner_frame(&mut reader)?;
             if frame.locator.start != summary.uncompressed_bytes || summary.outcome.is_some() {
@@ -708,8 +788,39 @@ pub async fn scan_owner(path: &Path) -> io::Result<OwnerSummary> {
             summary.uncompressed_bytes = frame.locator.end;
             summary.outcome = frame.metadata.outcome;
             summary.legacy_capture_metadata |= frame.metadata.captured_at.is_none();
+            if let Some(source) = frame.metadata.legacy_sql_row {
+                if sql_row.as_ref() != Some(&source) {
+                    if sql_row
+                        .as_ref()
+                        .is_some_and(|row| row.original_bytes != row_bytes)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "incomplete legacy SQL row",
+                        ));
+                    }
+                    source.hash_header(&mut sql_digest)?;
+                    sql_row = Some(source);
+                    row_bytes = 0;
+                }
+                row_bytes += frame.bytes.len() as u64;
+                sql_digest.update(&frame.bytes);
+            } else if !frame.bytes.is_empty() {
+                has_other_data = true;
+            }
             if frame.metadata.control {
                 summary.control_bytes += frame.bytes.len() as u64;
+            }
+        }
+        if let Some(row) = sql_row {
+            if row.original_bytes != row_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete legacy SQL row",
+                ));
+            }
+            if !has_other_data {
+                summary.legacy_sql_fingerprint = Some(format!("{:x}", sql_digest.finalize()));
             }
         }
         Ok(summary)
@@ -1207,7 +1318,7 @@ mod tests {
         assert!(read_execution_log_snapshot(&path).await.unwrap().complete);
         let old_path = dir.path().join("legacy.zst");
         let mut old = ExecutionLogWriter::open(old_path.clone()).await.unwrap();
-        old.append_legacy_jsonl_line("{\"Stdout\":\"old\"}\n")
+        old.append_legacy_bytes(b"{\"Stdout\":\"old\"}\n", None)
             .await
             .unwrap();
         old.finish(CaptureOutcome::LegacyUnknown).await.unwrap();

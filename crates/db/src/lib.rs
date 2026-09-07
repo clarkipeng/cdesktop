@@ -1,7 +1,7 @@
 use std::{str::FromStr, sync::Arc};
 
 use sqlx::{
-    ConnectOptions, Error, Pool, Sqlite, SqlitePool,
+    Error, Pool, Sqlite, SqlitePool,
     migrate::MigrateError,
     sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions},
 };
@@ -86,21 +86,6 @@ impl DBService {
         let pool = SqlitePool::connect_with(options).await?;
         run_migrations(&pool).await?;
         Ok(DBService { pool })
-    }
-
-    pub async fn new_migration_pool() -> Result<Pool<Sqlite>, Error> {
-        let database_url = format!(
-            "sqlite://{}",
-            asset_dir().join("db.v2.sqlite").to_string_lossy()
-        );
-        let options = SqliteConnectOptions::from_str(&database_url)?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Delete)
-            .disable_statement_logging();
-        SqlitePoolOptions::new()
-            .max_connections(64)
-            .connect_with(options)
-            .await
     }
 
     pub async fn new_with_after_connect<F>(after_connect: F) -> Result<DBService, Error>

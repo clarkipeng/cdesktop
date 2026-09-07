@@ -62,6 +62,27 @@ pub fn publish_noclobber(temp: tempfile::NamedTempFile, destination: &Path) -> i
     }
 }
 
+/// Re-establish publication durability after a lost/failed acknowledgement.
+/// Readability alone is insufficient to authorize deletion of another source.
+pub fn confirm_publication(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)?.sync_all()?;
+        sync_parent(path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        // MoveFileExW WRITE_THROUGH confirms a new successful publication. We
+        // have no verified equivalent for an already-existing directory entry;
+        // callers must retain redundant originals instead of guessing.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot reconfirm existing Windows publication durability",
+        ))
+    }
+}
+
 #[cfg(not(windows))]
 fn sync_parent(path: &Path) -> io::Result<()> {
     fs::File::open(
@@ -122,6 +143,8 @@ mod tests {
         let mut first = tempfile::NamedTempFile::new_in(&directory).unwrap();
         first.write_all(b"first").unwrap();
         publish_noclobber(first, &destination).unwrap();
+        #[cfg(not(windows))]
+        confirm_publication(&destination).unwrap();
         let mut retry = tempfile::NamedTempFile::new_in(&directory).unwrap();
         retry.write_all(b"different").unwrap();
         assert!(publish_noclobber(retry, &destination).is_err());

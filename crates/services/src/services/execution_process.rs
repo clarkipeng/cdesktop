@@ -1,206 +1,22 @@
-use std::{
-    io::{IsTerminal, Write},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use db::{
     DBService,
-    models::{
-        coding_agent_turn::CodingAgentTurn, execution_process::ExecutionProcess,
-        execution_process_logs::ExecutionProcessLogs,
-    },
+    models::{coding_agent_turn::CodingAgentTurn, execution_process::ExecutionProcess},
 };
-use futures::{StreamExt, TryStreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
-use sha2::{Digest, Sha256};
+use futures::StreamExt;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use utils::{
     execution_logs::{
-        CaptureOutcome, ExecutionLogWriter, LogAppend, execution_log_sha256,
-        legacy_process_log_file_path_in_root, process_log_file_path,
+        CaptureOutcome, ExecutionLogWriter, LogAppend, legacy_process_log_file_path_in_root,
+        process_log_file_path,
     },
     log_msg::LogMsg,
     msg_store::MsgStore,
 };
 use uuid::Uuid;
-
-pub async fn migrate_execution_logs_to_files() -> Result<()> {
-    let pool = DBService::new_migration_pool()
-        .await
-        .map_err(|e| anyhow::anyhow!("Migration DB pool error: {}", e))?;
-
-    if !ExecutionProcessLogs::has_any(&pool).await? {
-        return Ok(());
-    }
-
-    let is_tty = std::io::stderr().is_terminal();
-    if is_tty {
-        let _ = writeln!(
-            std::io::stderr(),
-            "Performing one time database migration to move logs from SQLite to flat file to improve performance, data remains local, may take a few minutes, please don't exit while this process is running..."
-        );
-    }
-
-    let pb = if is_tty {
-        Some(new_spinner("Migrating"))
-    } else {
-        None
-    };
-
-    let total_processes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    let count_task = {
-        let pool = pool.clone();
-        let pb = pb.clone();
-        let total_processes = total_processes.clone();
-        tokio::spawn(async move {
-            if let Ok(count) = ExecutionProcessLogs::count_distinct_processes(&pool).await {
-                total_processes.store(count as usize, std::sync::atomic::Ordering::Relaxed);
-                if let Some(pb) = pb {
-                    pb.set_length(count as u64);
-                    pb.set_style(
-                        ProgressStyle::default_bar()
-                            .template("{bar:36.yellow} {percent:>3}% {msg:<12.dim}")
-                            .unwrap_or_else(|_| ProgressStyle::default_bar())
-                            .progress_chars("■⬝"),
-                    );
-                }
-            }
-        })
-    };
-
-    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    ExecutionProcessLogs::stream_distinct_processes(&pool)
-        .map_err(anyhow::Error::from)
-        .map(|res| {
-            let pool = pool.clone();
-            let pb = pb.clone();
-            let completed = completed.clone();
-            let total_processes = total_processes.clone();
-            async move {
-                let p = res?;
-
-                let path = process_log_file_path(p.session_id, p.execution_id);
-                if path.exists()
-                    && utils::execution_logs::process_log_frame_index_path(&path).exists()
-                {
-                    if let Some(pb) = &pb {
-                        pb.inc(1);
-                    }
-                    return Ok::<(), anyhow::Error>(());
-                }
-
-                // Publish only a verified pair. A crash before either rename
-                // leaves the database source authoritative; a crash after
-                // publication leaves it redundant but readable.
-                let temp_path = path.with_extension("zst.tmp");
-                let temp_index_path =
-                    utils::execution_logs::process_log_frame_index_path(&temp_path);
-                let final_index_path = utils::execution_logs::process_log_frame_index_path(&path);
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                let _ = tokio::fs::remove_file(&temp_index_path).await;
-                if !path.exists() {
-                    // An index without its compressed owner was never
-                    // published. The database rows remain authoritative.
-                    let _ = tokio::fs::remove_file(&final_index_path).await;
-                }
-                let mut writer = ExecutionLogWriter::open(temp_path.clone()).await?;
-                let mut source_hash = Sha256::new();
-
-                let mut logs_stream =
-                    ExecutionProcessLogs::stream_log_lines_by_execution_id(&pool, &p.execution_id);
-                let mut has_logs = false;
-                while let Some(log_res) = logs_stream.next().await {
-                    let log = log_res?;
-                    has_logs = true;
-                    let mut line = log;
-                    if !line.ends_with('\n') {
-                        line.push('\n');
-                    }
-                    source_hash.update(line.as_bytes());
-                    match writer.append_legacy_jsonl_line(&line).await? {
-                        LogAppend::Written => {}
-                        LogAppend::Blocked | LogAppend::Unavailable => {
-                            anyhow::bail!(
-                                "cannot migrate execution {}: recording storage unavailable",
-                                p.execution_id
-                            );
-                        }
-                    }
-                }
-
-                if !has_logs {
-                    if let Some(pb) = &pb {
-                        pb.inc(1);
-                    }
-                    return Ok::<(), anyhow::Error>(());
-                }
-
-                drop(writer);
-                if execution_log_sha256(&temp_path).await? != source_hash.finalize().as_slice() {
-                    anyhow::bail!(
-                        "cannot migrate execution {}: decompressed hash mismatch",
-                        p.execution_id
-                    );
-                }
-                tokio::fs::rename(&temp_index_path, &final_index_path).await?;
-                tokio::fs::rename(&temp_path, &path).await?;
-
-                let c = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-
-                if let Some(pb) = &pb {
-                    pb.inc(1);
-                } else if c.is_multiple_of(100) {
-                    let t = total_processes.load(std::sync::atomic::Ordering::Relaxed);
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "sqlite-migration:{}",
-                        if t > 0 {
-                            (c * 100 / t).to_string()
-                        } else {
-                            "?".to_string()
-                        }
-                    );
-                }
-
-                Ok::<(), anyhow::Error>(())
-            }
-        })
-        .buffer_unordered(64)
-        .try_collect::<Vec<_>>()
-        .await?;
-
-    let _ = count_task.await;
-
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    } else {
-        let _ = writeln!(std::io::stderr(), "sqlite-migration:done");
-    }
-
-    let vacuum_pb = if is_tty {
-        Some(new_spinner("Compacting"))
-    } else {
-        let _ = writeln!(std::io::stderr(), "Compacting database...");
-        None
-    };
-
-    ExecutionProcessLogs::delete_all(&pool).await?;
-    sqlx::query("VACUUM").execute(&pool).await?;
-
-    if let Some(pb) = vacuum_pb {
-        pb.finish_and_clear();
-    }
-
-    let _ = writeln!(std::io::stderr(), "Database migration complete.");
-
-    pool.close().await;
-
-    Ok(())
-}
 
 pub async fn remove_session_process_logs(session_id: Uuid) -> Result<()> {
     let dir = utils::execution_logs::process_logs_session_dir(session_id);
@@ -259,21 +75,28 @@ pub async fn load_raw_log_messages(
             legacy_snapshot(bytes).ok()?
         }
     };
+    Some(messages_from_snapshot(snapshot))
+}
+
+fn messages_from_snapshot(snapshot: utils::execution_logs::LogSnapshot) -> RawLogMessages {
     let mut complete = snapshot.complete;
     let messages = snapshot
         .jsonl
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| match serde_json::from_str(line) {
+        // Legacy SQL rows can omit their final newline. Preserve their exact
+        // bytes in the owner and recognize adjacent JSON values in the view.
+        .flat_map(|line| serde_json::Deserializer::from_str(line).into_iter::<LogMsg>())
+        .filter_map(|message| match message {
             Ok(message) => Some(message),
             Err(error) => {
                 complete = false;
-                tracing::warn!(%execution_id, %error, "invalid record in bounded UI snapshot");
+                tracing::warn!(%error, "invalid record in bounded UI snapshot");
                 None
             }
         })
         .collect();
-    Some(RawLogMessages { messages, complete })
+    RawLogMessages { messages, complete }
 }
 
 fn legacy_snapshot(mut bytes: Vec<u8>) -> std::io::Result<utils::execution_logs::LogSnapshot> {
@@ -401,7 +224,7 @@ async fn read_execution_logs_for_execution(
                 .with_context(|| format!("read execution log file for execution {execution_id}"))?,
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Legacy files remain readable until the verified startup
+            // Legacy files remain readable until the explicit per-execution
             // migration publishes their compressed native replacement.
             let legacy_path = legacy_process_log_file_path_in_root(
                 &utils::assets::asset_dir(),
@@ -432,25 +255,15 @@ async fn read_execution_logs_for_execution(
     }
 }
 
-fn new_spinner(message: &'static str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.yellow} {msg:<12.dim}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner())
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
-    );
-    pb.set_message(message);
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::StreamExt as _;
-    use utils::execution_logs::{ExecutionLogWriter, read_execution_log_file};
+    use sha2::{Digest, Sha256};
+    use utils::execution_logs::{
+        ExecutionLogWriter, execution_log_sha256, read_execution_log_file,
+    };
 
     use super::*;
 
@@ -467,6 +280,16 @@ mod tests {
         assert!(!snapshot.complete);
         assert_eq!(snapshot.jsonl, line);
         assert!(!legacy_snapshot(line.as_bytes().to_vec()).unwrap().complete);
+    }
+
+    #[test]
+    fn original_sql_row_bytes_need_no_invented_newline_for_replay() {
+        let result = messages_from_snapshot(utils::execution_logs::LogSnapshot {
+            jsonl: "{\"Stdout\":\"first\"}{\"Stderr\":\"second\"}\n".into(),
+            complete: false,
+        });
+        assert_eq!(result.messages.len(), 2);
+        assert!(!result.complete);
     }
 
     fn scripted(

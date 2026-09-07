@@ -244,6 +244,34 @@ async fn get_raw_log_status(
     Ok(ResponseJson(ApiResponse::success(status)))
 }
 
+async fn migrate_raw_log(
+    Extension(process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<
+    ResponseJson<ApiResponse<services::services::execution_log_migration::MigrationReport>>,
+    ApiError,
+> {
+    if process.status == ExecutionProcessStatus::Running
+        || deployment
+            .container()
+            .get_msg_store_by_id(&process.id)
+            .await
+            .is_some()
+    {
+        return Err(ApiError::Conflict(
+            "execution capture is still active".into(),
+        ));
+    }
+    let report = services::services::execution_log_migration::migrate_execution_logs(
+        &deployment.db().pool,
+        &utils::assets::asset_dir(),
+        process.id,
+    )
+    .await
+    .map_err(services::services::container::ContainerError::Other)?;
+    Ok(ResponseJson(ApiResponse::success(report)))
+}
+
 /// Durable producer entry point for checkpoints and reports. Artifact bytes
 /// are deduplicated by their attachment hash, while every upload produces an
 /// occurrence row owned by this execution.
@@ -657,6 +685,7 @@ fn execution_routes() -> Router<DeploymentImpl> {
         .route("/normalized-snapshot", get(get_normalized_log_snapshot))
         .route("/raw-log", get(get_raw_log_range))
         .route("/raw-log/status", get(get_raw_log_status))
+        .route("/raw-log/migrate", post(migrate_raw_log))
         .route(
             "/artifacts",
             post(upload_execution_artifact).layer(DefaultBodyLimit::disable()),
