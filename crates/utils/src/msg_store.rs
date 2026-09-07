@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures::{StreamExt, future};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::sync::watch;
 
 use crate::{log_msg::LogMsg, stream_lines::LinesStreamExt};
 
@@ -204,24 +204,6 @@ impl MsgStore {
                 }
             })
             .boxed()
-    }
-
-    /// Forward a stream of typed log messages into this store.
-    pub fn spawn_forwarder<S, E>(self: Arc<Self>, stream: S) -> JoinHandle<()>
-    where
-        S: futures::Stream<Item = Result<LogMsg, E>> + Send + 'static,
-        E: std::fmt::Display + Send + 'static,
-    {
-        tokio::spawn(async move {
-            tokio::pin!(stream);
-
-            while let Some(next) = stream.next().await {
-                match next {
-                    Ok(msg) => self.push(msg),
-                    Err(e) => self.push(LogMsg::Stderr(format!("stream error: {e}"))),
-                }
-            }
-        })
     }
 }
 

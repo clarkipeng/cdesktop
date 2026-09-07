@@ -279,7 +279,8 @@ mod tests {
     use futures::StreamExt as _;
     use sha2::{Digest, Sha256};
     use utils::execution_logs::{
-        ExecutionLogWriter, execution_log_sha256, read_execution_log_file,
+        ExecutionLogWriter, MAX_EXECUTION_LOG_RANGE_BYTES, execution_log_sha256,
+        read_execution_log_range,
     };
 
     use super::*;
@@ -451,7 +452,9 @@ mod tests {
         assert_eq!(stops.load(Ordering::SeqCst), 1);
         assert_eq!(store.get_history().len(), 1);
         assert_eq!(
-            read_execution_log_file(&path).await.unwrap(),
+            read_execution_log_range(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES)
+                .await
+                .unwrap(),
             "{\"Stdout\":\"accepted\"}\n"
         );
         assert_eq!(
@@ -496,7 +499,9 @@ mod tests {
         assert_eq!(stops.load(Ordering::SeqCst), 1);
         assert_eq!(store.get_history().len(), 1);
         assert_eq!(
-            read_execution_log_file(&path).await.unwrap(),
+            read_execution_log_range(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES)
+                .await
+                .unwrap(),
             "{\"Stdout\":\"retained\"}\n"
         );
     }

@@ -6,7 +6,11 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::{assets::asset_dir, log_msg::LogMsg};
+use crate::{
+    assets::asset_dir,
+    durable_fs::{PublicationDurability, read_confirmed},
+    log_msg::LogMsg,
+};
 
 pub const EXECUTION_LOGS_DIRNAME: &str = "sessions";
 
@@ -450,19 +454,6 @@ impl ExecutionLogWriter {
     }
 }
 
-pub async fn read_execution_log_file(path: &Path) -> std::io::Result<String> {
-    // Kept only for the legacy snapshot adapter. New consumers must use the
-    // paged range API; this intentionally refuses instead of allocating a
-    // whole multi-gigabyte transcript.
-    if scan_owner(path).await?.uncompressed_bytes > MAX_EXECUTION_LOG_RANGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "execution snapshot exceeds page limit; use bounded snapshot or range API",
-        ));
-    }
-    read_execution_log_range(path, 0, MAX_EXECUTION_LOG_RANGE_BYTES).await
-}
-
 pub struct LogSnapshot {
     pub jsonl: String,
     pub complete: bool,
@@ -471,12 +462,23 @@ pub struct LogSnapshot {
 /// A UI view contains whole records only. A large or unsealed source is
 /// explicitly partial; the paged owner API remains the full-fidelity reader.
 pub async fn read_execution_log_snapshot(path: &Path) -> io::Result<LogSnapshot> {
-    let owner = scan_owner(path).await?;
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let (mut snapshot, durability) = read_confirmed(&path, read_snapshot_blocking)?;
+        snapshot.complete &= durability == PublicationDurability::Confirmed;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn read_snapshot_blocking(path: &Path) -> io::Result<LogSnapshot> {
+    let owner = scan_owner_blocking(path)?;
     let end = owner
         .uncompressed_bytes
         .min(in_memory_log_bytes())
         .min(MAX_EXECUTION_LOG_RANGE_BYTES);
-    let mut bytes = read_execution_log_range_bytes(path, 0, end).await?;
+    let mut bytes = read_range_blocking(path, 0, end)?;
     let truncated = end < owner.uncompressed_bytes;
     if truncated {
         let record_end = bytes
@@ -502,14 +504,42 @@ pub async fn read_execution_log_range(path: &Path, start: u64, end: u64) -> io::
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// Reads exact original bytes. This is the native integration contract: ranges
-/// are offsets in the decompressed producer stream, not UTF-8 character
-/// positions or compressed offsets.
+/// Reads exact original bytes provisionally, without a durability acknowledgement.
+/// Ranges are offsets in the decompressed stream, not characters or compressed
+/// offsets. Durable cursor consumers must use `read_execution_log_page`.
 pub async fn read_execution_log_range_bytes(
     path: &Path,
     start: u64,
     end: u64,
 ) -> io::Result<Vec<u8>> {
+    validate_range(start, end)?;
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || read_range_blocking(&path, start, end))
+        .await
+        .map_err(io::Error::other)?
+}
+
+pub struct LogPage {
+    pub bytes: Vec<u8>,
+    pub durability: PublicationDurability,
+}
+
+/// Read and verify a bounded range before confirming its publication. Only a
+/// confirmed response permits advancing from an already-confirmed contiguous
+/// start to its actual end. An arbitrary requested start does not certify a prefix.
+pub async fn read_execution_log_page(path: &Path, start: u64, end: u64) -> io::Result<LogPage> {
+    validate_range(start, end)?;
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let (bytes, durability) =
+            read_confirmed(&path, |path| read_range_blocking(path, start, end))?;
+        Ok(LogPage { bytes, durability })
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn validate_range(start: u64, end: u64) -> io::Result<()> {
     if end < start {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -522,10 +552,7 @@ pub async fn read_execution_log_range_bytes(
             "execution log range exceeds page limit",
         ));
     }
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || read_range_blocking(&path, start, end))
-        .await
-        .map_err(io::Error::other)?
+    Ok(())
 }
 
 fn read_range_blocking(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
@@ -681,6 +708,28 @@ pub struct OwnerSummary {
     control_bytes: u64,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct OwnerStatus {
+    #[serde(flatten)]
+    pub coverage: OwnerSummary,
+    pub durability: PublicationDurability,
+}
+
+/// Coverage and durability are separate owner facts. In particular, a Complete
+/// seal may be readable before the writer's fsync, so confirm after scanning it.
+pub async fn read_execution_log_status(path: &Path) -> io::Result<OwnerStatus> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let (coverage, durability) = read_confirmed(&path, scan_owner_blocking)?;
+        Ok(OwnerStatus {
+            coverage,
+            durability,
+        })
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 struct DecodedFrame {
     locator: LogFrame,
     metadata: CapturedLogMetadata,
@@ -755,64 +804,66 @@ fn read_owner_frame(reader: &mut io::BufReader<std::fs::File>) -> io::Result<Dec
 
 pub async fn scan_owner(path: &Path) -> io::Result<OwnerSummary> {
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        use sha2::Digest;
-        let mut reader = io::BufReader::new(std::fs::File::open(path)?);
-        let mut summary = OwnerSummary::default();
-        let mut sql_digest = sha2::Sha256::new();
-        let mut sql_row: Option<LegacySqlRow> = None;
-        let mut row_bytes = 0;
-        let mut has_other_data = false;
-        while !reader.fill_buf()?.is_empty() {
-            let frame = read_owner_frame(&mut reader)?;
-            if frame.locator.start != summary.uncompressed_bytes || summary.outcome.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "noncontiguous execution owner",
-                ));
-            }
-            summary.uncompressed_bytes = frame.locator.end;
-            summary.outcome = frame.metadata.outcome;
-            summary.legacy_capture_metadata |= frame.metadata.captured_at.is_none();
-            if let Some(source) = frame.metadata.legacy_sql_row {
-                if sql_row.as_ref() != Some(&source) {
-                    if sql_row
-                        .as_ref()
-                        .is_some_and(|row| row.original_bytes != row_bytes)
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "incomplete legacy SQL row",
-                        ));
-                    }
-                    source.hash_header(&mut sql_digest)?;
-                    sql_row = Some(source);
-                    row_bytes = 0;
+    tokio::task::spawn_blocking(move || scan_owner_blocking(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
+fn scan_owner_blocking(path: &Path) -> io::Result<OwnerSummary> {
+    use sha2::Digest;
+    let mut reader = io::BufReader::new(std::fs::File::open(path)?);
+    let mut summary = OwnerSummary::default();
+    let mut sql_digest = sha2::Sha256::new();
+    let mut sql_row: Option<LegacySqlRow> = None;
+    let mut row_bytes = 0;
+    let mut has_other_data = false;
+    while !reader.fill_buf()?.is_empty() {
+        let frame = read_owner_frame(&mut reader)?;
+        if frame.locator.start != summary.uncompressed_bytes || summary.outcome.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "noncontiguous execution owner",
+            ));
+        }
+        summary.uncompressed_bytes = frame.locator.end;
+        summary.outcome = frame.metadata.outcome;
+        summary.legacy_capture_metadata |= frame.metadata.captured_at.is_none();
+        if let Some(source) = frame.metadata.legacy_sql_row {
+            if sql_row.as_ref() != Some(&source) {
+                if sql_row
+                    .as_ref()
+                    .is_some_and(|row| row.original_bytes != row_bytes)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "incomplete legacy SQL row",
+                    ));
                 }
-                row_bytes += frame.bytes.len() as u64;
-                sql_digest.update(&frame.bytes);
-            } else if !frame.bytes.is_empty() {
-                has_other_data = true;
+                source.hash_header(&mut sql_digest)?;
+                sql_row = Some(source);
+                row_bytes = 0;
             }
-            if frame.metadata.control {
-                summary.control_bytes += frame.bytes.len() as u64;
-            }
+            row_bytes += frame.bytes.len() as u64;
+            sql_digest.update(&frame.bytes);
+        } else if !frame.bytes.is_empty() {
+            has_other_data = true;
         }
-        if let Some(row) = sql_row {
-            if row.original_bytes != row_bytes {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "incomplete legacy SQL row",
-                ));
-            }
-            if !has_other_data {
-                summary.legacy_sql_fingerprint = Some(format!("{:x}", sql_digest.finalize()));
-            }
+        if frame.metadata.control {
+            summary.control_bytes += frame.bytes.len() as u64;
         }
-        Ok(summary)
-    })
-    .await
-    .map_err(io::Error::other)?
+    }
+    if let Some(row) = sql_row {
+        if row.original_bytes != row_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete legacy SQL row",
+            ));
+        }
+        if !has_other_data {
+            summary.legacy_sql_fingerprint = Some(format!("{:x}", sql_digest.finalize()));
+        }
+    }
+    Ok(summary)
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -891,6 +942,101 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn read_acknowledgements_cover_visible_bytes_and_seals_with_an_open_writer() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        // Build real native frames, then expose them on another owner exactly
+        // as a writer does between write/flush and sync. No sidecar is copied.
+        let template = root.path().join("template.zst");
+        let mut writer = ExecutionLogWriter::open(template.clone()).await.unwrap();
+        writer
+            .append_jsonl_line("{\"Stdout\":\"é\"}\n")
+            .await
+            .unwrap();
+        let unsealed = std::fs::read(&template).unwrap();
+        writer.finish(CaptureOutcome::Complete).await.unwrap();
+        let sealed = std::fs::read(&template).unwrap();
+        let path = root.path().join("visible.zst");
+        let _lease = lock_execution_log(&path).unwrap();
+        let mut pending_writer = std::fs::File::create(&path).unwrap();
+        pending_writer.write_all(&unsealed).unwrap();
+        pending_writer.flush().unwrap();
+
+        let status = read_execution_log_status(&path).await.unwrap();
+        assert_eq!(status.coverage.outcome, None);
+        let expected_durability = if cfg!(windows) {
+            PublicationDurability::Unverified
+        } else {
+            PublicationDurability::Confirmed
+        };
+        assert_eq!(status.durability, expected_durability);
+        // A range is bytes, so splitting a code point is valid here.
+        let source = "{\"Stdout\":\"é\"}\n".as_bytes();
+        let page = read_execution_log_page(&path, 12, 100).await.unwrap();
+        assert_eq!(page.bytes, source[12..]);
+        assert_eq!(page.durability, expected_durability);
+
+        pending_writer.write_all(&sealed[unsealed.len()..]).unwrap();
+        pending_writer.flush().unwrap();
+        let status = read_execution_log_status(&path).await.unwrap();
+        assert_eq!(status.coverage.outcome, Some(CaptureOutcome::Complete));
+        assert_eq!(status.coverage.uncompressed_bytes, source.len() as u64);
+        assert_eq!(status.durability, expected_durability);
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["outcome"], "complete");
+        assert_eq!(encoded["durability"], expected_durability.as_str());
+        assert!(
+            encoded.get("coverage").is_none(),
+            "preserve existing status fields"
+        );
+        // Missing/corrupt owners cannot yield a confirmed empty/completed view.
+        assert!(
+            read_execution_log_page(&root.path().join("missing"), 0, 0)
+                .await
+                .is_err()
+        );
+        pending_writer.write_all(b"torn").unwrap();
+        pending_writer.flush().unwrap();
+        assert!(read_execution_log_status(&path).await.is_err());
+        assert!(
+            read_execution_log_page(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES + 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_legacy_frames_do_not_force_cross_frame_ranges_off_the_index() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("legacy.zst");
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        for (row_id, bytes) in [b"".as_slice(), b"first", b"", b"second", b""]
+            .into_iter()
+            .enumerate()
+        {
+            writer
+                .append_legacy_bytes(
+                    bytes,
+                    Some(&LegacySqlRow {
+                        row_id: row_id as i64,
+                        inserted_at: "2026-09-07 00:00:00".into(),
+                        reported_byte_size: bytes.len() as i64,
+                        original_bytes: bytes.len() as u64,
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        writer.finish(CaptureOutcome::LegacyUnknown).await.unwrap();
+        assert_eq!(read_range_from_index(&path, 2, 9).unwrap(), b"rstseco");
+        assert_eq!(read_range_from_index(&path, 0, 11).unwrap(), b"firstsecond");
+        assert_eq!(
+            read_execution_log_range_bytes(&path, 0, 11).await.unwrap(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
     async fn frames_round_trip_and_ranges_cross_frame_boundaries() {
         // Source ranges are the native contract for a later index. They must
         // remain correct even when a requested range crosses Zstd frames.
@@ -903,7 +1049,9 @@ mod tests {
         drop(writer);
 
         assert_eq!(
-            read_execution_log_file(&path).await.unwrap(),
+            read_execution_log_range(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES)
+                .await
+                .unwrap(),
             "first\nsecond\nthird\n"
         );
         assert_eq!(
@@ -1285,7 +1433,12 @@ mod tests {
             scan_owner(&path).await.unwrap().outcome,
             Some(CaptureOutcome::Complete)
         );
-        assert_eq!(read_execution_log_file(&path).await.unwrap(), "record\n");
+        assert_eq!(
+            read_execution_log_range(&path, 0, MAX_EXECUTION_LOG_RANGE_BYTES)
+                .await
+                .unwrap(),
+            "record\n"
+        );
         let mut reopened = ExecutionLogWriter::open(path.clone()).await.unwrap();
         assert!(reopened.append_jsonl_line("late").await.is_err());
     }
@@ -1321,10 +1474,6 @@ mod tests {
         }
         writer.finish(CaptureOutcome::Complete).await.unwrap();
         drop(writer);
-        assert!(
-            read_execution_log_file(&path).await.is_err(),
-            "whole-file adapter must refuse oversize sources"
-        );
         let snapshot = read_execution_log_snapshot(&path).await.unwrap();
         assert!(!snapshot.complete);
         assert!(snapshot.jsonl.len() <= MAX_EXECUTION_LOG_RANGE_BYTES as usize);
@@ -1347,7 +1496,10 @@ mod tests {
             .unwrap();
         assert!(!read_execution_log_snapshot(&path).await.unwrap().complete);
         writer.finish(CaptureOutcome::Complete).await.unwrap();
-        assert!(read_execution_log_snapshot(&path).await.unwrap().complete);
+        assert_eq!(
+            read_execution_log_snapshot(&path).await.unwrap().complete,
+            !cfg!(windows)
+        );
         let old_path = dir.path().join("legacy.zst");
         let mut old = ExecutionLogWriter::open(old_path.clone()).await.unwrap();
         old.append_legacy_bytes(b"{\"Stdout\":\"old\"}\n", None)

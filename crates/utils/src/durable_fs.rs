@@ -5,6 +5,50 @@
 use std::fs;
 use std::{io, path::Path};
 
+/// Separate readable coverage from a confirmed filesystem acknowledgement.
+/// Unverified data must not advance a durable cursor or replace another source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationDurability {
+    Confirmed,
+    Unverified,
+}
+
+impl PublicationDurability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+/// Verify the value first, then confirm its owner and reachable directory entries.
+/// The owner is native, append-only and never replaced. A writer may still be
+/// open: the reader's barrier covers bytes it observed before the barrier.
+pub fn read_confirmed<T>(
+    path: &Path,
+    read: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<(T, PublicationDurability)> {
+    read_confirmed_with(path, read, confirm_publication)
+}
+
+fn read_confirmed_with<T>(
+    path: &Path,
+    read: impl FnOnce(&Path) -> io::Result<T>,
+    confirm: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<(T, PublicationDurability)> {
+    let value = read(path)?;
+    let durability = match confirm(path) {
+        Ok(()) => PublicationDurability::Confirmed,
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            PublicationDurability::Unverified
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((value, durability))
+}
+
 /// Make each new parent entry durable, including a newly created session tree.
 /// Syncing only the leaf directory can still lose its unsynced ancestors.
 pub fn create_dir_all(path: &Path) -> io::Result<()> {
@@ -169,6 +213,49 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn read_acknowledgement_confirms_after_read_and_never_hides_io_failure() {
+        let read_finished = std::cell::Cell::new(false);
+        let read = |_: &Path| {
+            read_finished.set(true);
+            Ok(b"observed bytes")
+        };
+        let confirm = |_: &Path| {
+            assert!(
+                read_finished.get(),
+                "barrier must follow the observed value"
+            );
+            Ok(())
+        };
+        let (_, durability) = read_confirmed_with(Path::new("owner"), read, confirm).unwrap();
+        assert_eq!(durability, PublicationDurability::Confirmed);
+
+        let (bytes, durability) = read_confirmed_with(
+            Path::new("owner"),
+            |_| Ok(b"still readable"),
+            |_| Err(io::ErrorKind::Unsupported.into()),
+        )
+        .unwrap();
+        assert_eq!(bytes, b"still readable");
+        assert_eq!(durability, PublicationDurability::Unverified);
+        assert!(
+            read_confirmed_with(
+                Path::new("owner"),
+                |_| Ok(b"not acknowledged"),
+                |_| Err(io::ErrorKind::PermissionDenied.into()),
+            )
+            .is_err()
+        );
+        assert!(
+            read_confirmed_with::<()>(
+                Path::new("owner"),
+                |_| Err(io::ErrorKind::InvalidData.into()),
+                |_| panic!("do not confirm a failed read"),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn publish_preserves_existing_bytes_and_builds_nested_owner_directories() {

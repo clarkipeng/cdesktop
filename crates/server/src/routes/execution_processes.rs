@@ -219,18 +219,27 @@ async fn get_raw_log_range(
         execution_process.session_id,
         execution_process.id,
     );
-    let bytes =
-        utils::execution_logs::read_execution_log_range_bytes(&path, query.start, query.end)
-            .await?;
+    let page =
+        utils::execution_logs::read_execution_log_page(&path, query.start, query.end).await?;
+    raw_log_range_response(execution_process.id, query.start, page)
+}
+
+fn raw_log_range_response(
+    process_id: Uuid,
+    start: u64,
+    page: utils::execution_logs::LogPage,
+) -> Result<axum::response::Response, ApiError> {
     axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        // A byte range can split a JSON record or UTF-8 code point.
+        .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(
             "x-cdesktop-source-range",
-            format!("[{}, {})", query.start, query.start + bytes.len() as u64),
+            format!("[{}, {})", start, start + page.bytes.len() as u64),
         )
-        .header("x-cdesktop-source-id", execution_process.id.to_string())
-        .body(axum::body::Body::from(bytes))
+        .header("x-cdesktop-source-id", process_id.to_string())
+        .header("x-cdesktop-source-durability", page.durability.as_str())
+        .body(axum::body::Body::from(page.bytes))
         .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
@@ -238,9 +247,9 @@ async fn get_raw_log_range(
 /// status or a short range read. Missing/corrupt owners return errors.
 async fn get_raw_log_status(
     Extension(process): Extension<ExecutionProcess>,
-) -> Result<ResponseJson<ApiResponse<utils::execution_logs::OwnerSummary>>, ApiError> {
+) -> Result<ResponseJson<ApiResponse<utils::execution_logs::OwnerStatus>>, ApiError> {
     let path = utils::execution_logs::process_log_file_path(process.session_id, process.id);
-    let status = utils::execution_logs::scan_owner(&path).await?;
+    let status = utils::execution_logs::read_execution_log_status(&path).await?;
     Ok(ResponseJson(ApiResponse::success(status)))
 }
 
@@ -721,6 +730,47 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_range_response_reports_actual_bytes_and_explicit_durability() {
+        use utils::{durable_fs::PublicationDurability, execution_logs::LogPage};
+        let process_id = Uuid::new_v4();
+        for durability in [
+            PublicationDurability::Confirmed,
+            PublicationDurability::Unverified,
+        ] {
+            let response = raw_log_range_response(
+                process_id,
+                12,
+                LogPage {
+                    bytes: vec![0xa9, b'"', b'}'],
+                    durability,
+                },
+            )
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/octet-stream"
+            );
+            assert_eq!(response.headers()["x-cdesktop-source-range"], "[12, 15)");
+            assert_eq!(
+                response.headers()["x-cdesktop-source-id"],
+                process_id.to_string()
+            );
+            assert_eq!(
+                response.headers()["x-cdesktop-source-durability"],
+                durability.as_str()
+            );
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 3)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                &[0xa9, b'"', b'}']
+            );
+        }
+    }
 
     #[test]
     fn evidence_routes_have_no_overlapping_handlers() {
