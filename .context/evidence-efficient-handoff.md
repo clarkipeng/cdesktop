@@ -42,7 +42,9 @@
   turn-scoped guidance and cancellation of an unresolved `turn/start`, which
   returns without replaying it. Pinned app-server source shows that null
   collaboration developer guidance selects the built-in mode setting; no
-  append guidance is stored on resume. The pinned server itself was not run.
+  append guidance is stored on resume. The pinned server itself was not run:
+  its isolated test requires dependencies absent from the local vendor cache,
+  and the attempt was stopped before it could fetch them.
 - Normalization keys usage by native thread and turn, so repeated usage updates
   for one turn replace its entry rather than replaying old usage.
 - Measured local copy/startup result: not yet available. No provider/cache or
@@ -66,3 +68,11 @@ The fork branch is published and API-verified against draft PR #37. The
 mistaken upstream `cdesktop-ai/cdesktop` PR #21 was closed without deleting the
 fork branch. No merge, provider inference, cdesktop install/activation, or
 service restart was performed.
+
+## Remaining proof
+
+The pinned app-server mock-server test still needs to run in an environment
+with its already-provisioned toolchain and dependency cache. It is the final
+executable confirmation that a null turn collaboration override restores the
+built-in mode guidance. This lane is checkpointed, not complete, until that
+test is recorded.

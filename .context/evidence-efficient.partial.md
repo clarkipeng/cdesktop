@@ -1,4 +1,4 @@
-# Native execution efficiency: completion checkpoint
+# Native execution efficiency: checkpoint
 
 ## Now
 
@@ -31,7 +31,7 @@
 - Passed: `cargo clippy -p executors --tests -- -D warnings`, `pnpm run format`,
   and `git diff --check`.
 
-## Completed proof
+## Proved locally
 
 - Repeated continuation fixtures emit `thread/resume`, then `turn/start`, for
   the same recorded thread and emit no fork request.
@@ -41,6 +41,14 @@
   fresh `thread/resume` + `turn/start` pair.
 - Usage updates retain `thread_id` and `turn_id`, and a second notification for
   the same turn replaces its normalized entry instead of replaying old usage.
+
+## Remaining proof
+
+- The pinned app-server mock-server test for null collaboration developer
+  guidance has not run. Its local vendor cache lacked dependencies and the
+  isolated attempt was stopped before it could fetch them. Run it in a
+  pre-provisioned sandbox to confirm the built-in mode guidance at that exact
+  boundary before declaring the lane complete.
 
 ## Constraints retained
 
