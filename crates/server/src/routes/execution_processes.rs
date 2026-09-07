@@ -62,6 +62,7 @@ struct ArtifactUploadQuery {
     /// Original producer-relative path, if it differs from the uploaded name.
     original_path: Option<String>,
     producer_ref: Option<String>,
+    publication_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +216,9 @@ async fn upload_execution_artifact(
             continue;
         }
         let filename = field.file_name().unwrap_or("artifact.bin").to_owned();
+        if query.publication_key.trim().is_empty() {
+            return Err(ApiError::BadRequest("publication_key is required".into()));
+        }
         let original_path = query.original_path.as_deref().unwrap_or(&filename);
         let file = deployment
             .file()
@@ -226,9 +230,16 @@ async fn upload_execution_artifact(
                 execution_process.id,
                 original_path,
                 query.producer_ref.as_deref(),
+                &query.publication_key,
                 &file,
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                services::services::file::FileError::PublicationConflict => ApiError::Conflict(
+                    "artifact publication key already refers to different evidence".into(),
+                ),
+                other => other.into(),
+            })?;
         return Ok(ResponseJson(ApiResponse::success(occurrence)));
     }
     Err(ApiError::File(

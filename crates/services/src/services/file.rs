@@ -29,6 +29,9 @@ pub enum FileError {
     #[error("File not found")]
     NotFound,
 
+    #[error("artifact publication key was already used for different evidence")]
+    PublicationConflict,
+
     #[error("Failed to build response: {0}")]
     ResponseBuildError(String),
 }
@@ -207,17 +210,27 @@ impl FileService {
         execution_id: Uuid,
         original_path: &str,
         producer_ref: Option<&str>,
+        publication_key: &str,
         file: &File,
     ) -> Result<ExecutionArtifact, FileError> {
-        ExecutionArtifact::create(
+        let (artifact, publication) = ExecutionArtifact::create_or_replay(
             &self.pool,
             execution_id,
             file.id,
             original_path,
             producer_ref,
+            publication_key,
         )
         .await
-        .map_err(FileError::Database)
+        .map_err(FileError::Database)?;
+        if publication == db::models::execution_artifact::ExecutionArtifactPublication::Replayed
+            && (artifact.attachment_id != file.id
+                || artifact.original_path != original_path
+                || artifact.producer_ref.as_deref() != producer_ref)
+        {
+            return Err(FileError::PublicationConflict);
+        }
+        Ok(artifact)
     }
 
     pub async fn get_execution_artifact(

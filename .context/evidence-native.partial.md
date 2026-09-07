@@ -15,6 +15,13 @@
   a streamed `artifact` multipart field and returns its occurrence; `GET
   /api/execution-processes/{id}/artifacts/{occurrence_id}` resolves only an
   occurrence owned by that execution.
+- Replay contract in progress: callers supply `publication_key`; native SQLite
+  will use `(execution_id, publication_key)` as the idempotency boundary and
+  reject a replay whose byte blob or source metadata differs.
+
+Routing note: prior status commands mistakenly targeted a retired cdesktop
+session. No further workspace-manager routing is used; this local checkpoint
+is the status surface for the root coordinator.
 
 Focused isolated checks: `cargo test -p utils execution_logs --lib` (7 passed)
 and `cargo check -p server -p services` (passed before the final stale-index
