@@ -715,6 +715,111 @@ pub struct OwnerStatus {
     pub durability: PublicationDurability,
 }
 
+/// Metadata pages retain at most one decoded 64KiB frame plus this bounded set
+/// of small metadata records. They never return or duplicate transcript bodies.
+pub const MAX_PROVENANCE_FRAMES: usize = 128;
+
+#[derive(Debug, serde::Serialize)]
+pub struct ProvenanceFrame {
+    pub raw_range: std::ops::Range<u64>,
+    pub compressed_range: std::ops::Range<u64>,
+    pub captured_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub control: bool,
+    pub outcome: Option<CaptureOutcome>,
+    pub legacy_sql_row: Option<LegacySqlRow>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ProvenancePage {
+    pub frames: Vec<ProvenanceFrame>,
+    /// Opaque native position of the last returned frame. Re-reading that
+    /// bounded anchor verifies the next raw position even at EOF. None starts
+    /// at the beginning; Some(0) resumes after the first frame, including an
+    /// empty legacy row. Never substitute a raw byte offset for this cursor.
+    pub next_after_frame: Option<u64>,
+    /// Only the physical end observed during this read, not a terminal claim.
+    pub at_available_end: bool,
+    pub outcome: Option<CaptureOutcome>,
+    pub durability: PublicationDurability,
+}
+
+/// Resume from a previously returned native cursor; only contiguous confirmed
+/// pages from the beginning establish a confirmed prefix. A page verifies its
+/// anchor and subsequent frames, not the source preceding an arbitrary cursor.
+pub async fn read_execution_log_provenance(
+    path: &Path,
+    after_frame: Option<u64>,
+    limit: usize,
+) -> io::Result<ProvenancePage> {
+    if !(1..=MAX_PROVENANCE_FRAMES).contains(&limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid provenance page size",
+        ));
+    }
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let (mut page, durability) = read_confirmed(&path, |path| {
+            read_provenance_blocking(path, after_frame, limit)
+        })?;
+        page.durability = durability;
+        Ok(page)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn read_provenance_blocking(
+    path: &Path,
+    after_frame: Option<u64>,
+    limit: usize,
+) -> io::Result<ProvenancePage> {
+    let mut reader = io::BufReader::new(std::fs::File::open(path)?);
+    let mut raw_end = 0;
+    let mut outcome = None;
+    if let Some(anchor) = after_frame {
+        reader.seek(SeekFrom::Start(anchor))?;
+        let frame = read_owner_frame(&mut reader)?;
+        raw_end = frame.locator.end;
+        outcome = frame.metadata.outcome;
+    }
+    let mut page = ProvenancePage {
+        frames: Vec::with_capacity(limit),
+        next_after_frame: after_frame,
+        at_available_end: false,
+        outcome,
+        durability: PublicationDurability::Unverified,
+    };
+    while page.frames.len() < limit && !reader.fill_buf()?.is_empty() {
+        let frame = read_owner_frame(&mut reader)?;
+        if frame.locator.start != raw_end || page.outcome.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "noncontiguous execution owner",
+            ));
+        }
+        raw_end = frame.locator.end;
+        page.outcome = frame.metadata.outcome;
+        page.next_after_frame = Some(frame.locator.compressed_start);
+        page.frames.push(ProvenanceFrame {
+            raw_range: frame.locator.start..frame.locator.end,
+            compressed_range: frame.locator.compressed_start..frame.locator.compressed_end,
+            captured_at: frame.metadata.captured_at,
+            control: frame.metadata.control,
+            outcome: frame.metadata.outcome,
+            legacy_sql_row: frame.metadata.legacy_sql_row,
+        });
+    }
+    page.at_available_end = reader.fill_buf()?.is_empty();
+    if page.outcome.is_some() && !page.at_available_end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "data after execution seal",
+        ));
+    }
+    Ok(page)
+}
+
 /// Coverage and durability are separate owner facts. In particular, a Complete
 /// seal may be readable before the writer's fsync, so confirm after scanning it.
 pub async fn read_execution_log_status(path: &Path) -> io::Result<OwnerStatus> {
@@ -940,6 +1045,226 @@ fn resolve_process_logs_session_dir(root: &Path, session_id: Uuid) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provenance_pages_preserve_empty_rows_and_exact_insertion_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("legacy.zst");
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        let rows: Vec<_> = [b"".as_slice(), b"first", b"", b"second", b""]
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                (
+                    LegacySqlRow {
+                        row_id: index as i64 + 41,
+                        inserted_at: format!("2020-01-01 00:00:00.{index:03}"),
+                        reported_byte_size: 99, // Preserve the recorded value, not a guess.
+                        original_bytes: bytes.len() as u64,
+                    },
+                    bytes,
+                )
+            })
+            .collect();
+        for (row, bytes) in &rows {
+            writer.append_legacy_bytes(bytes, Some(row)).await.unwrap();
+        }
+        writer.finish(CaptureOutcome::LegacyUnknown).await.unwrap();
+        drop(writer);
+        std::fs::remove_file(process_log_frame_index_path(&path)).unwrap();
+        let mut after = None;
+        let mut raw_end = 0;
+        let mut compressed_end = 0;
+        for (row, bytes) in &rows {
+            let page = read_execution_log_provenance(&path, after, 1)
+                .await
+                .unwrap();
+            assert_eq!(page.frames.len(), 1);
+            assert!(!page.at_available_end, "a seal still follows the rows");
+            assert_eq!(page.outcome, None);
+            let frame = &page.frames[0];
+            assert_eq!(frame.legacy_sql_row.as_ref(), Some(row));
+            assert_eq!(frame.captured_at, None);
+            assert!(!frame.control);
+            assert_eq!(frame.raw_range, raw_end..raw_end + bytes.len() as u64);
+            assert_eq!(frame.compressed_range.start, compressed_end);
+            assert!(frame.compressed_range.end > compressed_end);
+            assert_eq!(page.next_after_frame, Some(compressed_end));
+            assert_ne!(page.next_after_frame, after, "empty rows must advance");
+            assert_eq!(
+                read_execution_log_range_bytes(&path, frame.raw_range.start, frame.raw_range.end)
+                    .await
+                    .unwrap(),
+                *bytes
+            );
+            raw_end = frame.raw_range.end;
+            compressed_end = frame.compressed_range.end;
+            after = page.next_after_frame;
+        }
+        let seal = read_execution_log_provenance(&path, after, 1)
+            .await
+            .unwrap();
+        assert_eq!(seal.frames.len(), 1);
+        assert_eq!(seal.frames[0].raw_range, raw_end..raw_end);
+        assert_eq!(seal.outcome, Some(CaptureOutcome::LegacyUnknown));
+        assert!(seal.at_available_end);
+        assert_ne!(seal.next_after_frame, after);
+        let eof = read_execution_log_provenance(&path, seal.next_after_frame, 1)
+            .await
+            .unwrap();
+        assert!(eof.frames.is_empty());
+        assert!(eof.at_available_end);
+        assert_eq!(eof.next_after_frame, seal.next_after_frame);
+        assert_eq!(eof.outcome, seal.outcome);
+        assert_eq!(raw_end, 11);
+    }
+
+    #[tokio::test]
+    async fn provenance_resumes_live_appends_without_copying_bodies_or_guessing_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("live.zst");
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        let empty = read_execution_log_provenance(&path, None, 1).await.unwrap();
+        assert!(empty.frames.is_empty());
+        assert!(empty.at_available_end);
+        assert_eq!(empty.outcome, None);
+        assert_eq!(empty.next_after_frame, None);
+        writer
+            .append_jsonl_line("{\"Stdout\":\"unique producer body α\"}\n")
+            .await
+            .unwrap();
+        let first = read_execution_log_provenance(&path, None, 1).await.unwrap();
+        assert_eq!(first.next_after_frame, Some(0));
+        assert!(first.at_available_end);
+        assert_eq!(first.outcome, None);
+        assert!(first.frames[0].captured_at.is_some());
+        assert!(!first.frames[0].control);
+        assert!(
+            !serde_json::to_string(&first)
+                .unwrap()
+                .contains("unique producer body")
+        );
+        writer
+            .append_control_line("{\"Stderr\":\"native control\"}\n")
+            .await
+            .unwrap();
+        let second = read_execution_log_provenance(&path, first.next_after_frame, 1)
+            .await
+            .unwrap();
+        assert_eq!(second.frames.len(), 1);
+        assert_eq!(
+            second.frames[0].raw_range.start,
+            first.frames[0].raw_range.end
+        );
+        assert!(second.frames[0].control);
+        assert!(second.at_available_end);
+        assert_eq!(second.outcome, None);
+        writer.finish(CaptureOutcome::Complete).await.unwrap();
+        let seal = read_execution_log_provenance(&path, second.next_after_frame, 1)
+            .await
+            .unwrap();
+        assert_eq!(seal.frames.len(), 1);
+        assert_eq!(seal.outcome, Some(CaptureOutcome::Complete));
+        assert_eq!(
+            seal.durability,
+            if cfg!(windows) {
+                PublicationDurability::Unverified
+            } else {
+                PublicationDurability::Confirmed
+            }
+        );
+        let whole = read_execution_log_provenance(&path, None, MAX_PROVENANCE_FRAMES)
+            .await
+            .unwrap();
+        assert_eq!(whole.frames.len(), 3);
+        assert_eq!(whole.next_after_frame, seal.next_after_frame);
+    }
+
+    #[tokio::test]
+    async fn provenance_rejects_bad_anchors_limits_and_tails_without_losing_valid_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owner.zst");
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        writer.append_jsonl_line("record\n").await.unwrap();
+        drop(writer);
+        for limit in [0, MAX_PROVENANCE_FRAMES + 1] {
+            assert_eq!(
+                read_execution_log_provenance(&path, None, limit)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        for anchor in [1, std::fs::metadata(&path).unwrap().len(), u64::MAX] {
+            assert!(
+                read_execution_log_provenance(&path, Some(anchor), 1)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            read_execution_log_provenance(&root.path().join("missing"), None, 1)
+                .await
+                .is_err()
+        );
+        let mut pending = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut pending, b"torn").unwrap();
+        let prefix = read_execution_log_provenance(&path, None, 1).await.unwrap();
+        assert_eq!(prefix.frames[0].raw_range, 0..7);
+        assert!(!prefix.at_available_end);
+        assert_eq!(prefix.outcome, None);
+        assert!(
+            read_execution_log_provenance(&path, prefix.next_after_frame, 1)
+                .await
+                .is_err()
+        );
+        assert!(read_execution_log_provenance(&path, None, 2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn provenance_rejects_discontinuous_ranges_and_data_after_a_seal() {
+        let root = tempfile::tempdir().unwrap();
+        let other = root.path().join("other.zst");
+        let mut other_writer = ExecutionLogWriter::open(other.clone()).await.unwrap();
+        other_writer.append_jsonl_line("other\n").await.unwrap();
+        drop(other_writer);
+        for sealed in [false, true] {
+            let path = root.path().join(format!("owner-{sealed}.zst"));
+            let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+            writer.append_jsonl_line("first\n").await.unwrap();
+            if sealed {
+                writer.finish(CaptureOutcome::Complete).await.unwrap();
+            }
+            drop(writer);
+            // Each appended frame has valid checksums, but is invalid in this
+            // owner: its raw range restarts at zero, or it follows a seal.
+            let mut output = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            std::io::copy(&mut std::fs::File::open(&other).unwrap(), &mut output).unwrap();
+            let prefix = read_execution_log_provenance(&path, None, 1).await.unwrap();
+            assert_eq!(prefix.frames[0].raw_range, 0..6);
+            assert_eq!(
+                read_execution_log_provenance(&path, prefix.next_after_frame, 3)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                read_execution_log_provenance(&path, None, 3)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     #[tokio::test]
     async fn read_acknowledgements_cover_visible_bytes_and_seals_with_an_open_writer() {

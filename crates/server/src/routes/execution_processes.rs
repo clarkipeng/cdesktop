@@ -58,6 +58,12 @@ struct RawLogRangeQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawLogProvenanceQuery {
+    after_frame: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ArtifactUploadQuery {
     /// Original producer-relative path, if it differs from the uploaded name.
     original_path: Option<String>,
@@ -251,6 +257,23 @@ async fn get_raw_log_status(
     let path = utils::execution_logs::process_log_file_path(process.session_id, process.id);
     let status = utils::execution_logs::read_execution_log_status(&path).await?;
     Ok(ResponseJson(ApiResponse::success(status)))
+}
+
+async fn get_raw_log_provenance(
+    Extension(process): Extension<ExecutionProcess>,
+    Query(query): Query<RawLogProvenanceQuery>,
+) -> Result<ResponseJson<ApiResponse<utils::execution_logs::ProvenancePage>>, ApiError> {
+    let limit = query
+        .limit
+        .unwrap_or(utils::execution_logs::MAX_PROVENANCE_FRAMES);
+    if !(1..=utils::execution_logs::MAX_PROVENANCE_FRAMES).contains(&limit) {
+        return Err(ApiError::BadRequest("invalid provenance page size".into()));
+    }
+    let path = utils::execution_logs::process_log_file_path(process.session_id, process.id);
+    let page =
+        utils::execution_logs::read_execution_log_provenance(&path, query.after_frame, limit)
+            .await?;
+    Ok(ResponseJson(ApiResponse::success(page)))
 }
 
 async fn migrate_raw_log(
@@ -695,6 +718,7 @@ fn execution_routes() -> Router<DeploymentImpl> {
         .route("/normalized-snapshot", get(get_normalized_log_snapshot))
         .route("/raw-log", get(get_raw_log_range))
         .route("/raw-log/status", get(get_raw_log_status))
+        .route("/raw-log/provenance", get(get_raw_log_provenance))
         .route("/raw-log/migrate", post(migrate_raw_log))
         .route(
             "/artifacts",
@@ -730,6 +754,29 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_query_preserves_frame_zero_as_distinct_from_the_first_page() {
+        let first =
+            Query::<RawLogProvenanceQuery>::try_from_uri(&"/raw-log/provenance".parse().unwrap())
+                .unwrap()
+                .0;
+        assert_eq!(first.after_frame, None);
+        assert_eq!(first.limit, None);
+        let next = Query::<RawLogProvenanceQuery>::try_from_uri(
+            &"/raw-log/provenance?after_frame=0&limit=1".parse().unwrap(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(next.after_frame, Some(0));
+        assert_eq!(next.limit, Some(1));
+        assert!(
+            Query::<RawLogProvenanceQuery>::try_from_uri(
+                &"/raw-log/provenance?after_frame=-1".parse().unwrap()
+            )
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn raw_range_response_reports_actual_bytes_and_explicit_durability() {

@@ -1,0 +1,81 @@
+---
+title: "Native execution evidence"
+description: "Read bounded source ranges and capture metadata without copying native transcripts."
+---
+
+Use the native execution owner for original evidence and keep indexes disposable.
+The endpoints below are relative to `/api/execution-processes/{id}`. The execution
+UUID identifies the source; ranges use half-open byte offsets in the serialised
+`LogMsg` stream, not characters or compressed-file positions.
+
+<Warning>
+  This integration contract is under review. Artifact publication does not yet
+  provide a verified, power-loss-safe SQLite retention receipt. Do not delete a
+  worktree or another original source based on artifact API success.
+</Warning>
+
+## Read source bytes
+
+`GET /raw-log?start=0&end=1048576` requests at most 1 MiB. The binary response can
+split UTF-8 characters or JSON records. Preserve undecoded trailing bytes when
+processing consecutive ranges.
+
+Check `x-cdesktop-source-id`, `x-cdesktop-source-range` and
+`x-cdesktop-source-durability`. The returned range ends at the actual returned
+byte count, which may be shorter than requested. A short response does not prove
+capture is complete.
+
+Only `confirmed` authorises advancing a durable cursor from an already confirmed,
+contiguous start. `unverified` bytes remain readable but do not authorise that
+advance. Missing or corrupt owners return errors, not empty evidence.
+
+## Page capture metadata
+
+`GET /raw-log/provenance` returns a normal API JSON envelope with these fields in
+`data`:
+
+- `frames`: bounded metadata records with raw and compressed ranges, capture time,
+  control status, terminal outcome and original legacy SQL row metadata when known.
+  Raw range start preserves the recorded capture byte position. Array order and
+  compressed position distinguish records that contribute no raw bytes.
+- `next_after_frame`: the native cursor for your next request.
+- `at_available_end`: whether this read reached the physical end then available.
+- `outcome`: the most recent verified terminal seal, or `null`.
+- `durability`: `confirmed` or `unverified`, established after reading the page.
+
+Start without `after_frame`. After processing a confirmed page, pass its
+`next_after_frame` as `after_frame`, omitting the parameter when the cursor is
+`null`. Treat this cursor as opaque: it identifies
+the previous frame, not a raw byte offset. A cursor of `0` differs from no cursor
+and must be retained. Empty legacy rows and terminal seals advance it too.
+
+You can set `limit` from 1 to 128; the default is 128. Each request verifies one
+bounded anchor and the subsequent frames. It does not rescan earlier pages or
+copy transcript bodies. Read their `raw_range` through the source-byte endpoint.
+Commit derived postings and their confirmed cursor together. An arbitrary cursor
+does not certify the source prefix; consume contiguous pages from the beginning.
+
+An empty page at the available end can acquire more frames later. Resume from
+the same cursor. If a tail is torn or corrupt, retain your last confirmed cursor
+and report unavailable evidence; do not turn the error into completion.
+
+## Interpret coverage separately from durability
+
+`GET /raw-log/status` scans the owner and returns aggregate coverage plus
+durability. Use provenance pages for incremental consumption instead of repeatedly
+scanning a growing owner.
+
+| Outcome          | Meaning                                                                          |
+| ---------------- | -------------------------------------------------------------------------------- |
+| `null`           | No verified seal; this does not establish whether the process is alive.          |
+| `complete`       | Native capture reached its end. Require confirmed durability too.                |
+| `unavailable`    | Capture could not retain the complete stream; its valid prefix remains evidence. |
+| `legacy_unknown` | Historical capture coverage was not measured.                                    |
+
+Windows read confirmation currently reports `unverified`. Legacy migration retains
+all redundant SQL/plain originals there. Elsewhere, migration prunes only after
+verifying the original bytes, row metadata and native publication barrier.
+
+Capture records native text-output messages, not arbitrary binary stdout or a
+reconstruction of provider inputs. Unknown input provenance and usage attribution
+must remain unknown. Live normalised/UI views remain provisional.
