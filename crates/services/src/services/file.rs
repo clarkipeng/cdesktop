@@ -12,7 +12,8 @@ use futures::{Stream, StreamExt};
 use mime_guess::MimeGuess;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
+use utils::durable_fs::PublicationDurability;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +89,17 @@ pub struct ArtifactPublication<'a> {
     pub publication_key: &'a str,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct ArtifactReceipt {
+    #[serde(flatten)]
+    pub occurrence: ExecutionArtifact,
+    pub sha256: String,
+    pub size_bytes: i64,
+    /// Only Confirmed authorises removing another source. Readable metadata
+    /// alone does not prove a durable reference or durable blob publication.
+    pub durability: PublicationDurability,
+}
+
 struct StagedUpload {
     // Drop removes incomplete uploads on errors or cancelled requests.
     temp: tempfile::NamedTempFile,
@@ -138,7 +150,7 @@ impl FileService {
             .stage_upload(stream, original_filename, max_size_bytes)
             .await?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let file = self.publish_upload(&mut tx, staged).await?;
+        let (file, _) = self.publish_upload(&mut tx, staged).await?;
         tx.commit().await?;
         Ok(file)
     }
@@ -212,52 +224,91 @@ impl FileService {
         &self,
         conn: &mut sqlx::SqliteConnection,
         staged: StagedUpload,
-    ) -> Result<File, FileError> {
+    ) -> Result<(File, PublicationDurability), FileError> {
         if let Some(existing) = File::find_by_hash(&mut *conn, &staged.data.hash).await? {
             // Never acknowledge retention of missing or corrupt original bytes.
-            self.verify_cached_file(&existing).await?;
-            return Ok(existing);
+            let durability = self.verify_cached_file(&existing).await?;
+            return Ok((existing, durability));
         }
         let cache_dir = self.cache_dir.clone();
-        let data = tokio::task::spawn_blocking(move || -> Result<CreateFile, std::io::Error> {
-            // A unique physical generation prevents GC of an old row from
-            // unlinking a later equal-byte publication. Publish durable bytes
-            // before the DB reference; uncertain commits must not delete them.
-            utils::durable_fs::publish_noclobber(
-                staged.temp,
-                &cache_dir.join(&staged.data.file_path),
-            )?;
-            Ok(staged.data)
+        let (data, durability) =
+            tokio::task::spawn_blocking(move || -> Result<_, std::io::Error> {
+                // A unique physical generation prevents GC of an old row from
+                // unlinking a later equal-byte publication. Publish durable bytes
+                // before the DB reference; uncertain commits must not delete them.
+                let durability = utils::durable_fs::publish_noclobber(
+                    staged.temp,
+                    &cache_dir.join(&staged.data.file_path),
+                )?;
+                Ok((staged.data, durability))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok((File::create(conn, &data).await?, durability))
+    }
+
+    async fn verify_cached_file(&self, file: &File) -> Result<PublicationDurability, FileError> {
+        let path = self.get_absolute_path(file);
+        let expected_hash = file.hash.clone();
+        let expected_size = file.size_bytes;
+        let (_, durability) = tokio::task::spawn_blocking(move || {
+            utils::durable_fs::read_confirmed(&path, |path| {
+                let mut input = fs::File::open(path)?;
+                let mut buffer = [0; 64 * 1024];
+                let mut hash = Sha256::new();
+                let mut size = 0u64;
+                loop {
+                    let read = std::io::Read::read(&mut input, &mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..read]);
+                    size += read as u64;
+                }
+                if size != expected_size as u64 || format!("{:x}", hash.finalize()) != expected_hash
+                {
+                    return Err(std::io::Error::other("cached artifact hash mismatch"));
+                }
+                Ok(())
+            })
         })
         .await
         .map_err(std::io::Error::other)??;
-        Ok(File::create(conn, &data).await?)
+        Ok(durability)
     }
 
-    async fn verify_cached_file(&self, file: &File) -> Result<(), FileError> {
-        let mut input = tokio::fs::File::open(self.get_absolute_path(file)).await?;
-        let mut buffer = [0; 64 * 1024];
-        let mut hash = Sha256::new();
-        let mut size = 0u64;
-        loop {
-            let read = input.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            hash.update(&buffer[..read]);
-            size += read as u64;
-        }
-        if size != file.size_bytes as u64 || format!("{:x}", hash.finalize()) != file.hash {
-            return Err(std::io::Error::other("cached artifact hash mismatch").into());
-        }
-        #[cfg(not(windows))]
-        {
-            let path = self.get_absolute_path(file);
-            tokio::task::spawn_blocking(move || utils::durable_fs::confirm_publication(&path))
+    async fn artifact_receipt(
+        &self,
+        occurrence: ExecutionArtifact,
+        file: File,
+        mut durability: PublicationDurability,
+        confirm: impl FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+    ) -> Result<ArtifactReceipt, FileError> {
+        if !occurrence.durable_commit {
+            durability = PublicationDurability::Unverified;
+        } else if durability == PublicationDurability::Confirmed {
+            // Read the actual native filename through SQLite. Never open/close
+            // its DB file behind SQLite's back; that could release its locks.
+            let filename: String =
+                sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name='main'")
+                    .fetch_one(&self.pool)
+                    .await?;
+            durability = if filename.is_empty() {
+                PublicationDurability::Unverified
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    PublicationDurability::from_confirmation(confirm(Path::new(&filename)))
+                })
                 .await
-                .map_err(std::io::Error::other)??;
+                .map_err(std::io::Error::other)??
+            };
         }
-        Ok(())
+        Ok(ArtifactReceipt {
+            occurrence,
+            sha256: file.hash,
+            size_bytes: file.size_bytes,
+            durability,
+        })
     }
 
     pub async fn publish_execution_artifact<S, E>(
@@ -265,7 +316,27 @@ impl FileService {
         stream: S,
         original_filename: &str,
         publication: ArtifactPublication<'_>,
-    ) -> Result<ExecutionArtifact, FileError>
+    ) -> Result<ArtifactReceipt, FileError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        self.publish_execution_artifact_with_confirmation(
+            stream,
+            original_filename,
+            publication,
+            utils::durable_fs::confirm_directory_entries,
+        )
+        .await
+    }
+
+    async fn publish_execution_artifact_with_confirmation<S, E>(
+        &self,
+        stream: S,
+        original_filename: &str,
+        publication: ArtifactPublication<'_>,
+        confirm: impl FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+    ) -> Result<ArtifactReceipt, FileError>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
@@ -274,7 +345,7 @@ impl FileService {
         // Upload first, then serialize publication with GC and other writers.
         // No committed attachment can exist without its retained occurrence.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(artifact) = ExecutionArtifact::find_by_publication(
+        if let Some(mut artifact) = ExecutionArtifact::find_by_publication(
             &mut tx,
             publication.execution_id,
             publication.publication_key,
@@ -293,11 +364,14 @@ impl FileService {
             }
             // Reuse the normal blob verification without publishing any new
             // bytes or occurrence. The staging file drops on every replay.
-            self.publish_upload(&mut tx, staged).await?;
+            let (file, durability) = self.publish_upload(&mut tx, staged).await?;
+            artifact.upgrade_commit_policy(&mut tx).await?;
             tx.commit().await?;
-            return Ok(artifact);
+            return self
+                .artifact_receipt(artifact, file, durability, confirm)
+                .await;
         }
-        let file = self.publish_upload(&mut tx, staged).await?;
+        let (file, durability) = self.publish_upload(&mut tx, staged).await?;
         let artifact = ExecutionArtifact::create(
             &mut tx,
             publication.execution_id,
@@ -310,7 +384,35 @@ impl FileService {
         .await
         .map_err(FileError::Database)?;
         tx.commit().await?;
-        Ok(artifact)
+        self.artifact_receipt(artifact, file, durability, confirm)
+            .await
+    }
+
+    pub async fn get_execution_artifact_receipt(
+        &self,
+        execution_id: Uuid,
+        occurrence_id: Uuid,
+    ) -> Result<Option<ArtifactReceipt>, FileError> {
+        let Some(occurrence) = self
+            .get_execution_artifact(occurrence_id)
+            .await?
+            .filter(|occurrence| occurrence.execution_id == execution_id)
+        else {
+            return Ok(None);
+        };
+        let file = File::find_by_id(&self.pool, occurrence.attachment_id)
+            .await?
+            .ok_or(FileError::NotFound)?;
+        let durability = self.verify_cached_file(&file).await?;
+        Ok(Some(
+            self.artifact_receipt(
+                occurrence,
+                file,
+                durability,
+                utils::durable_fs::confirm_directory_entries,
+            )
+            .await?,
+        ))
     }
 
     pub async fn get_execution_artifact(
@@ -486,14 +588,17 @@ mod evidence_tests {
     use super::*;
 
     async fn fixture() -> (tempfile::TempDir, FileService, Uuid) {
+        fixture_with_commit_migration(true).await
+    }
+
+    async fn fixture_with_commit_migration(
+        include_commit_marker: bool,
+    ) -> (tempfile::TempDir, FileService, Uuid) {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(dir.path().join("fixture.sqlite"))
-                    .create_if_missing(true)
-                    .foreign_keys(true)
+                db::connection_options(&dir.path().join("fixture.sqlite"))
                     .busy_timeout(std::time::Duration::from_secs(5)),
             )
             .await
@@ -531,6 +636,14 @@ mod evidence_tests {
         .execute(&pool)
         .await
         .unwrap();
+        if include_commit_marker {
+            sqlx::raw_sql(include_str!(
+                "../../../db/migrations/20260906000003_add_artifact_durable_commit.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         let execution_id = Uuid::new_v4();
         sqlx::query("INSERT INTO execution_processes (id) VALUES (?)")
             .bind(execution_id)
@@ -555,6 +668,17 @@ mod evidence_tests {
         key: &str,
         bytes: &'static [u8],
     ) -> Result<ExecutionArtifact, FileError> {
+        publish_receipt(service, execution_id, key, bytes)
+            .await
+            .map(|receipt| receipt.occurrence)
+    }
+
+    async fn publish_receipt(
+        service: &FileService,
+        execution_id: Uuid,
+        key: &str,
+        bytes: &'static [u8],
+    ) -> Result<ArtifactReceipt, FileError> {
         service
             .publish_execution_artifact(
                 futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(bytes))]),
@@ -608,6 +732,229 @@ mod evidence_tests {
         assert_eq!(
             fs::read(service.get_absolute_path(&file)).unwrap(),
             b"exact bytes\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipts_bind_verified_bytes_and_scope_without_exposing_the_commit_marker() {
+        let (_root, service, execution) = fixture().await;
+        let receipt = publish_receipt(&service, execution, "receipt", b"verified\n")
+            .await
+            .unwrap();
+        assert!(receipt.occurrence.durable_commit);
+        assert_eq!(
+            receipt.sha256,
+            format!("{:x}", Sha256::digest(b"verified\n"))
+        );
+        assert_eq!(receipt.size_bytes, 9);
+        assert_eq!(
+            receipt.durability,
+            if cfg!(windows) {
+                PublicationDurability::Unverified
+            } else {
+                PublicationDurability::Confirmed
+            }
+        );
+        let retrieved = service
+            .get_execution_artifact_receipt(execution, receipt.occurrence.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&receipt).unwrap(),
+            serde_json::to_value(&retrieved).unwrap()
+        );
+        assert!(
+            serde_json::to_value(&receipt)
+                .unwrap()
+                .get("durable_commit")
+                .is_none()
+        );
+        assert!(
+            service
+                .get_execution_artifact_receipt(Uuid::new_v4(), receipt.occurrence.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let file = service
+            .get_file(receipt.occurrence.attachment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        fs::write(service.get_absolute_path(&file), b"wrong bytes").unwrap();
+        assert!(
+            service
+                .get_execution_artifact_receipt(execution, receipt.occurrence.id)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_keeps_old_references_unverified_until_a_keyed_replay_writes_the_upgrade() {
+        let (_root, service, execution) = fixture_with_commit_migration(false).await;
+        let file = service
+            .store_file(b"old source", "checkpoint.md")
+            .await
+            .unwrap();
+        let occurrence_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_artifacts (id,execution_id,attachment_id,original_path,original_name,producer_ref,publication_key,captured_at) VALUES (?,?,?,'.context/checkpoint.md','checkpoint.md','task/checkpoint','old','2020-01-01 00:00:00')")
+            .bind(occurrence_id).bind(execution).bind(file.id).execute(&service.pool).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/20260906000003_add_artifact_durable_commit.sql"
+        ))
+        .execute(&service.pool)
+        .await
+        .unwrap();
+        let old = service
+            .get_execution_artifact_receipt(execution, occurrence_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!old.occurrence.durable_commit);
+        assert_eq!(old.durability, PublicationDurability::Unverified);
+        assert!(
+            !service
+                .get_execution_artifact(occurrence_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .durable_commit,
+            "GET must not upgrade historical provenance"
+        );
+        let replay = publish_receipt(&service, execution, "old", b"old source")
+            .await
+            .unwrap();
+        assert_eq!(replay.occurrence.id, occurrence_id);
+        assert_eq!(replay.occurrence.captured_at, old.occurrence.captured_at);
+        assert!(replay.occurrence.durable_commit);
+        assert_eq!(
+            replay.occurrence.attachment_id,
+            old.occurrence.attachment_id
+        );
+        assert_eq!(
+            replay.durability,
+            if cfg!(windows) {
+                PublicationDurability::Unverified
+            } else {
+                PublicationDurability::Confirmed
+            }
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_artifacts")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_weak_writing_connection_cannot_publish_a_durable_reference() {
+        let (root, mut service, execution) = fixture().await;
+        service.pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                db::connection_options(&root.path().join("fixture.sqlite"))
+                    .synchronous(sqlx::sqlite::SqliteSynchronous::Full),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            publish_receipt(&service, execution, "weak", b"retained candidate").await,
+            Err(FileError::Database(sqlx::Error::Protocol(_)))
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_artifacts")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attachments")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn failed_or_unsupported_receipt_barriers_preserve_committed_references_for_replay() {
+        let (_root, service, execution) = fixture().await;
+        // Inject only the final directory barrier, after the real reference
+        // commit, on both first publication and replay. Blob bytes stay owned.
+        let mut occurrence_id = None;
+        for failure in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            let pool = service.pool.clone();
+            let result = service
+                .publish_execution_artifact_with_confirmation(
+                    futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"receipt retry",
+                    ))]),
+                    "checkpoint.md",
+                    ArtifactPublication {
+                        execution_id: execution,
+                        original_path: ".context/checkpoint.md",
+                        producer_ref: Some("task/checkpoint"),
+                        publication_key: "retry",
+                    },
+                    move |_: &Path| {
+                        // A separate SQLite connection must see the committed
+                        // reference before any final barrier can acknowledge it.
+                        let committed = tokio::runtime::Handle::current().block_on(
+                            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_artifacts WHERE publication_key='retry' AND durable_commit=1").fetch_one(&pool)
+                        ).unwrap();
+                        assert_eq!(committed, 1);
+                        Err(failure.into())
+                    },
+                )
+                .await;
+            if failure == std::io::ErrorKind::PermissionDenied {
+                assert!(matches!(result, Err(FileError::Io(_))));
+            } else {
+                assert_eq!(
+                    result.unwrap().durability,
+                    PublicationDurability::Unverified
+                );
+            }
+            let id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM execution_artifacts WHERE publication_key='retry'",
+            )
+            .fetch_one(&service.pool)
+            .await
+            .unwrap();
+            assert!(occurrence_id.is_none_or(|previous| previous == id));
+            occurrence_id = Some(id);
+            let artifact = service.get_execution_artifact(id).await.unwrap().unwrap();
+            assert!(artifact.durable_commit);
+            let file = service
+                .get_file(artifact.attachment_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fs::read(service.get_absolute_path(&file)).unwrap(),
+                b"receipt retry"
+            );
+        }
+        let replay = publish_receipt(&service, execution, "retry", b"receipt retry")
+            .await
+            .unwrap();
+        assert_eq!(Some(replay.occurrence.id), occurrence_id);
+        assert_eq!(replay.durability, PublicationDurability::Confirmed);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_artifacts")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap(),
+            1
         );
     }
 
@@ -741,9 +1088,12 @@ mod evidence_tests {
             )
             .await
             .unwrap();
-        assert_eq!(first.attachment_id, second.attachment_id);
+        assert_eq!(first.attachment_id, second.occurrence.attachment_id);
         assert_eq!(first.original_name.as_deref(), Some("checkpoint.md"));
-        assert_eq!(second.original_name.as_deref(), Some("another.txt"));
+        assert_eq!(
+            second.occurrence.original_name.as_deref(),
+            Some("another.txt")
+        );
         let file = service
             .get_file(first.attachment_id)
             .await

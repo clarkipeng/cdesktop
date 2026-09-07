@@ -15,6 +15,14 @@ pub enum PublicationDurability {
 }
 
 impl PublicationDurability {
+    pub fn from_confirmation(result: io::Result<()>) -> io::Result<Self> {
+        match result {
+            Ok(()) => Ok(Self::Confirmed),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(Self::Unverified),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Confirmed => "confirmed",
@@ -39,13 +47,7 @@ fn read_confirmed_with<T>(
     confirm: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<(T, PublicationDurability)> {
     let value = read(path)?;
-    let durability = match confirm(path) {
-        Ok(()) => PublicationDurability::Confirmed,
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-            PublicationDurability::Unverified
-        }
-        Err(error) => return Err(error),
-    };
+    let durability = PublicationDurability::from_confirmation(confirm(path))?;
     Ok((value, durability))
 }
 
@@ -84,13 +86,17 @@ pub fn create_dir_all(path: &Path) -> io::Result<()> {
 
 /// Existing destinations are never replaced. A failure after publication leaves
 /// the destination in place for verification/recovery, never speculative deletion.
-pub fn publish_noclobber(temp: tempfile::NamedTempFile, destination: &Path) -> io::Result<()> {
+pub fn publish_noclobber(
+    temp: tempfile::NamedTempFile,
+    destination: &Path,
+) -> io::Result<PublicationDurability> {
     temp.as_file().sync_all()?;
     #[cfg(not(windows))]
     {
         temp.persist_noclobber(destination)
             .map_err(|error| error.error)?;
-        sync_parent_chain(destination)
+        sync_parent_chain(destination)?;
+        Ok(PublicationDurability::Confirmed)
     }
     #[cfg(windows)]
     {
@@ -102,7 +108,8 @@ pub fn publish_noclobber(temp: tempfile::NamedTempFile, destination: &Path) -> i
             return Err(io::Error::last_os_error());
         }
         let path = temp.into_temp_path();
-        move_write_through(&path, destination)
+        move_write_through(&path, destination)?;
+        Ok(PublicationDurability::Unverified)
     }
 }
 
@@ -110,16 +117,23 @@ pub fn publish_noclobber(temp: tempfile::NamedTempFile, destination: &Path) -> i
 /// Readability alone is insufficient to authorize deletion of another source.
 pub fn confirm_publication(path: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
+    fs::File::open(path)?.sync_all()?;
+    confirm_directory_entries(path)
+}
+
+/// Confirm only the reachable directory entries. SQLite owns its DB file and
+/// syncs it through its VFS: an extra DB-file open/close could release its POSIX
+/// locks. Call this after the native SQLite reference transaction has committed.
+pub fn confirm_directory_entries(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
     {
-        fs::File::open(path)?.sync_all()?;
         sync_parent_chain(path)
     }
     #[cfg(windows)]
     {
         let _ = path;
-        // MoveFileExW WRITE_THROUGH confirms a new successful publication. We
-        // have no verified equivalent for an already-existing directory entry;
-        // callers must retain redundant originals instead of guessing.
+        // No verified barrier for an already-existing ancestor chain. Callers
+        // retain redundant originals instead of guessing, even on first publish.
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "cannot reconfirm existing Windows publication durability",
@@ -265,7 +279,14 @@ mod tests {
         let destination = directory.join("owner");
         let mut first = tempfile::NamedTempFile::new_in(&directory).unwrap();
         first.write_all(b"first").unwrap();
-        publish_noclobber(first, &destination).unwrap();
+        assert_eq!(
+            publish_noclobber(first, &destination).unwrap(),
+            if cfg!(windows) {
+                PublicationDurability::Unverified
+            } else {
+                PublicationDurability::Confirmed
+            }
+        );
         #[cfg(not(windows))]
         confirm_publication(&destination).unwrap();
         let mut retry = tempfile::NamedTempFile::new_in(&directory).unwrap();

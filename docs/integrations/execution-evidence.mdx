@@ -9,9 +9,9 @@ UUID identifies the source; ranges use half-open byte offsets in the serialised
 `LogMsg` stream, not characters or compressed-file positions.
 
 <Warning>
-  This integration contract is under review. Artifact publication does not yet
-  provide a verified, power-loss-safe SQLite retention receipt. Do not delete a
-  worktree or another original source based on artifact API success.
+  This integration contract is under review and is not activated in the
+  installed runtime. HTTP success alone never authorises deleting original
+  evidence. Check the explicit durability and identity fields described below.
 </Warning>
 
 ## Read source bytes
@@ -79,3 +79,42 @@ verifying the original bytes, row metadata and native publication barrier.
 Capture records native text-output messages, not arbitrary binary stdout or a
 reconstruction of provider inputs. Unknown input provenance and usage attribution
 must remain unknown. Live normalised/UI views remain provisional.
+
+## Retain artifacts before removing their originals
+
+`POST /artifacts` accepts one multipart field named `artifact`, with its original
+filename. Supply a stable, non-empty `publication_key` query parameter for the
+logical publication. Optional `original_path` and `producer_ref` preserve the
+producer's path and reference; the path defaults to the uploaded filename.
+
+The JSON receipt in `data` includes the occurrence `id`, `execution_id`,
+`attachment_id`, original path/name, producer reference, publication key,
+`captured_at`, `sha256`, `size_bytes` and `durability`.
+
+Before removing an original, match its expected execution, publication key,
+path/name, SHA-256 and size to a `confirmed` receipt. Persist the occurrence ID
+with your owning task first. A receipt covers only those exact bytes, not later
+edits or the rest of a worktree. Keep the native execution and its references
+while you need the evidence.
+
+Confirmation requires verified blob publication, a reference committed under
+the checked native SQLite policy and confirmation of the database's ancestor
+directory entries. The native connection policy is DELETE journal, EXTRA
+synchronous and fullfsync enabled. SQLite owns database-file synchronisation;
+the application confirms directory entries without opening the database file.
+
+If the response is lost or confirmation fails, retain the original and repeat
+the same request. Matching bytes and publication metadata return the same
+occurrence ID and capture time. Reusing the key for different evidence returns
+a conflict. Distinct keys can retain distinct occurrences of equal bytes.
+
+`GET /artifacts/{occurrence_id}` verifies the cached bytes and returns a fresh
+receipt scoped to the execution. Historical references remain `unverified`
+until a matching keyed publication replay commits their upgrade; reading
+metadata never upgrades them. Windows receipts remain `unverified` because
+ancestor durability is not established there. Other storage failures return
+errors, not confirmed receipts.
+
+`GET /artifacts/{occurrence_id}/file` downloads the bytes. A successful download
+is not a retention receipt. No endpoint authorises removing evidence when its
+durability is missing or `unverified`.

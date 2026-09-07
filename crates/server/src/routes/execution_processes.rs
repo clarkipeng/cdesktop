@@ -305,15 +305,14 @@ async fn migrate_raw_log(
 }
 
 /// Durable producer entry point for checkpoints and reports. Artifact bytes
-/// are deduplicated by their attachment hash, while every upload produces an
-/// occurrence row owned by this execution.
+/// are deduplicated by attachment hash; a keyed replay preserves the same
+/// occurrence. Only a confirmed receipt authorises removing another source.
 async fn upload_execution_artifact(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<ArtifactUploadQuery>,
     mut multipart: Multipart,
-) -> Result<ResponseJson<ApiResponse<db::models::execution_artifact::ExecutionArtifact>>, ApiError>
-{
+) -> Result<ResponseJson<ApiResponse<services::services::file::ArtifactReceipt>>, ApiError> {
     while let Some(field) = multipart.next_field().await? {
         if field.name() != Some("artifact") {
             continue;
@@ -353,13 +352,11 @@ async fn get_execution_artifact(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(deployment): State<DeploymentImpl>,
     Path(path): Path<ArtifactPath>,
-) -> Result<ResponseJson<ApiResponse<db::models::execution_artifact::ExecutionArtifact>>, ApiError>
-{
+) -> Result<ResponseJson<ApiResponse<services::services::file::ArtifactReceipt>>, ApiError> {
     let occurrence = deployment
         .file()
-        .get_execution_artifact(path.occurrence_id)
+        .get_execution_artifact_receipt(execution_process.id, path.occurrence_id)
         .await?
-        .filter(|artifact| artifact.execution_id == execution_process.id)
         .ok_or_else(|| ApiError::File(services::services::file::FileError::NotFound))?;
     Ok(ResponseJson(ApiResponse::success(occurrence)))
 }
