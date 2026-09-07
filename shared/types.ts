@@ -715,6 +715,11 @@ export enum OutcomeBindingScope { account = "account", route = "route", task = "
 
 export type NormalizedExecutionOutcome = { class: ExecutionOutcomeClass, 
 /**
+ * Explicit adapter acknowledgement when stopping independently managed
+ * tool processes. False must remain unconfirmed across stop retries.
+ */
+cleanup_confirmed?: boolean, 
+/**
  * Stable provider error code (e.g. `usage_limit_exceeded`), never raw
  * provider message text.
  */
