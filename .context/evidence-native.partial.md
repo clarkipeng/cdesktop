@@ -11,6 +11,10 @@
 - Artifact source: `execution_artifacts.id` is the occurrence identity;
   `attachment_id` is only the content-addressed blob identity. The FK excludes
   retained occurrences from orphan cleanup.
+- Producer/read routes: `POST /api/execution-processes/{id}/artifacts` accepts
+  a streamed `artifact` multipart field and returns its occurrence; `GET
+  /api/execution-processes/{id}/artifacts/{occurrence_id}` resolves only an
+  occurrence owned by that execution.
 
 Focused isolated checks: `cargo test -p utils execution_logs --lib` (7 passed)
 and `cargo check -p server -p services` (passed before the final stale-index
