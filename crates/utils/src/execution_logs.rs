@@ -138,12 +138,13 @@ impl ExecutionLogWriter {
             .append(true)
             .open(&index_path)
             .await?;
-        let uncompressed_offset = match read_frame_index(&index_path).await {
-            Ok(frames) if !frames.is_empty() => frames.last().unwrap().end,
-            Ok(_) if written == 0 => 0,
-            // The frame stream remains authoritative. Reopen recovers its
-            // complete byte length before assigning the next stable range.
-            Ok(_) | Err(_) => uncompressed_len_by_streaming_decode(&path).await?,
+        // The compressed owner, not its cache index, defines the next stable
+        // range. Refuse to append after a torn owner instead of reusing an
+        // offset based on a stale sidecar.
+        let uncompressed_offset = if written == 0 {
+            0
+        } else {
+            uncompressed_len_by_streaming_decode(&path).await?
         };
         Ok(Self {
             path,
@@ -200,7 +201,9 @@ impl ExecutionLogWriter {
             return Ok(LogAppend::Blocked);
         }
         self.control_bytes = self.control_bytes.saturating_add(len);
-        if !self.has_disk_reserve(jsonl_line.len())? {
+        // Control output spends the reserve ordinary evidence was forbidden
+        // from consuming, so the refusal marker remains recordable.
+        if !self.has_control_space(jsonl_line.len())? {
             return Ok(LogAppend::Unavailable);
         }
         self.write_frame(jsonl_line, None, self.capture_order)
@@ -217,6 +220,11 @@ impl ExecutionLogWriter {
             .saturating_add(incoming_bytes as u64)
             .saturating_add(8 * 1024);
         Ok(fs2::available_space(parent)? >= required)
+    }
+
+    fn has_control_space(&self, incoming_bytes: usize) -> io::Result<bool> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        Ok(fs2::available_space(parent)? >= (incoming_bytes as u64).saturating_add(8 * 1024))
     }
 
     async fn write_frame(
@@ -292,8 +300,10 @@ impl ExecutionLogWriter {
         jsonl_line: &str,
         captured_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> io::Result<()> {
-        let order = self.capture_order;
-        self.capture_order = self.capture_order.saturating_add(1);
+        // Byte position is the durable capture order. Unlike a counter it
+        // cannot collide when one logical record spans several Zstd frames.
+        let order = self.uncompressed_offset;
+        self.capture_order = order;
         self.write_frame(jsonl_line, captured_at, order).await
     }
 
@@ -709,6 +719,34 @@ mod tests {
         assert_eq!(
             read_execution_log_range(&path, 0, 13).await.unwrap(),
             "first\nsecond\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_derives_next_range_from_owner_not_stale_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proc.jsonl.zst");
+        let mut writer = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        writer.append_control_line("first\n").await.unwrap();
+        writer.append_control_line("second\n").await.unwrap();
+        drop(writer);
+        let index = process_log_frame_index_path(&path);
+        let first = tokio::fs::read_to_string(&index)
+            .await
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        tokio::fs::write(&index, format!("{first}\n"))
+            .await
+            .unwrap();
+        let mut reopened = ExecutionLogWriter::open(path.clone()).await.unwrap();
+        reopened.append_control_line("third\n").await.unwrap();
+        drop(reopened);
+        assert_eq!(
+            read_execution_log_range(&path, 0, 19).await.unwrap(),
+            "first\nsecond\nthird\n"
         );
     }
 
