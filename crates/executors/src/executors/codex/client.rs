@@ -79,7 +79,10 @@ pub struct AppServerClient {
     pending_plan: Mutex<Option<PendingPlan>>,
     turn_cancellation: Arc<Mutex<TurnCancellationState>>,
     turn_changed: Arc<Notify>,
-    cancellation_requested: AtomicBool,
+    // Serialize start responses with cancellation, without blocking the reader's
+    // completion notifications on the turn-state mutex.
+    turn_start_gate: Arc<Mutex<()>>,
+    cancellation_requested: Arc<AtomicBool>,
     repo_context: RepoContext,
     commit_reminder: bool,
     commit_reminder_prompt: String,
@@ -112,7 +115,8 @@ impl AppServerClient {
             pending_plan: Mutex::new(None),
             turn_cancellation: Arc::new(Mutex::new(TurnCancellationState::default())),
             turn_changed: Arc::new(Notify::new()),
-            cancellation_requested: AtomicBool::new(false),
+            turn_start_gate: Arc::new(Mutex::new(())),
+            cancellation_requested: Arc::new(AtomicBool::new(false)),
             thread_id: Mutex::new(None),
             rollout_path: Mutex::new(None),
             storage_limits: StorageLimits::default(),
@@ -241,6 +245,8 @@ impl AppServerClient {
         input: Vec<UserInput>,
         collaboration_mode: Option<CollaborationMode>,
     ) -> Result<TurnStartResponse, ExecutorError> {
+        let _start = self.turn_start_gate.lock().await;
+        self.ensure_not_cancelling()?;
         let request = ClientRequest::TurnStart {
             request_id: self.next_request_id(),
             params: TurnStartParams {
@@ -253,6 +259,16 @@ impl AppServerClient {
         let response = self.send_request(request, "turn/start").await?;
         self.record_turn_started(thread_id, &response).await;
         Ok(response)
+    }
+
+    fn ensure_not_cancelling(&self) -> Result<(), ExecutorError> {
+        if self.cancellation_requested.load(Ordering::SeqCst) {
+            return Err(ExecutorError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Codex execution is cancelling",
+            )));
+        }
+        Ok(())
     }
 
     async fn record_turn_started(&self, thread_id: String, response: &TurnStartResponse) {
@@ -316,6 +332,7 @@ impl AppServerClient {
     /// that it had to fall back to killing only the app-server group.
     pub async fn cancel_execution(&self) -> Result<(), ExecutorError> {
         self.cancellation_requested.store(true, Ordering::SeqCst);
+        let _start = self.turn_start_gate.lock().await;
         let (target, needs_interrupt) = loop {
             let notified = self.turn_changed.notified();
             let state = self.turn_cancellation.lock().await;
@@ -428,6 +445,8 @@ impl AppServerClient {
         thread_id: String,
         target: ReviewTarget,
     ) -> Result<ReviewStartResponse, ExecutorError> {
+        let _start = self.turn_start_gate.lock().await;
+        self.ensure_not_cancelling()?;
         let request = ClientRequest::ReviewStart {
             request_id: self.next_request_id(),
             params: ReviewStartParams {
@@ -1019,9 +1038,6 @@ impl AppServerClient {
         message: String,
         collaboration_mode: Option<CollaborationMode>,
     ) {
-        if self.cancellation_requested.load(Ordering::SeqCst) {
-            return;
-        }
         let peer = self.rpc().clone();
         let cancel = self.cancel.clone();
         let request = ClientRequest::TurnStart {
@@ -1038,7 +1054,13 @@ impl AppServerClient {
         };
         let turn_cancellation = self.turn_cancellation.clone();
         let turn_changed = self.turn_changed.clone();
+        let turn_start_gate = self.turn_start_gate.clone();
+        let cancellation_requested = self.cancellation_requested.clone();
         tokio::spawn(async move {
+            let _start = turn_start_gate.lock().await;
+            if cancellation_requested.load(Ordering::SeqCst) {
+                return;
+            }
             match peer
                 .request::<TurnStartResponse, _>(
                     request_id(&request),
@@ -1838,6 +1860,80 @@ mod permission_tests {
                 "an ignored interrupt must not become an acknowledgement"
             );
             cancelling.abort();
+            reader_shutdown.cancel();
+        }
+
+        #[tokio::test]
+        async fn cancellation_waits_for_a_sent_continuation_before_acknowledging_cleanup() {
+            let (client, mut requests, mut responses, reader_shutdown) = fixture();
+            *client.thread_id.lock().await = Some("thread-a".into());
+            let starting = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .turn_start_with_mode("thread-a".into(), Vec::new(), None)
+                        .await
+                })
+            };
+            let start = read_json(&mut requests).await;
+            write_json(&mut responses, serde_json::json!({
+                "jsonrpc":"2.0", "id":start["id"], "result":{"turn":turn("turn-a", "inProgress")}
+            })).await;
+            starting.await.unwrap().unwrap();
+            client.enqueue_feedback("continue as turn B".into()).await;
+            write_json(
+                &mut responses,
+                serde_json::json!({
+                    "jsonrpc":"2.0", "method":"turn/completed", "params":{
+                        "threadId":"thread-a", "turn":turn("turn-a", "interrupted")
+                    }
+                }),
+            )
+            .await;
+            let continuation = read_json(&mut requests).await;
+            assert_eq!(continuation["method"], "turn/start");
+            let cancelling = {
+                let client = client.clone();
+                tokio::spawn(async move { client.cancel_execution().await })
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), read_json(&mut requests))
+                    .await
+                    .is_err(),
+                "must not clean turn A while sent turn B has no response"
+            );
+            write_json(&mut responses, serde_json::json!({
+                "jsonrpc":"2.0", "id":continuation["id"], "result":{"turn":turn("turn-b", "inProgress")}
+            })).await;
+            let interrupt = read_json(&mut requests).await;
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            assert_eq!(interrupt["params"]["turnId"], "turn-b");
+            write_json(
+                &mut responses,
+                serde_json::json!({
+                    "jsonrpc":"2.0", "id":interrupt["id"], "result":{}
+                }),
+            )
+            .await;
+            write_json(
+                &mut responses,
+                serde_json::json!({
+                    "jsonrpc":"2.0", "method":"turn/completed", "params":{
+                        "threadId":"thread-a", "turn":turn("turn-b", "interrupted")
+                    }
+                }),
+            )
+            .await;
+            let clean = read_json(&mut requests).await;
+            assert_eq!(clean["method"], "thread/backgroundTerminals/clean");
+            write_json(
+                &mut responses,
+                serde_json::json!({
+                    "jsonrpc":"2.0", "id":clean["id"], "result":{}
+                }),
+            )
+            .await;
+            cancelling.await.unwrap().unwrap();
             reader_shutdown.cancel();
         }
 
