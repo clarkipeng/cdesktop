@@ -67,6 +67,24 @@ use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 use crate::{command, copy, process_budget::HostProcessBudget};
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
+const RAW_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Bound waiting for pipe EOF, not storage I/O. The sole recorder seals an
+/// unavailable outcome on expiry; its pending writes must finish before we can
+/// publish terminal process state or release its ownership.
+async fn finish_raw_capture(
+    mut capture: JoinHandle<()>,
+    drain_expired: CancellationToken,
+    grace: Duration,
+) -> Result<(), tokio::task::JoinError> {
+    match tokio::time::timeout(grace, &mut capture).await {
+        Ok(result) => result,
+        Err(_) => {
+            drain_expired.cancel();
+            capture.await
+        }
+    }
+}
 
 fn execution_current_dir(
     worktree_root: Option<&Path>,
@@ -568,6 +586,7 @@ impl LocalContainerService {
         exec_id: &Uuid,
         exit_signal: Option<ExecutorExitSignal>,
         capture: JoinHandle<()>,
+        drain_expired: CancellationToken,
     ) -> JoinHandle<()> {
         let exec_id = *exec_id;
         let child_store = self.child_store.clone();
@@ -612,7 +631,9 @@ impl LocalContainerService {
             if let Some(child_lock) = child_store.read().await.get(&exec_id).cloned() {
                 let _ = child_lock.write().await.start_kill();
             }
-            if let Err(error) = capture.await {
+            if let Err(error) =
+                finish_raw_capture(capture, drain_expired, RAW_CAPTURE_DRAIN_GRACE).await
+            {
                 tracing::error!(%exec_id, %error, "raw capture task failed");
                 recording_failures.write().await.insert(exec_id);
             }
@@ -833,6 +854,7 @@ impl LocalContainerService {
         &self,
         process: &ExecutionProcess,
         child: &mut AsyncGroupChild,
+        drain_expired: CancellationToken,
     ) -> Result<BoxFuture<'static, ()>, ContainerError> {
         let id = process.id;
         let store = self
@@ -870,6 +892,7 @@ impl LocalContainerService {
             writer,
             select(out, err).boxed(),
             store,
+            drain_expired,
             stop,
         )
         .boxed())
@@ -1446,8 +1469,9 @@ impl ContainerService for LocalContainerService {
             ))
         })??;
 
+        let drain_expired = CancellationToken::new();
         let capture = match self
-            .prepare_child_log_capture(execution_process, &mut spawned.child)
+            .prepare_child_log_capture(execution_process, &mut spawned.child, drain_expired.clone())
             .await
         {
             Ok(capture) => capture,
@@ -1468,7 +1492,12 @@ impl ContainerService for LocalContainerService {
 
         // Spawn unified exit monitor: watches OS exit and optional executor signal
         let capture = tokio::spawn(capture);
-        let hn = self.spawn_exit_monitor(&execution_process.id, spawned.exit_signal, capture);
+        let hn = self.spawn_exit_monitor(
+            &execution_process.id,
+            spawned.exit_signal,
+            capture,
+            drain_expired,
+        );
         self.add_exit_monitor_handle(execution_process.id, hn).await;
 
         Ok(())
@@ -1754,6 +1783,80 @@ mod tests {
             use std::os::windows::process::ExitStatusExt;
             ExitStatusExt::from_raw(code as u32)
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_group_cannot_wait_forever_for_a_pipe_held_outside_it() {
+        use std::{
+            process::Stdio,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        use command_group::AsyncCommandGroup;
+        use utils::execution_logs::{CaptureOutcome, read_execution_log_range, scan_owner};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owner.zst");
+        let writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+            .await
+            .unwrap();
+        // Two actual process groups: the execution exits, while the other owns
+        // its still-open output pipe. This is the escaped-descendant condition.
+        let mut holder = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "printf retained; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .group_spawn()
+            .unwrap();
+        let output = holder.inner().stdout.take().unwrap();
+        let mut execution = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .group_spawn()
+            .unwrap();
+        execution.wait().await.unwrap();
+        let _ = execution.start_kill();
+
+        let store = Arc::new(MsgStore::new());
+        let mut observed = store.history_plus_stream();
+        let drain = CancellationToken::new();
+        let failures = Arc::new(AtomicUsize::new(0));
+        let counter = failures.clone();
+        let capture = tokio::spawn(execution_process_service::capture_raw_logs(
+            writer,
+            utils::stream_lines::utf8_chunks(ReaderStream::new(output))
+                .map_ok(LogMsg::Stdout)
+                .boxed(),
+            store,
+            drain.clone(),
+            Box::new(move || {
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        ));
+        let observed = tokio::time::timeout(Duration::from_secs(5), observed.next()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            finish_raw_capture(capture, drain, Duration::from_millis(20)),
+        )
+        .await;
+        let remained_alive = holder.try_wait().unwrap().is_none();
+        // Test owns this exact extra process group; clean it before assertions.
+        holder.start_kill().unwrap();
+        holder.wait().await.unwrap();
+        assert!(observed.unwrap().unwrap().is_ok());
+        result.unwrap().unwrap();
+        assert!(remained_alive, "pipe holder must not have reached EOF");
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scan_owner(&path).await.unwrap().outcome,
+            Some(CaptureOutcome::Unavailable)
+        );
+        assert_eq!(
+            read_execution_log_range(&path, 0, 100).await.unwrap(),
+            "{\"Stdout\":\"retained\"}\n"
+        );
+        utils::execution_logs::lock_execution_log(&path).unwrap();
     }
 
     #[test]

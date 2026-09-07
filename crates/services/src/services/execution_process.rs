@@ -145,10 +145,24 @@ pub async fn capture_raw_logs(
     mut writer: ExecutionLogWriter,
     mut stream: futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>,
     store: Arc<MsgStore>,
+    drain_expired: tokio_util::sync::CancellationToken,
     on_failure: RecordingStop,
 ) {
     let result: Result<(), std::io::Error> = async {
-        while let Some(message) = stream.next().await {
+        loop {
+            // Cancellation is observed only between completed appends. Never
+            // drop an in-flight file write/flush: Tokio may still own its I/O.
+            let message = tokio::select! {
+                biased;
+                _ = drain_expired.cancelled() => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,
+                        "output pipes remained open after process exit"));
+                }
+                message = stream.next() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
             let message = message?;
             if matches!(message, LogMsg::Finished) {
                 break;
@@ -326,6 +340,7 @@ mod tests {
                 LogMsg::Finished,
             ]),
             Arc::new(MsgStore::new()),
+            tokio_util::sync::CancellationToken::new(),
             on_log_limit,
         )
         .await;
@@ -353,6 +368,7 @@ mod tests {
             writer,
             scripted(vec![LogMsg::Stdout("small".into()), LogMsg::Finished]),
             Arc::new(MsgStore::new()),
+            tokio_util::sync::CancellationToken::new(),
             on_log_limit,
         )
         .await;
@@ -381,6 +397,7 @@ mod tests {
             writer,
             scripted(messages),
             store.clone(),
+            tokio_util::sync::CancellationToken::new(),
             Box::new(|| Box::pin(async { panic!("healthy capture failed") })),
         )
         .await;
@@ -392,6 +409,55 @@ mod tests {
             execution_log_sha256(&path).await.unwrap().as_slice(),
             Sha256::digest(expected.as_bytes()).as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn drain_expiry_finishes_the_accepted_record_before_sealing_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.jsonl.zst");
+        let writer = ExecutionLogWriter::with_free_disk_reserve(path.clone(), 0)
+            .await
+            .unwrap();
+        let store = Arc::new(MsgStore::new());
+        let drain = tokio_util::sync::CancellationToken::new();
+        let signal = drain.clone();
+        // The select's cancellation arm was already polled when the producer
+        // hands off this record and expires the drain. It is now capture-owned.
+        let stream = futures::stream::once(async move {
+            signal.cancel();
+            Ok(LogMsg::Stdout("accepted".into()))
+        })
+        .chain(futures::stream::pending())
+        .boxed();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counter = stops.clone();
+        capture_raw_logs(
+            writer,
+            stream,
+            store.clone(),
+            drain,
+            Box::new(move || {
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        )
+        .await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_eq!(store.get_history().len(), 1);
+        assert_eq!(
+            read_execution_log_file(&path).await.unwrap(),
+            "{\"Stdout\":\"accepted\"}\n"
+        );
+        assert_eq!(
+            utils::execution_logs::scan_owner(&path)
+                .await
+                .unwrap()
+                .outcome,
+            Some(CaptureOutcome::Unavailable)
+        );
+        // Completion released the writer lease, not merely a UI subscription.
+        utils::execution_logs::lock_execution_log(&path).unwrap();
     }
 
     #[tokio::test]
@@ -414,6 +480,7 @@ mod tests {
             writer,
             stream,
             store.clone(),
+            tokio_util::sync::CancellationToken::new(),
             Box::new(move || {
                 Box::pin(async move {
                     counter.fetch_add(1, Ordering::SeqCst);
