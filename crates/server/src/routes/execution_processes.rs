@@ -3,7 +3,8 @@ use std::sync::LazyLock;
 use anyhow;
 use axum::{
     Extension, Router,
-    extract::{Path, Query, State, ws::Message},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State, ws::Message},
+    http::header,
     middleware::from_fn_with_state,
     response::{IntoResponse, Json as ResponseJson},
     routing::{get, post},
@@ -50,12 +51,38 @@ struct StopExecutionProcessRequest {
     dedupe_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawLogRangeQuery {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLogProvenanceQuery {
+    after_frame: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactUploadQuery {
+    /// Original producer-relative path, if it differs from the uploaded name.
+    original_path: Option<String>,
+    producer_ref: Option<String>,
+    publication_key: String,
+}
+
+#[derive(Deserialize)]
+struct ArtifactPath {
+    occurrence_id: Uuid,
+}
+
 #[derive(Debug, Serialize)]
 struct NormalizedLogSnapshot {
     entries: Vec<serde_json::Value>,
     patch_count: usize,
     skipped_patch_count: usize,
     complete: bool,
+    incomplete_reason: Option<String>,
 }
 
 fn apply_normalized_message(
@@ -109,6 +136,14 @@ async fn get_normalized_log_snapshot(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<NormalizedLogSnapshot>>, ApiError> {
+    // A live normalizer may still be processing the last raw message when its
+    // process ends. Only historical replay awaits all normalizers and can
+    // establish a complete bounded view; a live snapshot remains provisional.
+    let live_view = deployment
+        .container()
+        .get_msg_store_by_id(&execution_process.id)
+        .await
+        .is_some();
     let Some(mut stream) = deployment
         .container()
         .stream_normalized_logs(&execution_process.id)
@@ -123,6 +158,8 @@ async fn get_normalized_log_snapshot(
     let mut patch_count = 0;
     let mut skipped_patch_count = 0;
     let mut complete = false;
+    let mut incomplete_reason = live_view
+        .then(|| "live normalized view is provisional; read again after finalization".to_owned());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
     while patch_count < 100_000 {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -137,13 +174,20 @@ async fn get_normalized_log_snapshot(
         let Ok(Some(message)) = next else {
             break;
         };
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                incomplete_reason = Some(error.to_string());
+                continue;
+            }
+        };
         if apply_normalized_message(
             &mut document,
-            message?,
+            message,
             &mut patch_count,
             &mut skipped_patch_count,
         ) {
-            complete = true;
+            complete = incomplete_reason.is_none() && skipped_patch_count == 0;
             break;
         }
     }
@@ -158,7 +202,177 @@ async fn get_normalized_log_snapshot(
         patch_count,
         skipped_patch_count,
         complete,
+        incomplete_reason,
     })))
+}
+
+/// Returns exact producer bytes for a bounded decompressed range. The range
+/// namespace is `(execution_process.id, [start, end))`; it remains stable when
+/// Zstd frames or the rebuildable sidecar change.
+async fn get_raw_log_range(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    Query(query): Query<RawLogRangeQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    if query.end < query.start
+        || query.end.saturating_sub(query.start)
+            > utils::execution_logs::MAX_EXECUTION_LOG_RANGE_BYTES
+    {
+        return Err(ApiError::BadRequest(
+            "invalid or oversized execution log range".into(),
+        ));
+    }
+    let path = utils::execution_logs::process_log_file_path(
+        execution_process.session_id,
+        execution_process.id,
+    );
+    let page =
+        utils::execution_logs::read_execution_log_page(&path, query.start, query.end).await?;
+    raw_log_range_response(execution_process.id, query.start, page)
+}
+
+fn raw_log_range_response(
+    process_id: Uuid,
+    start: u64,
+    page: utils::execution_logs::LogPage,
+) -> Result<axum::response::Response, ApiError> {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        // A byte range can split a JSON record or UTF-8 code point.
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            "x-cdesktop-source-range",
+            format!("[{}, {})", start, start + page.bytes.len() as u64),
+        )
+        .header("x-cdesktop-source-id", process_id.to_string())
+        .header("x-cdesktop-source-durability", page.durability.as_str())
+        .body(axum::body::Body::from(page.bytes))
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
+}
+
+/// Capture completion is an owner fact, not a guess from the execution's exit
+/// status or a short range read. Missing/corrupt owners return errors.
+async fn get_raw_log_status(
+    Extension(process): Extension<ExecutionProcess>,
+) -> Result<ResponseJson<ApiResponse<utils::execution_logs::OwnerStatus>>, ApiError> {
+    let path = utils::execution_logs::process_log_file_path(process.session_id, process.id);
+    let status = utils::execution_logs::read_execution_log_status(&path).await?;
+    Ok(ResponseJson(ApiResponse::success(status)))
+}
+
+async fn get_raw_log_provenance(
+    Extension(process): Extension<ExecutionProcess>,
+    Query(query): Query<RawLogProvenanceQuery>,
+) -> Result<ResponseJson<ApiResponse<utils::execution_logs::ProvenancePage>>, ApiError> {
+    let limit = query
+        .limit
+        .unwrap_or(utils::execution_logs::MAX_PROVENANCE_FRAMES);
+    if !(1..=utils::execution_logs::MAX_PROVENANCE_FRAMES).contains(&limit) {
+        return Err(ApiError::BadRequest("invalid provenance page size".into()));
+    }
+    let path = utils::execution_logs::process_log_file_path(process.session_id, process.id);
+    let page =
+        utils::execution_logs::read_execution_log_provenance(&path, query.after_frame, limit)
+            .await?;
+    Ok(ResponseJson(ApiResponse::success(page)))
+}
+
+async fn migrate_raw_log(
+    Extension(process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<
+    ResponseJson<ApiResponse<services::services::execution_log_migration::MigrationReport>>,
+    ApiError,
+> {
+    if process.status == ExecutionProcessStatus::Running
+        || deployment
+            .container()
+            .get_msg_store_by_id(&process.id)
+            .await
+            .is_some()
+    {
+        return Err(ApiError::Conflict(
+            "execution capture is still active".into(),
+        ));
+    }
+    let report = services::services::execution_log_migration::migrate_execution_logs(
+        &deployment.db().pool,
+        &utils::assets::asset_dir(),
+        process.id,
+    )
+    .await
+    .map_err(services::services::container::ContainerError::Other)?;
+    Ok(ResponseJson(ApiResponse::success(report)))
+}
+
+/// Durable producer entry point for checkpoints and reports. Artifact bytes
+/// are deduplicated by attachment hash; a keyed replay preserves the same
+/// occurrence. Only a confirmed receipt authorises removing another source.
+async fn upload_execution_artifact(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<ArtifactUploadQuery>,
+    mut multipart: Multipart,
+) -> Result<ResponseJson<ApiResponse<services::services::file::ArtifactReceipt>>, ApiError> {
+    while let Some(field) = multipart.next_field().await? {
+        if field.name() != Some("artifact") {
+            continue;
+        }
+        let filename = field.file_name().unwrap_or("artifact.bin").to_owned();
+        if query.publication_key.trim().is_empty() {
+            return Err(ApiError::BadRequest("publication_key is required".into()));
+        }
+        let original_path = query.original_path.as_deref().unwrap_or(&filename);
+        let occurrence = deployment
+            .file()
+            .publish_execution_artifact(
+                field.into_stream(),
+                &filename,
+                services::services::file::ArtifactPublication {
+                    execution_id: execution_process.id,
+                    original_path,
+                    producer_ref: query.producer_ref.as_deref(),
+                    publication_key: &query.publication_key,
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                services::services::file::FileError::PublicationConflict => ApiError::Conflict(
+                    "artifact publication key already refers to different evidence".into(),
+                ),
+                other => other.into(),
+            })?;
+        return Ok(ResponseJson(ApiResponse::success(occurrence)));
+    }
+    Err(ApiError::File(
+        services::services::file::FileError::NotFound,
+    ))
+}
+
+async fn get_execution_artifact(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+    Path(path): Path<ArtifactPath>,
+) -> Result<ResponseJson<ApiResponse<services::services::file::ArtifactReceipt>>, ApiError> {
+    let occurrence = deployment
+        .file()
+        .get_execution_artifact_receipt(execution_process.id, path.occurrence_id)
+        .await?
+        .ok_or_else(|| ApiError::File(services::services::file::FileError::NotFound))?;
+    Ok(ResponseJson(ApiResponse::success(occurrence)))
+}
+
+async fn get_execution_artifact_file(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+    Path(path): Path<ArtifactPath>,
+) -> Result<axum::response::Response, ApiError> {
+    let occurrence = deployment
+        .file()
+        .get_execution_artifact(path.occurrence_id)
+        .await?
+        .filter(|artifact| artifact.execution_id == execution_process.id)
+        .ok_or_else(|| ApiError::File(services::services::file::FileError::NotFound))?;
+    super::attachments::serve_file(Path(occurrence.attachment_id), State(deployment)).await
 }
 
 async fn stream_raw_logs_ws(
@@ -464,6 +678,7 @@ async fn handle_execution_processes_by_session_ws(
                     }
                     Some(Err(e)) => {
                         tracing::error!("stream error: {}", e);
+                        let _ = socket.close_for_refresh().await;
                         break;
                     }
                     None => break,
@@ -492,18 +707,34 @@ async fn get_execution_process_repo_states(
     Ok(ResponseJson(ApiResponse::success(repo_states)))
 }
 
-pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
-    let workspace_id_router = Router::new()
+fn execution_routes() -> Router<DeploymentImpl> {
+    Router::new()
         .route("/", get(get_execution_process_by_id))
         .route("/stop", post(stop_execution_process))
         .route("/repo-states", get(get_execution_process_repo_states))
         .route("/normalized-snapshot", get(get_normalized_log_snapshot))
+        .route("/raw-log", get(get_raw_log_range))
+        .route("/raw-log/status", get(get_raw_log_status))
+        .route("/raw-log/provenance", get(get_raw_log_provenance))
+        .route("/raw-log/migrate", post(migrate_raw_log))
+        .route(
+            "/artifacts",
+            post(upload_execution_artifact).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/artifacts/{occurrence_id}", get(get_execution_artifact))
+        .route(
+            "/artifacts/{occurrence_id}/file",
+            get(get_execution_artifact_file),
+        )
         .route("/raw-logs/ws", get(stream_raw_logs_ws))
         .route("/normalized-logs/ws", get(stream_normalized_logs_ws))
-        .layer(from_fn_with_state(
-            deployment.clone(),
-            load_execution_process_middleware,
-        ));
+}
+
+pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
+    let workspace_id_router = execution_routes().layer(from_fn_with_state(
+        deployment.clone(),
+        load_execution_process_middleware,
+    ));
 
     let workspaces_router = Router::new()
         .route("/", get(list_execution_processes_by_session))
@@ -520,6 +751,109 @@ pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_query_preserves_frame_zero_as_distinct_from_the_first_page() {
+        let first =
+            Query::<RawLogProvenanceQuery>::try_from_uri(&"/raw-log/provenance".parse().unwrap())
+                .unwrap()
+                .0;
+        assert_eq!(first.after_frame, None);
+        assert_eq!(first.limit, None);
+        let next = Query::<RawLogProvenanceQuery>::try_from_uri(
+            &"/raw-log/provenance?after_frame=0&limit=1".parse().unwrap(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(next.after_frame, Some(0));
+        assert_eq!(next.limit, Some(1));
+        assert!(
+            Query::<RawLogProvenanceQuery>::try_from_uri(
+                &"/raw-log/provenance?after_frame=-1".parse().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_range_response_reports_actual_bytes_and_explicit_durability() {
+        use utils::{durable_fs::PublicationDurability, execution_logs::LogPage};
+        let process_id = Uuid::new_v4();
+        for durability in [
+            PublicationDurability::Confirmed,
+            PublicationDurability::Unverified,
+        ] {
+            let response = raw_log_range_response(
+                process_id,
+                12,
+                LogPage {
+                    bytes: vec![0xa9, b'"', b'}'],
+                    durability,
+                },
+            )
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/octet-stream"
+            );
+            assert_eq!(response.headers()["x-cdesktop-source-range"], "[12, 15)");
+            assert_eq!(
+                response.headers()["x-cdesktop-source-id"],
+                process_id.to_string()
+            );
+            assert_eq!(
+                response.headers()["x-cdesktop-source-durability"],
+                durability.as_str()
+            );
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 3)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                &[0xa9, b'"', b'}']
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_routes_have_no_overlapping_handlers() {
+        // Axum rejects duplicate method/path registration only at construction,
+        // so compilation alone cannot prove the native API can start.
+        let _ = execution_routes();
+    }
+
+    #[tokio::test]
+    async fn nested_artifact_paths_extract_parent_and_occurrence_by_name() {
+        // A scalar Path<Uuid> fails when the nested route carries two IDs.
+        // Exercise the real extractor types through Axum, without a deployment
+        // or production DB, on a temporary loopback listener.
+        let app = Router::new().route(
+            "/{id}/artifacts/{occurrence_id}",
+            get(
+                |Path(_parent): Path<crate::middleware::ExecutionProcessPath>,
+                 Path(path): Path<ArtifactPath>| async move {
+                    path.occurrence_id.to_string()
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let parent = Uuid::new_v4();
+        let occurrence = Uuid::new_v4();
+        let response = reqwest::get(format!("http://{address}/{parent}/artifacts/{occurrence}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), occurrence.to_string());
+        let invalid = reqwest::get(format!("http://{address}/invalid/artifacts/{occurrence}"))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn normalized_snapshot_coalesces_streaming_replacements() {

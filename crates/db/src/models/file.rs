@@ -26,7 +26,10 @@ pub struct CreateFile {
 }
 
 impl File {
-    pub async fn create(pool: &SqlitePool, data: &CreateFile) -> Result<Self, sqlx::Error> {
+    pub async fn create<'e>(
+        executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+        data: &CreateFile,
+    ) -> Result<Self, sqlx::Error> {
         let id = Uuid::new_v4();
         sqlx::query_as!(
             File,
@@ -47,11 +50,14 @@ impl File {
             data.size_bytes,
             data.hash,
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
     }
 
-    pub async fn find_by_hash(pool: &SqlitePool, hash: &str) -> Result<Option<Self>, sqlx::Error> {
+    pub async fn find_by_hash<'e>(
+        executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+        hash: &str,
+    ) -> Result<Option<Self>, sqlx::Error> {
         sqlx::query_as!(
             File,
             r#"SELECT id as "id!: Uuid",
@@ -66,11 +72,14 @@ impl File {
                WHERE hash = $1"#,
             hash
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
     }
 
-    pub async fn find_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Self>, sqlx::Error> {
+    pub async fn find_by_id<'e>(
+        executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+        id: Uuid,
+    ) -> Result<Option<Self>, sqlx::Error> {
         sqlx::query_as!(
             File,
             r#"SELECT id as "id!: Uuid",
@@ -85,7 +94,7 @@ impl File {
                WHERE id = $1"#,
             id
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
     }
 
@@ -135,27 +144,30 @@ impl File {
         .await
     }
 
-    pub async fn delete(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query!(r#"DELETE FROM attachments WHERE id = $1"#, id)
-            .execute(pool)
-            .await?;
-        Ok(())
+    /// Recheck references in the deleting statement, not a prior GC snapshot.
+    /// Commit the row deletion before unlinking its private cache path.
+    pub async fn delete_unreferenced<'e>(
+        executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+        id: Uuid,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        sqlx::query_as::<_, Self>(
+            "DELETE FROM attachments WHERE id = ?
+             AND NOT EXISTS (SELECT 1 FROM workspace_attachments WHERE attachment_id = attachments.id)
+             AND NOT EXISTS (SELECT 1 FROM execution_artifacts WHERE attachment_id = attachments.id)
+             RETURNING id, file_path, original_name, mime_type, size_bytes, hash, created_at, updated_at",
+        )
+        .bind(id)
+        .fetch_optional(executor)
+        .await
     }
 
     pub async fn find_orphaned_files(pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error> {
-        sqlx::query_as!(
-            File,
-            r#"SELECT i.id as "id!: Uuid",
-                      i.file_path as "file_path!",
-                      i.original_name as "original_name!",
-                      i.mime_type,
-                      i.size_bytes as "size_bytes!",
-                      i.hash as "hash!",
-                      i.created_at as "created_at!: DateTime<Utc>",
-                      i.updated_at as "updated_at!: DateTime<Utc>"
-               FROM attachments i
-               LEFT JOIN workspace_attachments wa ON i.id = wa.attachment_id
-               WHERE wa.workspace_id IS NULL"#
+        sqlx::query_as::<_, File>(
+            "SELECT i.id, i.file_path, i.original_name, i.mime_type, i.size_bytes, i.hash, i.created_at, i.updated_at
+             FROM attachments i
+             LEFT JOIN workspace_attachments wa ON i.id = wa.attachment_id
+             LEFT JOIN execution_artifacts ea ON i.id = ea.attachment_id
+             WHERE wa.workspace_id IS NULL AND ea.attachment_id IS NULL",
         )
         .fetch_all(pool)
         .await

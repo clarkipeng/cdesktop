@@ -9,6 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use db::models::file::{File, WorkspaceAttachment};
 use deployment::Deployment;
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use services::services::file::FileError;
 use tokio::fs::File as TokioFile;
@@ -106,8 +107,12 @@ pub(crate) async fn process_file_upload(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "file.bin".to_string());
 
-            let data = field.bytes().await?;
-            let file = file_service.store_file(&data, &filename).await?;
+            // Multipart chunks flow directly into FileService's staging file;
+            // the request limit remains the admission policy, not a reason to
+            // allocate an entire upload in the route.
+            let file = file_service
+                .store_stream(field.into_stream(), &filename, Some(20 * 1024 * 1024))
+                .await?;
 
             if let Some(workspace_id) = link_workspace_id {
                 WorkspaceAttachment::associate_many_dedup(

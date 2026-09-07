@@ -67,18 +67,40 @@ impl LogMsg {
 
     /// Rough size accounting for your byte‑budgeted history.
     pub fn approx_bytes(&self) -> usize {
-        const OVERHEAD: usize = 8;
-        match self {
-            LogMsg::Stdout(s) => EV_STDOUT.len() + s.len() + OVERHEAD,
-            LogMsg::Stderr(s) => EV_STDERR.len() + s.len() + OVERHEAD,
-            LogMsg::JsonPatch(patch) => {
-                let json_len = serde_json::to_string(patch).map(|s| s.len()).unwrap_or(2);
-                EV_JSON_PATCH.len() + json_len + OVERHEAD
+        const OVERHEAD: usize = std::mem::size_of::<LogMsg>() + 2 * std::mem::size_of::<usize>();
+        let payload = match self {
+            LogMsg::Stdout(s) | LogMsg::Stderr(s) | LogMsg::SessionId(s) | LogMsg::MessageId(s) => {
+                s.capacity()
             }
-            LogMsg::SessionId(s) => EV_SESSION_ID.len() + s.len() + OVERHEAD,
-            LogMsg::MessageId(s) => EV_MESSAGE_ID.len() + s.len() + OVERHEAD,
-            LogMsg::Ready => EV_READY.len() + OVERHEAD,
-            LogMsg::Finished => EV_FINISHED.len() + OVERHEAD,
-        }
+            LogMsg::JsonPatch(patch) => {
+                // Count without allocating a second serialized copy merely to
+                // discover that a large patch will not fit the disposable view.
+                let mut count = ByteCount(0);
+                if serde_json::to_writer(&mut count, patch).is_err() {
+                    return usize::MAX;
+                }
+                count.0.saturating_add(
+                    patch
+                        .0
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<json_patch::PatchOperation>()),
+                )
+            }
+            LogMsg::Ready | LogMsg::Finished => 0,
+        };
+        OVERHEAD.saturating_add(payload)
+    }
+}
+
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

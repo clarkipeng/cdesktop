@@ -102,6 +102,14 @@ pub struct UserSystemInfo {
     pub preview_proxy_port: Option<u16>,
 }
 
+fn service_capabilities() -> HashMap<String, u32> {
+    HashMap::from([
+        ("managed_task_launch".into(), 1),
+        // API availability, not a per-source durability acknowledgement.
+        ("execution_evidence".into(), 1),
+    ])
+}
+
 // TODO: update frontend, BE schema has changed, this replaces GET /config and /config/constants
 #[axum::debug_handler]
 async fn get_user_system_info(
@@ -171,7 +179,7 @@ async fn get_user_system_info(
             }
             caps
         },
-        service_capabilities: HashMap::from([("managed_task_launch".into(), 1)]),
+        service_capabilities: service_capabilities(),
         shared_api_base: deployment.remote_info().get_api_base(),
         preview_proxy_port: deployment.client_info().get_preview_proxy_port(),
     };
@@ -675,4 +683,16 @@ async fn handle_executor_discovered_options_ws(
         .send(LogMsg::Finished.to_ws_message_unchecked())
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod evidence_contract_tests {
+    use super::service_capabilities;
+
+    #[test]
+    fn info_advertises_evidence_without_changing_the_managed_launch_contract() {
+        let capabilities = serde_json::to_value(service_capabilities()).unwrap();
+        assert_eq!(capabilities["execution_evidence"], 1);
+        assert_eq!(capabilities["managed_task_launch"], 1);
+    }
 }

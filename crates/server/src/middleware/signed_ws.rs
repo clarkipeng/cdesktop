@@ -7,7 +7,7 @@ use std::{
 use axum::{
     extract::{
         FromRef, FromRequestParts,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::request::Parts,
     response::IntoResponse,
@@ -156,6 +156,16 @@ impl MaybeSignedWebSocket {
             WebSocketInner::Signed(ws) => ws.close().await,
         }
     }
+
+    /// A state-stream gap requires a fresh snapshot. A normal1000 close tells
+    /// the web client not to reconnect, so make recovery explicit on the wire.
+    pub async fn close_for_refresh(&mut self) -> anyhow::Result<()> {
+        self.send(Message::Close(Some(CloseFrame {
+            code: close_code::AGAIN,
+            reason: "refresh source snapshot".into(),
+        })))
+        .await
+    }
 }
 
 impl Stream for MaybeSignedWebSocket {
@@ -205,5 +215,43 @@ impl Sink<Message> for MaybeSignedWebSocket {
             WebSocketInner::Plain(ws) => Pin::new(ws).poll_close(cx).map_err(anyhow::Error::from),
             WebSocketInner::Signed(ws) => Pin::new(ws).poll_close(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Router, routing::get};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn refresh_close_is_retryable_on_the_actual_websocket() {
+        // No Deployment/default DB: exercise only the real socket wrapper over
+        // an isolated ephemeral loopback listener and inspect the client frame.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(|ws| async move {
+                    let mut socket = MaybeSignedWebSocket {
+                        inner: WebSocketInner::Plain(Box::new(ws)),
+                    };
+                    socket.close_for_refresh().await.unwrap();
+                })
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let message = socket.next().await.unwrap().unwrap();
+        server.abort();
+        assert!(
+            matches!(message, tokio_tungstenite::tungstenite::Message::Close(Some(frame))
+            if u16::from(frame.code) == close_code::AGAIN && frame.reason == "refresh source snapshot")
+        );
     }
 }

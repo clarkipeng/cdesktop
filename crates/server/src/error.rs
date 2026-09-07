@@ -481,6 +481,18 @@ impl IntoResponse for ApiError {
             ApiError::File(FileError::NotFound) => {
                 ErrorInfo::not_found("FileNotFound", "File not found.")
             }
+            ApiError::File(FileError::StorageUnavailable) => ErrorInfo::with_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "EvidenceStorageUnavailable",
+                self.to_string(),
+            ),
+            ApiError::File(FileError::Retained | FileError::PublicationConflict) => {
+                ErrorInfo::with_status(
+                    StatusCode::CONFLICT,
+                    "RetainedFileConflict",
+                    self.to_string(),
+                )
+            }
             ApiError::File(_) => ErrorInfo {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 error_type: "FileError",

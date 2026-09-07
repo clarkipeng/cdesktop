@@ -69,6 +69,65 @@ use worktree_manager::WorktreeError;
 use crate::services::{auth_binding, execution_process, notification::NotificationService};
 pub type ContainerRef = String;
 
+fn normalized_replay_stream(
+    store: &MsgStore,
+) -> futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>> {
+    // Stream normalized patches, deduplicating consecutive patches
+    // that target the same path (only the final state matters for
+    // historical replay). The Ready sentinel flushes the buffer.
+    let stream = store
+        .history_plus_stream()
+        .take_while(|message| future::ready(!matches!(message, Ok(LogMsg::Ready))))
+        .filter_map(|msg| async move {
+            match msg {
+                Ok(LogMsg::JsonPatch(patch)) => Some(Ok(patch)),
+                Err(error) => Some(Err(error)),
+                _ => None,
+            }
+        })
+        .fuse();
+
+    let deduped = futures::stream::unfold(
+        (stream.boxed(), None::<Patch>, HashSet::<String>::new()),
+        |(mut stream, buffered, mut sent_paths)| async move {
+            match stream.next().await {
+                Some(Ok(patch)) => {
+                    let Some(prev) = buffered else {
+                        // First patch — just buffer it
+                        return Some((None, (stream, Some(patch), sent_paths)));
+                    };
+                    if patch_entry_path(&patch) == patch_entry_path(&prev)
+                        && is_add_or_replace(&patch)
+                        && is_add_or_replace(&prev)
+                    {
+                        // Same path, both add/replace — replace buffer
+                        Some((None, (stream, Some(patch), sent_paths)))
+                    } else {
+                        // Different — emit prev, buffer new
+                        let prev = fix_patch_ops(prev, &mut sent_paths);
+                        Some((Some(Ok(prev)), (stream, Some(patch), sent_paths)))
+                    }
+                }
+                Some(Err(error)) => Some((Some(Err(error)), (stream, buffered, sent_paths))),
+                None => {
+                    // Sentinel or stream end: flush buffer and terminate
+                    if let Some(prev) = buffered {
+                        let prev = fix_patch_ops(prev, &mut sent_paths);
+                        return Some((Some(Ok(prev)), (stream, None, sent_paths)));
+                    }
+                    None
+                }
+            }
+        },
+    )
+    .filter_map(|opt| async move { opt })
+    .map(|patch| patch.map(LogMsg::JsonPatch))
+    .chain(futures::stream::once(async {
+        Ok::<_, std::io::Error>(LogMsg::Finished)
+    }));
+    deduped.boxed()
+}
+
 fn max_running_agents() -> i64 {
     std::env::var("CDESKTOP_MAX_RUNNING_AGENTS")
         .ok()
@@ -431,7 +490,7 @@ pub trait ContainerService {
         &self,
         session_id: Uuid,
     ) -> Result<Option<ExecutionProcess>, ContainerError> {
-        let _scheduler = self.scheduler_lock().lock().await;
+        let scheduler = self.scheduler_lock().lock().await;
         let pool = &self.db().pool;
         if ExecutionProcess::has_running_coding_agent_for_session(pool, session_id).await? {
             return Ok(None);
@@ -579,6 +638,7 @@ pub trait ContainerService {
                 &ExecutionProcessRunReason::CodingAgent,
                 execution_id,
                 true,
+                &scheduler,
             )
             .await
         }
@@ -1088,19 +1148,19 @@ pub trait ContainerService {
         status: ExecutionProcessStatus,
     ) -> Result<(), ContainerError>;
 
-    /// Start persisting this execution's live log stream to its durable file.
-    ///
-    /// Overridden by implementors that own the child process, so the durable
-    /// writer's byte cap can stop a runaway agent instead of silently dropping
-    /// its output. The default persists without a stop hook.
-    async fn spawn_log_persistence(&self, execution_process: &ExecutionProcess) {
-        execution_process::spawn_stream_raw_logs_to_storage(
-            self.msg_stores().clone(),
-            self.db().clone(),
-            execution_process.id,
-            execution_process.session_id,
-            None,
-        );
+    /// Subscribe before launch so adapter identities cannot fall out of the UI
+    /// history before the database observer sees them. Raw capture is inline
+    /// with the native producer, not a subscriber of this disposable mirror.
+    async fn spawn_log_metadata_sync(&self, execution_process: &ExecutionProcess) {
+        if let Some(store) = self.get_msg_store_by_id(&execution_process.id).await {
+            let handle = execution_process::spawn_session_metadata_sync(
+                store.history_plus_stream(),
+                self.db().clone(),
+                execution_process.id,
+            );
+            self.store_db_stream_handle(execution_process.id, handle)
+                .await;
+        }
     }
 
     async fn try_commit_changes(&self, ctx: &ExecutionContext) -> Result<bool, ContainerError>;
@@ -1150,16 +1210,22 @@ pub trait ContainerService {
                     .filter(|msg| {
                         future::ready(matches!(
                             msg,
-                            Ok(LogMsg::Stdout(..) | LogMsg::Stderr(..) | LogMsg::Finished)
+                            Ok(LogMsg::Stdout(..) | LogMsg::Stderr(..) | LogMsg::Finished) | Err(_)
                         ))
                     })
                     .boxed(),
             );
         } else {
-            let messages = execution_process::load_raw_log_messages(&self.db().pool, *id).await?;
+            let source = execution_process::load_raw_log_messages(&self.db().pool, *id).await?;
+            let gap = (!source.complete).then(|| {
+                Err(std::io::Error::other(
+                    "bounded or legacy raw view; complete capture coverage unavailable",
+                ))
+            });
 
             let stream = futures::stream::iter(
-                messages
+                source
+                    .messages
                     .into_iter()
                     .filter(|m| matches!(m, LogMsg::Stdout(_) | LogMsg::Stderr(_)))
                     .chain(std::iter::once(LogMsg::Finished))
@@ -1167,7 +1233,7 @@ pub trait ContainerService {
             )
             .boxed();
 
-            Some(stream)
+            Some(futures::stream::iter(gap).chain(stream).boxed())
         }
     }
 
@@ -1180,20 +1246,19 @@ pub trait ContainerService {
                 store
                     .history_plus_stream()
                     .take_while(|msg| future::ready(!matches!(msg, Ok(LogMsg::Finished))))
-                    .filter(|msg| future::ready(matches!(msg, Ok(LogMsg::JsonPatch(..)))))
+                    .filter(|msg| future::ready(matches!(msg, Ok(LogMsg::JsonPatch(..)) | Err(_))))
                     .chain(futures::stream::once(async {
                         Ok::<_, std::io::Error>(LogMsg::Finished)
                     }))
                     .boxed(),
             )
         } else {
-            let raw_messages =
-                execution_process::load_raw_log_messages(&self.db().pool, *id).await?;
+            let source = execution_process::load_raw_log_messages(&self.db().pool, *id).await?;
 
             // Create temporary store and populate
             // Include JsonPatch messages (already normalized) and Stdout/Stderr (need normalization)
             let temp_store = Arc::new(MsgStore::new());
-            for msg in raw_messages {
+            for msg in source.messages {
                 if matches!(
                     msg,
                     LogMsg::Stdout(_) | LogMsg::Stderr(_) | LogMsg::JsonPatch(_)
@@ -1202,6 +1267,9 @@ pub trait ContainerService {
                 }
             }
             temp_store.push_finished();
+            let source_complete = source.complete && temp_store.history_complete();
+            // Subscribe before normalizers can publish/evict their first patch.
+            let deduped = normalized_replay_stream(&temp_store);
 
             let process = match ExecutionProcess::find_by_id(&self.db().pool, *id).await {
                 Ok(Some(process)) => process,
@@ -1328,63 +1396,12 @@ pub trait ContainerService {
                 });
             }
 
-            // Stream normalized patches, deduplicating consecutive patches
-            // that target the same path (only the final state matters for
-            // historical replay). The Ready sentinel flushes the buffer.
-            enum PatchOrDone {
-                Patch(Patch),
-                Done,
-            }
-
-            let stream = temp_store
-                .history_plus_stream()
-                .filter_map(|msg| async move {
-                    match msg {
-                        Ok(LogMsg::JsonPatch(patch)) => Some(PatchOrDone::Patch(patch)),
-                        Ok(LogMsg::Ready) => Some(PatchOrDone::Done),
-                        _ => None,
-                    }
-                });
-
-            let deduped = futures::stream::unfold(
-                (stream.boxed(), None::<Patch>, HashSet::<String>::new()),
-                |(mut stream, buffered, mut sent_paths)| async move {
-                    match stream.next().await {
-                        Some(PatchOrDone::Patch(patch)) => {
-                            let Some(prev) = buffered else {
-                                // First patch — just buffer it
-                                return Some((None, (stream, Some(patch), sent_paths)));
-                            };
-                            if patch_entry_path(&patch) == patch_entry_path(&prev)
-                                && is_add_or_replace(&patch)
-                                && is_add_or_replace(&prev)
-                            {
-                                // Same path, both add/replace — replace buffer
-                                Some((None, (stream, Some(patch), sent_paths)))
-                            } else {
-                                // Different — emit prev, buffer new
-                                let prev = fix_patch_ops(prev, &mut sent_paths);
-                                Some((Some(prev), (stream, Some(patch), sent_paths)))
-                            }
-                        }
-                        Some(PatchOrDone::Done) | None => {
-                            // Sentinel or stream end: flush buffer and terminate
-                            if let Some(prev) = buffered {
-                                let prev = fix_patch_ops(prev, &mut sent_paths);
-                                return Some((Some(prev), (stream, None, sent_paths)));
-                            }
-                            None
-                        }
-                    }
-                },
-            )
-            .filter_map(|opt| async move { opt })
-            .map(|p| Ok::<_, std::io::Error>(LogMsg::JsonPatch(p)))
-            .chain(futures::stream::once(async {
-                Ok::<_, std::io::Error>(LogMsg::Finished)
-            }));
-
-            Some(deduped.boxed())
+            let gap = (!source_complete).then(|| {
+                Err(std::io::Error::other(
+                    "bounded or legacy normalized view; complete capture coverage unavailable",
+                ))
+            });
+            Some(futures::stream::iter(gap).chain(deduped).boxed())
         }
     }
 
@@ -1527,22 +1544,12 @@ pub trait ContainerService {
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
     ) -> Result<ExecutionProcess, ContainerError> {
-        // Coding-agent admission is centralized here for every direct launch.
-        // Queue dispatch already holds this lock and calls the same primitive
-        // immediately before creating its execution row.
+        // Every launch holds this through row creation and native registration.
+        // Stop uses the same barrier before declaring a missing child orphaned.
+        // Queue dispatch already holds it and calls the same primitive directly.
+        let scheduler = self.scheduler_lock().lock().await;
         if *run_reason == ExecutionProcessRunReason::CodingAgent {
-            let _scheduler = self.scheduler_lock().lock().await;
             self.admit_coding_agent(&self.db().pool).await?;
-            return self
-                .start_execution_with_id(
-                    workspace,
-                    session,
-                    executor_action,
-                    run_reason,
-                    Uuid::new_v4(),
-                    false,
-                )
-                .await;
         }
         self.start_execution_with_id(
             workspace,
@@ -1551,6 +1558,7 @@ pub trait ContainerService {
             run_reason,
             Uuid::new_v4(),
             false,
+            &scheduler,
         )
         .await
     }
@@ -1565,6 +1573,9 @@ pub trait ContainerService {
         Ok(())
     }
 
+    /// Launch admission must cover the committed row through native runtime
+    /// registration. Passing its guard keeps every caller inside that boundary.
+    #[allow(clippy::too_many_arguments)] // The guard proves admission; it is not a launch option.
     async fn start_execution_with_id(
         &self,
         workspace: &Workspace,
@@ -1573,6 +1584,7 @@ pub trait ContainerService {
         run_reason: &ExecutionProcessRunReason,
         execution_process_id: Uuid,
         claim_pending_commands: bool,
+        _scheduler: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Hold start admission through the durable row creation. Drain activation
         // takes the matching writer, so no admitted start can appear after drain begins.
@@ -1686,6 +1698,9 @@ pub trait ContainerService {
         if *run_reason != ExecutionProcessRunReason::ArchiveScript
             && let Err(e) = Workspace::set_archived(&self.db().pool, workspace.id, false).await
         {
+            if let Some(handle) = self.take_db_stream_handle(&execution_process.id).await {
+                handle.abort();
+            }
             self.msg_stores()
                 .write()
                 .await
@@ -1749,10 +1764,14 @@ pub trait ContainerService {
             }
         }
 
+        self.spawn_log_metadata_sync(&execution_process).await;
         if let Err(start_error) = self
             .start_execution_inner(workspace, &execution_process, executor_action)
             .await
         {
+            if let Some(handle) = self.take_db_stream_handle(&execution_process.id).await {
+                handle.abort();
+            }
             self.msg_stores()
                 .write()
                 .await
@@ -1883,7 +1902,6 @@ pub trait ContainerService {
             }
         }
 
-        self.spawn_log_persistence(&execution_process).await;
         Ok(execution_process)
     }
 
@@ -1920,5 +1938,51 @@ pub trait ContainerService {
 
         tracing::debug!("Started next action: {:?}", next_action);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replay_flushes_last_patch_then_finishes_without_waiting_for_more_output() {
+        let store = MsgStore::new();
+        let mut stream = normalized_replay_stream(&store);
+        store.push_patch(
+            serde_json::from_value(serde_json::json!([{
+                "op": "add", "path": "/entries/0", "value": {"content": "retained"}
+            }]))
+            .unwrap(),
+        );
+        store.push(LogMsg::Ready);
+        let messages = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut output = Vec::new();
+            while let Some(message) = stream.next().await {
+                output.push(message.unwrap());
+            }
+            output
+        })
+        .await
+        .expect("Ready must terminate replay even while the store is alive");
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0], LogMsg::JsonPatch(_)));
+        assert!(matches!(messages[1], LogMsg::Finished));
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_ui_coverage_errors() {
+        let store = MsgStore::new();
+        store.push_stdout(
+            "x".repeat(utils::execution_logs::DEFAULT_IN_MEMORY_LOG_BYTES as usize + 1),
+        );
+        let mut stream = normalized_replay_stream(&store);
+        store.push(LogMsg::Ready);
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            LogMsg::Finished
+        ));
+        assert!(stream.next().await.is_none());
     }
 }

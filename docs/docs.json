@@ -110,6 +110,7 @@
       {
         "group": "Integrations",
         "pages": [
+          "integrations/execution-evidence",
           "integrations/github-integration",
           "integrations/azure-repos-integration",
           "integrations/vscode-extension",

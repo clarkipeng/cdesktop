@@ -12,6 +12,11 @@ use uuid::Uuid;
 
 use crate::DeploymentImpl;
 
+#[derive(serde::Deserialize)]
+pub struct ExecutionProcessPath {
+    id: Uuid,
+}
+
 pub async fn load_workspace_middleware(
     State(deployment): State<DeploymentImpl>,
     Path(workspace_id): Path<Uuid>,
@@ -40,11 +45,12 @@ pub async fn load_workspace_middleware(
 
 pub async fn load_execution_process_middleware(
     State(deployment): State<DeploymentImpl>,
-    Path(process_id): Path<Uuid>,
+    Path(path): Path<ExecutionProcessPath>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Load the execution process from the database
+    let process_id = path.id;
     let execution_process =
         match ExecutionProcess::find_by_id(&deployment.db().pool, process_id).await {
             Ok(Some(process)) => process,

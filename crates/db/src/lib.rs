@@ -1,15 +1,45 @@
-use std::{str::FromStr, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use sqlx::{
-    ConnectOptions, Error, Pool, Sqlite, SqlitePool,
+    Error, Pool, Sqlite, SqlitePool,
     migrate::MigrateError,
-    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{
+        SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions,
+        SqliteSynchronous,
+    },
 };
 use utils::assets::asset_dir;
 
 pub mod models;
 pub mod provider_catalog;
 pub mod provider_payloads;
+
+/// One native commit policy for both pool constructors and explicit-path fixtures.
+/// DELETE/FULL alone can lose the last commit after power loss. EXTRA confirms
+/// journal removal; fullfsync requests the stronger macOS storage barrier.
+pub fn connection_options(path: &Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Delete)
+        .synchronous(SqliteSynchronous::Extra)
+        .pragma("fullfsync", "ON")
+}
+
+/// Verify the actual writing connection, not merely the pool's configured defaults.
+/// This is a prerequisite for an artifact reference's durable-commit marker.
+async fn require_durable_commit_policy(conn: &mut SqliteConnection) -> Result<(), Error> {
+    let (journal, synchronous, fullfsync): (String, i64, i64) = sqlx::query_as(
+        "SELECT journal_mode, synchronous, fullfsync FROM pragma_journal_mode(), pragma_synchronous(), pragma_fullfsync()",
+    ).fetch_one(conn).await?;
+    if journal != "delete" || synchronous != 3 || fullfsync != 1 {
+        return Err(Error::Protocol(
+            "artifact retention requires DELETE/EXTRA/fullfsync on its writing connection".into(),
+        ));
+    }
+    Ok(())
+}
 
 async fn run_migrations(pool: &Pool<Sqlite>) -> Result<(), Error> {
     use std::collections::HashSet;
@@ -76,31 +106,10 @@ pub struct DBService {
 
 impl DBService {
     pub async fn new() -> Result<DBService, Error> {
-        let database_url = format!(
-            "sqlite://{}",
-            asset_dir().join("db.v2.sqlite").to_string_lossy()
-        );
-        let options = SqliteConnectOptions::from_str(&database_url)?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Delete);
+        let options = connection_options(&asset_dir().join("db.v2.sqlite"));
         let pool = SqlitePool::connect_with(options).await?;
         run_migrations(&pool).await?;
         Ok(DBService { pool })
-    }
-
-    pub async fn new_migration_pool() -> Result<Pool<Sqlite>, Error> {
-        let database_url = format!(
-            "sqlite://{}",
-            asset_dir().join("db.v2.sqlite").to_string_lossy()
-        );
-        let options = SqliteConnectOptions::from_str(&database_url)?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Delete)
-            .disable_statement_logging();
-        SqlitePoolOptions::new()
-            .max_connections(64)
-            .connect_with(options)
-            .await
     }
 
     pub async fn new_with_after_connect<F>(after_connect: F) -> Result<DBService, Error>
@@ -127,13 +136,7 @@ impl DBService {
             + Sync
             + 'static,
     {
-        let database_url = format!(
-            "sqlite://{}",
-            asset_dir().join("db.v2.sqlite").to_string_lossy()
-        );
-        let options = SqliteConnectOptions::from_str(&database_url)?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Delete);
+        let options = connection_options(&asset_dir().join("db.v2.sqlite"));
 
         let pool = if let Some(hook) = after_connect {
             SqlitePoolOptions::new()
@@ -152,5 +155,39 @@ impl DBService {
 
         run_migrations(&pool).await?;
         Ok(pool)
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn artifact_commit_policy_is_verified_on_each_actual_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(connection_options(&root.path().join("policy.sqlite")))
+            .await
+            .unwrap();
+        let mut first = pool.acquire().await.unwrap();
+        let mut second = pool.acquire().await.unwrap();
+        require_durable_commit_policy(&mut first).await.unwrap();
+        require_durable_commit_policy(&mut second).await.unwrap();
+        sqlx::query("PRAGMA synchronous=FULL")
+            .execute(&mut *second)
+            .await
+            .unwrap();
+        assert!(require_durable_commit_policy(&mut second).await.is_err());
+        require_durable_commit_policy(&mut first).await.unwrap();
+        sqlx::query("PRAGMA synchronous=EXTRA")
+            .execute(&mut *second)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA fullfsync=OFF")
+            .execute(&mut *second)
+            .await
+            .unwrap();
+        assert!(require_durable_commit_policy(&mut second).await.is_err());
     }
 }

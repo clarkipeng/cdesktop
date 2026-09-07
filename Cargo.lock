@@ -10862,6 +10862,7 @@ dependencies = [
  "api-types",
  "async-trait",
  "backon",
+ "bytes",
  "chrono",
  "dashmap",
  "db",
@@ -10874,7 +10875,6 @@ dependencies = [
  "git",
  "git-host",
  "ignore",
- "indicatif",
  "json-patch 2.0.0",
  "libc",
  "mime_guess",
@@ -13391,6 +13391,7 @@ dependencies = [
  "command-group",
  "directories",
  "dirs 5.0.1",
+ "fs2",
  "futures",
  "json-patch 2.0.0",
  "jsonwebtoken",
@@ -13402,6 +13403,7 @@ dependencies = [
  "sentry-tracing",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shellexpand",
  "shlex",
  "similar",
@@ -13417,6 +13419,7 @@ dependencies = [
  "which",
  "windows-sys 0.61.2",
  "winreg 0.55.0",
+ "zstd",
 ]
 
 [[package]]

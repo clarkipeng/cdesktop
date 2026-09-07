@@ -26,6 +26,10 @@ bindings/
 # IDE
 .vscode/
 .idea/
+
+# Workspace-local agent handoffs and scratch data
+/.context/
+
 *.swp
 *.swo
 *~

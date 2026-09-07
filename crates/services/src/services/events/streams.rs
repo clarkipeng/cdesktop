@@ -3,7 +3,6 @@ use db::models::{
 };
 use futures::StreamExt;
 use serde_json::json;
-use tokio_stream::wrappers::BroadcastStream;
 use utils::log_msg::LogMsg;
 use uuid::Uuid;
 
@@ -47,97 +46,90 @@ impl EventService {
         let initial_msg = LogMsg::JsonPatch(serde_json::from_value(initial_patch).unwrap());
 
         // Get filtered event stream
-        let filtered_stream =
-            BroadcastStream::new(self.msg_store.get_receiver()).filter_map(move |msg_result| {
-                async move {
-                    match msg_result {
-                        Ok(LogMsg::JsonPatch(patch)) => {
-                            // Filter events based on session_id
-                            if let Some(patch_op) = patch.0.first() {
-                                // Check if this is a modern execution process patch
-                                if patch_op.path().starts_with("/execution_processes/") {
-                                    match patch_op {
-                                        json_patch::PatchOperation::Add(op) => {
-                                            // Parse execution process data directly from value
-                                            if let Ok(process) =
-                                                serde_json::from_value::<ExecutionProcess>(
-                                                    op.value.clone(),
-                                                )
-                                                && process.session_id == session_id
-                                            {
-                                                if !show_soft_deleted && process.dropped {
-                                                    let remove_patch =
-                                                        execution_process_patch::remove(process.id);
-                                                    return Some(Ok(LogMsg::JsonPatch(
-                                                        remove_patch,
-                                                    )));
-                                                }
-                                                return Some(Ok(LogMsg::JsonPatch(patch)));
+        let filtered_stream = self.msg_store.live_stream().filter_map(move |msg_result| {
+            async move {
+                match msg_result {
+                    Ok(LogMsg::JsonPatch(patch)) => {
+                        // Filter events based on session_id
+                        if let Some(patch_op) = patch.0.first() {
+                            // Check if this is a modern execution process patch
+                            if patch_op.path().starts_with("/execution_processes/") {
+                                match patch_op {
+                                    json_patch::PatchOperation::Add(op) => {
+                                        // Parse execution process data directly from value
+                                        if let Ok(process) =
+                                            serde_json::from_value::<ExecutionProcess>(
+                                                op.value.clone(),
+                                            )
+                                            && process.session_id == session_id
+                                        {
+                                            if !show_soft_deleted && process.dropped {
+                                                let remove_patch =
+                                                    execution_process_patch::remove(process.id);
+                                                return Some(Ok(LogMsg::JsonPatch(remove_patch)));
                                             }
-                                        }
-                                        json_patch::PatchOperation::Replace(op) => {
-                                            // Parse execution process data directly from value
-                                            if let Ok(process) =
-                                                serde_json::from_value::<ExecutionProcess>(
-                                                    op.value.clone(),
-                                                )
-                                                && process.session_id == session_id
-                                            {
-                                                if !show_soft_deleted && process.dropped {
-                                                    let remove_patch =
-                                                        execution_process_patch::remove(process.id);
-                                                    return Some(Ok(LogMsg::JsonPatch(
-                                                        remove_patch,
-                                                    )));
-                                                }
-                                                return Some(Ok(LogMsg::JsonPatch(patch)));
-                                            }
-                                        }
-                                        json_patch::PatchOperation::Remove(_) => {
-                                            // For remove operations, we can't verify session_id
-                                            // so we allow all removals and let the client handle filtering
                                             return Some(Ok(LogMsg::JsonPatch(patch)));
                                         }
-                                        _ => {}
                                     }
-                                }
-                                // Fallback to legacy EventPatch format for backward compatibility
-                                else if let Ok(event_patch_value) = serde_json::to_value(patch_op)
-                                    && let Ok(event_patch) =
-                                        serde_json::from_value::<EventPatch>(event_patch_value)
-                                {
-                                    match &event_patch.value.record {
-                                        RecordTypes::ExecutionProcess(process) => {
-                                            if process.session_id == session_id {
-                                                if !show_soft_deleted && process.dropped {
-                                                    let remove_patch =
-                                                        execution_process_patch::remove(process.id);
-                                                    return Some(Ok(LogMsg::JsonPatch(
-                                                        remove_patch,
-                                                    )));
-                                                }
-                                                return Some(Ok(LogMsg::JsonPatch(patch)));
+                                    json_patch::PatchOperation::Replace(op) => {
+                                        // Parse execution process data directly from value
+                                        if let Ok(process) =
+                                            serde_json::from_value::<ExecutionProcess>(
+                                                op.value.clone(),
+                                            )
+                                            && process.session_id == session_id
+                                        {
+                                            if !show_soft_deleted && process.dropped {
+                                                let remove_patch =
+                                                    execution_process_patch::remove(process.id);
+                                                return Some(Ok(LogMsg::JsonPatch(remove_patch)));
                                             }
+                                            return Some(Ok(LogMsg::JsonPatch(patch)));
                                         }
-                                        RecordTypes::DeletedExecutionProcess {
-                                            session_id: Some(deleted_session_id),
-                                            ..
-                                        } => {
-                                            if *deleted_session_id == session_id {
-                                                return Some(Ok(LogMsg::JsonPatch(patch)));
-                                            }
-                                        }
-                                        _ => {}
                                     }
+                                    json_patch::PatchOperation::Remove(_) => {
+                                        // For remove operations, we can't verify session_id
+                                        // so we allow all removals and let the client handle filtering
+                                        return Some(Ok(LogMsg::JsonPatch(patch)));
+                                    }
+                                    _ => {}
                                 }
                             }
-                            None
+                            // Fallback to legacy EventPatch format for backward compatibility
+                            else if let Ok(event_patch_value) = serde_json::to_value(patch_op)
+                                && let Ok(event_patch) =
+                                    serde_json::from_value::<EventPatch>(event_patch_value)
+                            {
+                                match &event_patch.value.record {
+                                    RecordTypes::ExecutionProcess(process) => {
+                                        if process.session_id == session_id {
+                                            if !show_soft_deleted && process.dropped {
+                                                let remove_patch =
+                                                    execution_process_patch::remove(process.id);
+                                                return Some(Ok(LogMsg::JsonPatch(remove_patch)));
+                                            }
+                                            return Some(Ok(LogMsg::JsonPatch(patch)));
+                                        }
+                                    }
+                                    RecordTypes::DeletedExecutionProcess {
+                                        session_id: Some(deleted_session_id),
+                                        ..
+                                    } => {
+                                        if *deleted_session_id == session_id {
+                                            return Some(Ok(LogMsg::JsonPatch(patch)));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
-                        Ok(other) => Some(Ok(other)), // Pass through non-patch messages
-                        Err(_) => None,               // Filter out broadcast errors
+                        None
                     }
+                    Ok(other) => Some(Ok(other)), // Pass through non-patch messages
+                    Err(error) => Some(Err(error)), // Close/resnapshot rather than hide a gap
                 }
-            });
+            }
+        });
 
         // Start with initial snapshot, Ready signal, then live updates
         let initial_stream = futures::stream::iter(vec![Ok(initial_msg), Ok(LogMsg::Ready)]);
@@ -180,46 +172,45 @@ impl EventService {
         let type_str = scratch_type.to_string();
 
         // Filter to only this scratch's events by matching id and payload.type in the patch value
-        let filtered_stream =
-            BroadcastStream::new(self.msg_store.get_receiver()).filter_map(move |msg_result| {
-                let id_str = scratch_id.to_string();
-                let type_str = type_str.clone();
-                async move {
-                    match msg_result {
-                        Ok(LogMsg::JsonPatch(patch)) => {
-                            if let Some(op) = patch.0.first()
-                                && op.path() == "/scratch"
-                            {
-                                // Extract id and payload.type from the patch value
-                                let value = match op {
-                                    json_patch::PatchOperation::Add(a) => Some(&a.value),
-                                    json_patch::PatchOperation::Replace(r) => Some(&r.value),
-                                    json_patch::PatchOperation::Remove(_) => None,
-                                    _ => None,
-                                };
+        let filtered_stream = self.msg_store.live_stream().filter_map(move |msg_result| {
+            let id_str = scratch_id.to_string();
+            let type_str = type_str.clone();
+            async move {
+                match msg_result {
+                    Ok(LogMsg::JsonPatch(patch)) => {
+                        if let Some(op) = patch.0.first()
+                            && op.path() == "/scratch"
+                        {
+                            // Extract id and payload.type from the patch value
+                            let value = match op {
+                                json_patch::PatchOperation::Add(a) => Some(&a.value),
+                                json_patch::PatchOperation::Replace(r) => Some(&r.value),
+                                json_patch::PatchOperation::Remove(_) => None,
+                                _ => None,
+                            };
 
-                                let matches = value.is_some_and(|v| {
-                                    let id_matches =
-                                        v.get("id").and_then(|v| v.as_str()) == Some(&id_str);
-                                    let type_matches = v
-                                        .get("payload")
-                                        .and_then(|p| p.get("type"))
-                                        .and_then(|t| t.as_str())
-                                        == Some(&type_str);
-                                    id_matches && type_matches
-                                });
+                            let matches = value.is_some_and(|v| {
+                                let id_matches =
+                                    v.get("id").and_then(|v| v.as_str()) == Some(&id_str);
+                                let type_matches = v
+                                    .get("payload")
+                                    .and_then(|p| p.get("type"))
+                                    .and_then(|t| t.as_str())
+                                    == Some(&type_str);
+                                id_matches && type_matches
+                            });
 
-                                if matches {
-                                    return Some(Ok(LogMsg::JsonPatch(patch)));
-                                }
+                            if matches {
+                                return Some(Ok(LogMsg::JsonPatch(patch)));
                             }
-                            None
                         }
-                        Ok(other) => Some(Ok(other)),
-                        Err(_) => None,
+                        None
                     }
+                    Ok(other) => Some(Ok(other)),
+                    Err(error) => Some(Err(error)),
                 }
-            });
+            }
+        });
 
         let initial_stream = futures::stream::iter(vec![Ok(initial_msg), Ok(LogMsg::Ready)]);
         let combined_stream = initial_stream.chain(filtered_stream).boxed();
@@ -247,48 +238,51 @@ impl EventService {
         }]);
         let initial_msg = LogMsg::JsonPatch(serde_json::from_value(initial_patch).unwrap());
 
-        let filtered_stream = BroadcastStream::new(self.msg_store.get_receiver()).filter_map(
-            move |msg_result| async move {
-                match msg_result {
-                    Ok(LogMsg::JsonPatch(patch)) => {
-                        if let Some(op) = patch.0.first()
-                            && op.path().starts_with("/workspaces")
-                        {
-                            // If archived filter is set, handle state transitions
-                            if let Some(archived_filter) = archived {
-                                // Extract workspace data from Add/Replace operations
-                                let value = match op {
-                                    json_patch::PatchOperation::Add(a) => Some(&a.value),
-                                    json_patch::PatchOperation::Replace(r) => Some(&r.value),
-                                    json_patch::PatchOperation::Remove(_) => {
-                                        // Allow remove operations through - client will handle
-                                        return Some(Ok(LogMsg::JsonPatch(patch)));
-                                    }
-                                    _ => None,
-                                };
-
-                                if let Some(v) = value
-                                    && let Some(ws_archived) =
-                                        v.get("archived").and_then(|a| a.as_bool())
-                                {
-                                    if ws_archived == archived_filter {
-                                        // Workspace matches this filter
-                                        // Convert Replace to Add since workspace may be new to this filtered stream
-                                        if let json_patch::PatchOperation::Replace(r) = op {
-                                            let add_patch = json_patch::Patch(vec![
-                                                json_patch::PatchOperation::Add(
-                                                    json_patch::AddOperation {
-                                                        path: r.path.clone(),
-                                                        value: r.value.clone(),
-                                                    },
-                                                ),
-                                            ]);
-                                            return Some(Ok(LogMsg::JsonPatch(add_patch)));
+        let filtered_stream =
+            self.msg_store
+                .live_stream()
+                .filter_map(move |msg_result| async move {
+                    match msg_result {
+                        Ok(LogMsg::JsonPatch(patch)) => {
+                            if let Some(op) = patch.0.first()
+                                && op.path().starts_with("/workspaces")
+                            {
+                                // If archived filter is set, handle state transitions
+                                if let Some(archived_filter) = archived {
+                                    // Extract workspace data from Add/Replace operations
+                                    let value = match op {
+                                        json_patch::PatchOperation::Add(a) => Some(&a.value),
+                                        json_patch::PatchOperation::Replace(r) => Some(&r.value),
+                                        json_patch::PatchOperation::Remove(_) => {
+                                            // Allow remove operations through - client will handle
+                                            return Some(Ok(LogMsg::JsonPatch(patch)));
                                         }
-                                        return Some(Ok(LogMsg::JsonPatch(patch)));
-                                    } else {
-                                        // Workspace no longer matches this filter - send remove
-                                        let remove_patch = json_patch::Patch(vec![
+                                        _ => None,
+                                    };
+
+                                    if let Some(v) = value
+                                        && let Some(ws_archived) =
+                                            v.get("archived").and_then(|a| a.as_bool())
+                                    {
+                                        if ws_archived == archived_filter {
+                                            // Workspace matches this filter
+                                            // Convert Replace to Add since workspace may be new to this filtered stream
+                                            if let json_patch::PatchOperation::Replace(r) = op {
+                                                let add_patch = json_patch::Patch(vec![
+                                                    json_patch::PatchOperation::Add(
+                                                        json_patch::AddOperation {
+                                                            path: r.path.clone(),
+                                                            value: r.value.clone(),
+                                                        },
+                                                    ),
+                                                ]);
+                                                return Some(Ok(LogMsg::JsonPatch(add_patch)));
+                                            }
+                                            return Some(Ok(LogMsg::JsonPatch(patch)));
+                                        } else {
+                                            // Workspace no longer matches this filter - send remove
+                                            let remove_patch =
+                                                json_patch::Patch(vec![
                                             json_patch::PatchOperation::Remove(
                                                 json_patch::RemoveOperation {
                                                     path: op
@@ -299,19 +293,18 @@ impl EventService {
                                                 },
                                             ),
                                         ]);
-                                        return Some(Ok(LogMsg::JsonPatch(remove_patch)));
+                                            return Some(Ok(LogMsg::JsonPatch(remove_patch)));
+                                        }
                                     }
                                 }
+                                return Some(Ok(LogMsg::JsonPatch(patch)));
                             }
-                            return Some(Ok(LogMsg::JsonPatch(patch)));
+                            None
                         }
-                        None
+                        Ok(other) => Some(Ok(other)),
+                        Err(error) => Some(Err(error)),
                     }
-                    Ok(other) => Some(Ok(other)),
-                    Err(_) => None,
-                }
-            },
-        );
+                });
 
         let initial_stream = futures::stream::iter(vec![Ok(initial_msg), Ok(LogMsg::Ready)]);
         Ok(initial_stream.chain(filtered_stream).boxed())
@@ -352,27 +345,26 @@ impl EventService {
                 .unwrap_or(nil_path)
         };
 
-        let filtered_stream =
-            BroadcastStream::new(self.msg_store.get_receiver()).filter_map(move |msg_result| {
-                let server_prefix = server_prefix.clone();
-                async move {
-                    match msg_result {
-                        Ok(LogMsg::JsonPatch(patch)) => {
-                            if let Some(op) = patch.0.first()
-                                && op.path().starts_with(&server_prefix)
-                            {
-                                // Rewrite path: /workspaces/{wsid}/sessions/{sid}
-                                //          → /sessions/{sid}
-                                let rewritten = rewrite_patch_paths(&patch, &server_prefix);
-                                return Some(Ok(LogMsg::JsonPatch(rewritten)));
-                            }
-                            None
+        let filtered_stream = self.msg_store.live_stream().filter_map(move |msg_result| {
+            let server_prefix = server_prefix.clone();
+            async move {
+                match msg_result {
+                    Ok(LogMsg::JsonPatch(patch)) => {
+                        if let Some(op) = patch.0.first()
+                            && op.path().starts_with(&server_prefix)
+                        {
+                            // Rewrite path: /workspaces/{wsid}/sessions/{sid}
+                            //          → /sessions/{sid}
+                            let rewritten = rewrite_patch_paths(&patch, &server_prefix);
+                            return Some(Ok(LogMsg::JsonPatch(rewritten)));
                         }
-                        Ok(other) => Some(Ok(other)),
-                        Err(_) => None,
+                        None
                     }
+                    Ok(other) => Some(Ok(other)),
+                    Err(error) => Some(Err(error)),
                 }
-            });
+            }
+        });
 
         let initial_stream = futures::stream::iter(vec![Ok(initial_msg), Ok(LogMsg::Ready)]);
         Ok(initial_stream.chain(filtered_stream).boxed())
@@ -418,4 +410,61 @@ fn rewrite_patch_paths(patch: &json_patch::Patch, server_prefix: &str) -> json_p
         })
         .collect();
     json_patch::Patch(new_ops)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use db::DBService;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tokio::sync::RwLock;
+    use utils::msg_store::MsgStore;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn every_event_filter_preserves_gaps_for_client_resnapshot() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("../db/migrations").run(&pool).await.unwrap();
+        let store = Arc::new(MsgStore::new());
+        let service =
+            EventService::new(DBService { pool }, store.clone(), Arc::new(RwLock::new(0)));
+        let id = Uuid::new_v4();
+        let mut streams = vec![
+            service
+                .stream_execution_processes_for_session_raw(id, false)
+                .await
+                .unwrap(),
+            service
+                .stream_scratch_raw(id, &db::models::scratch::ScratchType::WorkspaceNotes)
+                .await
+                .unwrap(),
+            service.stream_workspaces_raw(None, None).await.unwrap(),
+            service.stream_sessions_for_workspace_raw(id).await.unwrap(),
+        ];
+        for stream in &mut streams {
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                LogMsg::JsonPatch(_)
+            ));
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                LogMsg::Ready
+            ));
+        }
+        for _ in 0..32 {
+            store.push_stdout("x".repeat(64 * 1024));
+        }
+        for stream in &mut streams {
+            assert!(
+                stream.next().await.unwrap().is_err(),
+                "a filtered gap must not leave the client silently stale"
+            );
+        }
+    }
 }
