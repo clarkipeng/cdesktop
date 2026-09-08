@@ -146,9 +146,7 @@ impl RunningExecution {
 
     fn acknowledged_cleanup(&self) -> Result<(), ContainerError> {
         if self.cleanup_unverifiable {
-            return Err(ContainerError::Other(anyhow!(
-                "executor cannot verify detached-tool cleanup"
-            )));
+            return Err(ContainerError::CleanupUnconfirmed);
         }
         Ok(())
     }
@@ -2093,12 +2091,12 @@ mod tests {
             completion: futures::future::ready(Ok(())).boxed().shared(),
         };
         for _ in 0..2 {
-            assert!(
+            assert!(matches!(
                 running
                     .stop(ExecutionProcessStatus::Killed, Duration::from_millis(1))
-                    .await
-                    .is_err()
-            );
+                    .await,
+                Err(ContainerError::CleanupUnconfirmed)
+            ));
         }
     }
 

@@ -165,6 +165,8 @@ pub enum ContainerError {
     CodingAgentCapacity,
     #[error("Failed to kill process: {0}")]
     KillFailed(std::io::Error),
+    #[error("Tool cleanup is unconfirmed; detached tools may still be running")]
+    CleanupUnconfirmed,
     #[error(transparent)]
     Other(#[from] AnyhowError), // Catches any unclassified errors
 }
@@ -1124,12 +1126,11 @@ pub trait ContainerService {
             self.stop_execution(&process, ExecutionProcessStatus::Killed)
                 .await?;
         }
-        if let Some(id) =
-            ExecutionProcessOutcome::unconfirmed_cleanup_for_workspace(pool, workspace.id).await?
+        if ExecutionProcessOutcome::unconfirmed_cleanup_for_workspace(pool, workspace.id)
+            .await?
+            .is_some()
         {
-            return Err(ContainerError::Other(anyhow!(
-                "execution {id} has unconfirmed tool cleanup"
-            )));
+            return Err(ContainerError::CleanupUnconfirmed);
         }
         Ok(())
     }
@@ -1139,9 +1140,7 @@ pub trait ContainerService {
             .await?
             .is_some_and(|value| value.outcome.0.cleanup_confirmed == Some(false))
         {
-            return Err(ContainerError::Other(anyhow!(
-                "execution {id} has unconfirmed tool cleanup"
-            )));
+            return Err(ContainerError::CleanupUnconfirmed);
         }
         Ok(())
     }
