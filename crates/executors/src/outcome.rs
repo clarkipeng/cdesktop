@@ -41,6 +41,11 @@ pub enum OutcomeBindingScope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct NormalizedExecutionOutcome {
     pub class: ExecutionOutcomeClass,
+    /// Explicit adapter acknowledgement when stopping independently managed
+    /// tool processes. False must remain unconfirmed across stop retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cleanup_confirmed: Option<bool>,
     /// Stable provider error code (e.g. `usage_limit_exceeded`), never raw
     /// provider message text.
     #[serde(default)]
@@ -95,6 +100,7 @@ impl NormalizedExecutionOutcome {
         };
         Self {
             class,
+            cleanup_confirmed: None,
             provider_code: None,
             retry_after_seconds: None,
             resets_at: None,

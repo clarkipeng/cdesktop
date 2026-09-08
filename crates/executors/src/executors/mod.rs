@@ -398,6 +398,9 @@ pub struct SpawnedChild {
     pub exit_signal: Option<ExecutorExitSignal>,
     /// Container → Executor: signals when container wants to cancel the execution
     pub cancel: Option<CancellationToken>,
+    /// This adapter cannot verify detached-tool termination. A stop must remain
+    /// explicitly unconfirmed even when its protocol and process group finish.
+    pub cleanup_unverifiable: bool,
 }
 
 impl From<AsyncGroupChild> for SpawnedChild {
@@ -406,6 +409,7 @@ impl From<AsyncGroupChild> for SpawnedChild {
             child,
             exit_signal: None,
             cancel: None,
+            cleanup_unverifiable: false,
         }
     }
 }

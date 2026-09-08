@@ -177,6 +177,7 @@ impl From<ContainerError> for ApiError {
             ContainerError::Worktree(e) => e.into(),
             ContainerError::HostAdmission(e) => ApiError::HostAdmission(e),
             ContainerError::MaintenanceDrain(e) => ApiError::MaintenanceDrain(e),
+            ContainerError::CleanupUnconfirmed => ApiError::Conflict(err.to_string()),
             other => ApiError::Container(other),
         }
     }
@@ -720,6 +721,31 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::*;
+
+    #[tokio::test]
+    async fn unconfirmed_cleanup_is_an_actionable_conflict_not_an_internal_error() {
+        for (error, status, message) in [
+            (
+                ContainerError::CleanupUnconfirmed,
+                StatusCode::CONFLICT,
+                "Tool cleanup is unconfirmed; detached tools may still be running",
+            ),
+            (
+                ContainerError::Other(anyhow::anyhow!("private internal detail")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An internal error occurred. Please try again.",
+            ),
+        ] {
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["success"], false);
+            assert_eq!(body["message"], message);
+        }
+    }
 
     #[test]
     fn in_progress_stop_response_is_protocol_distinct_from_rejection() {

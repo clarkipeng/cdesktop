@@ -435,6 +435,23 @@ impl SessionCommand {
         .await?;
         Ok(())
     }
+
+    /// Fence the existing workspace queue before stopping its processes. Call
+    /// under the dispatch scheduler lock so an admitted launch is fully bound.
+    pub async fn cancel_workspace(
+        pool: &SqlitePool,
+        workspace_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE session_commands SET state = 'cancelled', finished_at = datetime('now', 'subsec') \
+             WHERE session_id IN (SELECT id FROM sessions WHERE workspace_id = ?) \
+             AND state IN ('pending', 'claimed')",
+        )
+        .bind(workspace_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
 }
 
 pub enum CancelSessionCommand {
@@ -1008,6 +1025,106 @@ mod tests {
             SessionCommand::pending(&pool, session_id).await.unwrap()[0].id,
             replacement.id
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_stop_cancels_claimed_and_queued_work_before_exit_or_recovery() {
+        let pool = pool().await;
+        sqlx::query("CREATE TABLE sessions (id BLOB PRIMARY KEY, workspace_id BLOB NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let workspace_id = Uuid::new_v4();
+        let sessions = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let mut executions = Vec::new();
+        for (index, session_id) in sessions.iter().enumerate() {
+            sqlx::query("INSERT INTO sessions VALUES (?, ?)")
+                .bind(session_id)
+                .bind(if index == 2 {
+                    Uuid::new_v4()
+                } else {
+                    workspace_id
+                })
+                .execute(&pool)
+                .await
+                .unwrap();
+            SessionCommand::enqueue(&pool, command(*session_id, "running", Some("initial")))
+                .await
+                .unwrap();
+            SessionCommand::claim_pending(&pool, *session_id)
+                .await
+                .unwrap();
+            let execution_id = execution_row(&pool).await;
+            SessionCommand::bind_execution(&pool, *session_id, execution_id)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE execution_processes SET status = 'running' WHERE id = ?")
+                .bind(execution_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            SessionCommand::enqueue(&pool, command(*session_id, "follow-up", Some("queued")))
+                .await
+                .unwrap();
+            executions.push(execution_id);
+        }
+        SessionCommand::cancel_workspace(&pool, workspace_id)
+            .await
+            .unwrap();
+        SessionCommand::cancel_workspace(&pool, workspace_id)
+            .await
+            .unwrap();
+        for (session_id, execution_id) in sessions[..2].iter().zip(&executions) {
+            // Both orders of a delayed exit callback, retry and recovery must
+            // retain cancellation. Neither the original nor sentinel can run.
+            sqlx::query("UPDATE execution_processes SET status = 'killed' WHERE id = ?")
+                .bind(execution_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            for success in [false, true] {
+                SessionCommand::finish_execution(&pool, *execution_id, success)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    SessionCommand::requeue_execution(&pool, *execution_id)
+                        .await
+                        .unwrap(),
+                    0
+                );
+            }
+            SessionCommand::release_execution(&pool, *execution_id)
+                .await
+                .unwrap();
+            assert!(
+                SessionCommand::claim_pending(&pool, *session_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let rows = SessionCommand::for_session(&pool, *session_id)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows.iter()
+                    .all(|row| row.state == SessionCommandState::Cancelled)
+            );
+            assert_eq!(rows[0].execution_process_id, Some(*execution_id));
+            assert_eq!(rows[0].attempt_number, 1);
+            assert_eq!(rows[1].attempt_number, 0);
+            let (retried, inserted) =
+                SessionCommand::enqueue(&pool, command(*session_id, "retry", Some("queued")))
+                    .await
+                    .unwrap();
+            assert!(!inserted);
+            assert_eq!(retried.state, SessionCommandState::Cancelled);
+        }
+        let other = SessionCommand::for_session(&pool, sessions[2])
+            .await
+            .unwrap();
+        assert_eq!(other[0].state, SessionCommandState::Claimed);
+        assert_eq!(other[1].state, SessionCommandState::Pending);
     }
 
     #[tokio::test]

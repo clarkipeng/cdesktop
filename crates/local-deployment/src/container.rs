@@ -114,6 +114,7 @@ struct RunningExecution {
     child: Arc<RwLock<AsyncGroupChild>>,
     cancel: Option<CancellationToken>,
     requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
+    cleanup_unverifiable: bool,
     // Every stop caller can await the same monitor, including after its own
     // graceful timeout. No caller can consume or detach another caller's wait.
     completion: MonitorCompletion,
@@ -127,19 +128,27 @@ impl RunningExecution {
     ) -> Result<(), ContainerError> {
         self.requested_stop.lock().await.get_or_insert(status);
         if matches!(self.completion.clone().now_or_never(), Some(Ok(()))) {
-            return Ok(());
+            return self.acknowledged_cleanup();
         }
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
             if let Ok(Ok(())) = tokio::time::timeout(grace, self.completion.clone()).await {
-                return Ok(());
+                return self.acknowledged_cleanup();
             }
         }
         command::kill_process_group(&mut *self.child.write().await).await?;
         self.completion
             .clone()
             .await
-            .map_err(|error| ContainerError::Other(anyhow!("exit monitor failed: {error}")))
+            .map_err(|error| ContainerError::Other(anyhow!("exit monitor failed: {error}")))?;
+        self.acknowledged_cleanup()
+    }
+
+    fn acknowledged_cleanup(&self) -> Result<(), ContainerError> {
+        if self.cleanup_unverifiable {
+            return Err(ContainerError::CleanupUnconfirmed);
+        }
+        Ok(())
     }
 }
 
@@ -598,6 +607,7 @@ impl LocalContainerService {
 
     /// Spawn a background task that polls the child process for completion and
     /// cleans up the execution entry when it exits.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_exit_monitor(
         &self,
         exec_id: &Uuid,
@@ -606,6 +616,7 @@ impl LocalContainerService {
         capture: JoinHandle<CaptureOutcome>,
         drain_expired: CancellationToken,
         requested_stop: Arc<Mutex<Option<ExecutionProcessStatus>>>,
+        cleanup_unverifiable: bool,
     ) -> JoinHandle<()> {
         let exec_id = *exec_id;
         let msg_stores = self.msg_stores.clone();
@@ -626,14 +637,6 @@ impl LocalContainerService {
                 // Some coding agent processes do not automatically exit after processing the user request; instead the executor
                 // signals when processing has finished to gracefully kill the process.
                 exit_result = &mut exit_signal_future => {
-                    // Executor signaled completion: kill group and use the provided result
-                    {
-                        let mut child = child.write().await;
-                        if let Err(err) = command::kill_process_group(&mut child).await {
-                            tracing::error!("Failed to kill process group after exit signal: {} {}", exec_id, err);
-                        }
-                    }
-
                     NormalizedProcessOutcome::from_executor_signal(exit_result)
                 }
                 // Process exit
@@ -643,9 +646,22 @@ impl LocalContainerService {
                     )
                 }
             };
+            // Reap the captured process group regardless of whether the
+            // executor protocol or the OS leader exit won the race. The PGID
+            // remains usable after leader exit; start_kill() alone does not
+            // establish that same-group descendants are gone.
+            {
+                let mut child = child.write().await;
+                if let Err(err) = command::kill_process_group(&mut child).await {
+                    tracing::error!(
+                        "Failed to kill process group after completion: {} {}",
+                        exec_id,
+                        err
+                    );
+                }
+            }
             // Descendants must close inherited pipes before the recorder can
             // drain. Process completion is published only after durable capture.
-            let _ = child.write().await.start_kill();
             let captured =
                 finish_raw_capture(capture, drain_expired, RAW_CAPTURE_DRAIN_GRACE).await;
             let recording_failed = !matches!(captured, Ok(CaptureOutcome::Complete));
@@ -665,12 +681,21 @@ impl LocalContainerService {
             };
             let (status, exit_code) = outcome.status_and_exit_code();
 
+            let mut normalized = outcome.normalized_outcome().cloned();
+            if requested_stop.is_some() && cleanup_unverifiable {
+                normalized
+                    .get_or_insert_with(|| {
+                        NormalizedExecutionOutcome::new(ExecutionOutcomeClass::UserStopped)
+                    })
+                    .cleanup_confirmed = Some(false);
+            }
+
             let completed_attempt = match ExecutionProcess::complete_running_attempt(
                 &db.pool,
                 exec_id,
                 status,
                 exit_code,
-                outcome.normalized_outcome(),
+                normalized.as_ref(),
             )
             .await
             {
@@ -1287,7 +1312,7 @@ impl ContainerService for LocalContainerService {
     }
 
     async fn delete(&self, workspace: &Workspace) -> Result<(), ContainerError> {
-        self.try_stop(workspace, true).await;
+        self.stop_workspace(workspace, true).await?;
         self.cleanup_workspace(workspace).await;
         Ok(())
     }
@@ -1517,6 +1542,7 @@ impl ContainerService for LocalContainerService {
             capture,
             drain_expired,
             requested_stop.clone(),
+            spawned.cleanup_unverifiable,
         );
         running.insert(
             execution_process.id,
@@ -1524,6 +1550,7 @@ impl ContainerService for LocalContainerService {
                 child,
                 cancel: spawned.cancel,
                 requested_stop,
+                cleanup_unverifiable: spawned.cleanup_unverifiable,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1544,6 +1571,7 @@ impl ContainerService for LocalContainerService {
                 "stop requires a terminal status"
             )));
         }
+        self.confirm_execution_cleanup(execution_process.id).await?;
         let running = running_execution_for_stop(
             &self.running_executions,
             &self.scheduler_lock,
@@ -1576,7 +1604,7 @@ impl ContainerService for LocalContainerService {
                 SessionCommand::requeue_killed_execution(&self.db().pool, execution_process.id)
                     .await?;
             }
-            return Ok(());
+            return self.confirm_execution_cleanup(execution_process.id).await;
         };
         running.stop(status, Duration::from_secs(5)).await?;
         // Only the monitor publishes completion and releases capture/UI state.
@@ -1590,7 +1618,7 @@ impl ContainerService for LocalContainerService {
             )));
         }
 
-        Ok(())
+        self.confirm_execution_cleanup(execution_process.id).await
     }
 
     async fn stream_diff(
@@ -1886,6 +1914,7 @@ mod tests {
                 child: child.clone(),
                 cancel: None,
                 requested_stop: Arc::new(Mutex::new(None)),
+                cleanup_unverifiable: false,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1954,6 +1983,7 @@ mod tests {
                 child: Arc::new(RwLock::new(child)),
                 cancel: has_graceful_cancel.then(CancellationToken::new),
                 requested_stop: Arc::new(Mutex::new(None)),
+                cleanup_unverifiable: has_graceful_cancel,
                 completion: monitor
                     .map(|result| result.map_err(Arc::new))
                     .boxed()
@@ -1982,16 +2012,16 @@ mod tests {
                 first.abort();
             }
             drop(producer); // Only now can the recorder seal and release its lease.
-            tokio::time::timeout(Duration::from_secs(5), second)
+            let second = tokio::time::timeout(Duration::from_secs(5), second)
                 .await
                 .unwrap()
-                .unwrap()
                 .unwrap();
+            assert_eq!(second.is_err(), has_graceful_cancel);
             let first = first.await;
             if abandon_first {
                 assert!(first.unwrap_err().is_cancelled());
             } else {
-                first.unwrap().unwrap();
+                assert_eq!(first.unwrap().is_err(), has_graceful_cancel);
             }
             assert!(terminal.load(Ordering::SeqCst));
             assert_eq!(
@@ -2027,6 +2057,7 @@ mod tests {
             child: Arc::new(RwLock::new(child)),
             cancel: Some(CancellationToken::new()),
             requested_stop: Arc::new(Mutex::new(None)),
+            cleanup_unverifiable: true,
             completion: monitor
                 .map(|result| result.map_err(Arc::new))
                 .boxed()
@@ -2041,6 +2072,32 @@ mod tests {
         }
         assert!(result.is_err());
         assert!(stopped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_monitor_cannot_acknowledge_detached_tool_cleanup_on_retry() {
+        use command_group::AsyncCommandGroup;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .group_spawn()
+            .unwrap();
+        child.wait().await.unwrap();
+        let running = RunningExecution {
+            child: Arc::new(RwLock::new(child)),
+            cancel: Some(CancellationToken::new()),
+            requested_stop: Arc::new(Mutex::new(None)),
+            cleanup_unverifiable: true,
+            completion: futures::future::ready(Ok(())).boxed().shared(),
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                running
+                    .stop(ExecutionProcessStatus::Killed, Duration::from_millis(1))
+                    .await,
+                Err(ContainerError::CleanupUnconfirmed)
+            ));
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ use db::{
             CreateExecutionProcess, ExecutionContext, ExecutionProcess, ExecutionProcessError,
             ExecutionProcessRunReason, ExecutionProcessStatus,
         },
+        execution_process_outcome::ExecutionProcessOutcome,
         execution_process_repo_state::{
             CreateExecutionProcessRepoState, ExecutionProcessRepoState,
         },
@@ -164,6 +165,8 @@ pub enum ContainerError {
     CodingAgentCapacity,
     #[error("Failed to kill process: {0}")]
     KillFailed(std::io::Error),
+    #[error("Tool cleanup is unconfirmed; detached tools may still be running")]
+    CleanupUnconfirmed,
     #[error(transparent)]
     Other(#[from] AnyhowError), // Catches any unclassified errors
 }
@@ -1087,45 +1090,59 @@ pub trait ContainerService {
             }
         }
 
-        self.try_stop(&workspace, false).await;
+        self.stop_workspace(&workspace, false).await?;
         ExecutionProcess::drop_at_and_after(pool, session_id, target_process_id).await?;
 
         Ok(())
     }
 
-    async fn try_stop(&self, workspace: &Workspace, include_dev_server: bool) {
-        // stop execution processes for this workspace's sessions
-        let sessions = match Session::find_by_workspace_id(&self.db().pool, workspace.id).await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        for session in sessions {
-            if let Ok(processes) =
-                ExecutionProcess::find_by_session_id(&self.db().pool, session.id, false).await
-            {
-                for process in processes {
-                    // Skip dev server processes unless explicitly included
-                    if !include_dev_server
-                        && process.run_reason == ExecutionProcessRunReason::DevServer
-                    {
-                        continue;
-                    }
-                    if process.status == ExecutionProcessStatus::Running {
-                        self.stop_execution(&process, ExecutionProcessStatus::Killed)
-                            .await
-                            .unwrap_or_else(|e| {
-                                tracing::debug!(
-                                    "Failed to stop execution process {} for workspace {}: {}",
-                                    process.id,
-                                    workspace.id,
-                                    e
-                                );
-                            });
-                    }
-                }
-            }
+    async fn stop_workspace(
+        &self,
+        workspace: &Workspace,
+        include_dev_server: bool,
+    ) -> Result<(), ContainerError> {
+        let scheduler = self.scheduler_lock().lock().await;
+        let pool = &self.db().pool;
+        // Cancel before interrupting: exit callbacks and crash recovery must
+        // not replay the stopped command or dispatch its queued follow-ups.
+        SessionCommand::cancel_workspace(pool, workspace.id).await?;
+        let mut running = Vec::new();
+        for session in Session::find_by_workspace_id(pool, workspace.id).await? {
+            running.extend(
+                ExecutionProcess::find_by_session_id(pool, session.id, false)
+                    .await?
+                    .into_iter()
+                    .filter(|process| {
+                        process.status == ExecutionProcessStatus::Running
+                            && (include_dev_server
+                                || process.run_reason != ExecutionProcessRunReason::DevServer)
+                    }),
+            );
         }
+        // Exit monitors dispatch other work under this lock; never await a
+        // monitor while holding it. New commands after the fence are new work.
+        drop(scheduler);
+        for process in running {
+            self.stop_execution(&process, ExecutionProcessStatus::Killed)
+                .await?;
+        }
+        if ExecutionProcessOutcome::unconfirmed_cleanup_for_workspace(pool, workspace.id)
+            .await?
+            .is_some()
+        {
+            return Err(ContainerError::CleanupUnconfirmed);
+        }
+        Ok(())
+    }
+
+    async fn confirm_execution_cleanup(&self, id: Uuid) -> Result<(), ContainerError> {
+        if ExecutionProcessOutcome::find_by_execution_process_id(&self.db().pool, id)
+            .await?
+            .is_some_and(|value| value.outcome.0.cleanup_confirmed == Some(false))
+        {
+            return Err(ContainerError::CleanupUnconfirmed);
+        }
+        Ok(())
     }
 
     async fn ensure_container_exists(
