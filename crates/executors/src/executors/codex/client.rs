@@ -326,10 +326,9 @@ impl AppServerClient {
         }
     }
 
-    /// Ask Codex to stop the exact active turn and its separately managed
-    /// background terminals. The caller supplies the outer timeout: an ignored
-    /// request deliberately remains unacknowledged so container stop can report
-    /// that it had to fall back to killing only the app-server group.
+    /// Interrupt the exact turn and enqueue background-terminal cleanup.
+    /// Success acknowledges the protocol exchange, not tool-process exit.
+    /// The container supplies the outer timeout and process-group fallback.
     pub async fn cancel_execution(&self) -> Result<(), ExecutorError> {
         self.cancellation_requested.store(true, Ordering::SeqCst);
         let _start = self.turn_start_gate.lock().await;
@@ -377,8 +376,8 @@ impl AppServerClient {
                 status = self.wait_for_matching_completion(&target) => {
                     let status = status?;
                     // Normal completion can win the cancellation race. It is
-                    // direct foreground-process evidence, so do not retain the
-                    // client forever waiting for an interrupt response that can
+                    // a terminal turn, so do not retain the client forever
+                    // waiting for an interrupt response that can
                     // no longer abort that turn. An interrupted terminal still
                     // requires the protocol acknowledgement.
                     if status == TurnStatus::Interrupted {
@@ -1720,7 +1719,7 @@ mod permission_tests {
         }
 
         #[tokio::test]
-        async fn cancellation_waits_for_turn_identity_and_matching_terminal_cleanup() {
+        async fn matching_turn_cancellation_does_not_prove_detached_tool_exit() {
             let (client, mut requests, mut responses, reader_shutdown) = fixture();
             client
                 .enqueue_feedback("queued after interruption".into())
@@ -1786,13 +1785,11 @@ mod permission_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(
                 !cancelling.is_finished(),
-                "a different turn's terminal event must not acknowledge cleanup"
+                "a different turn's terminal event must not complete cancellation"
             );
 
-            // The fake app server performs the foreground-tool cleanup before
-            // it emits the matching interrupted terminal notification.
-            detached.start_kill().unwrap();
-            detached.wait().await.unwrap();
+            // Codex may acknowledge interruption and enqueue cleanup while its
+            // independently grouped tool is still alive, as the real canary did.
             write_json(
                 &mut responses,
                 serde_json::json!({
@@ -1814,7 +1811,10 @@ mod permission_tests {
             )
             .await;
             cancelling.await.unwrap().unwrap();
-            assert!(detached.try_wait().unwrap().is_some());
+            let survived = detached.try_wait().unwrap().is_none();
+            detached.start_kill().unwrap();
+            detached.wait().await.unwrap();
+            assert!(survived, "protocol completion must not imply tool exit");
             assert!(
                 tokio::time::timeout(Duration::from_millis(20), read_json(&mut requests))
                     .await
@@ -1864,7 +1864,7 @@ mod permission_tests {
         }
 
         #[tokio::test]
-        async fn cancellation_waits_for_a_sent_continuation_before_acknowledging_cleanup() {
+        async fn cancellation_waits_for_a_sent_continuation_before_requesting_cleanup() {
             let (client, mut requests, mut responses, reader_shutdown) = fixture();
             *client.thread_id.lock().await = Some("thread-a".into());
             let starting = {
