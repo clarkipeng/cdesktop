@@ -356,6 +356,19 @@ impl LocalContainerService {
             expired_workspaces.len()
         );
         for workspace in &expired_workspaces {
+            if let Some(workspace_dir) = WorkspaceManager::workspace_dir_for(workspace) {
+                let repositories =
+                    WorkspaceRepo::find_repos_for_workspace(&self.db.pool, workspace.id)
+                        .await
+                        .unwrap_or_default();
+                if WorkspaceManager::holds_uncommitted_work(&workspace_dir, &repositories) {
+                    tracing::info!(
+                        "Keeping expired workspace {} because it has uncommitted work",
+                        workspace.id
+                    );
+                    continue;
+                }
+            }
             self.cleanup_workspace(workspace).await;
         }
         Ok(())

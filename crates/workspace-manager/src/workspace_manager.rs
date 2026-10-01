@@ -11,7 +11,7 @@ use db::{
         workspace_repo::{CreateWorkspaceRepo, RepoWithTargetBranch, WorkspaceRepo},
     },
 };
-use git::{GitService, GitServiceError};
+use git::{GitCli, GitService, GitServiceError};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use utils::text::{git_branch_id, short_uuid};
@@ -184,6 +184,60 @@ mod tests {
         assert_eq!(count(&pool, "execution_processes").await, 0);
         assert!(!workspace_dir.exists());
         assert!(!session_log_dir.exists());
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    // The idle sweep deleted dirty worktrees, so operators disabled it and
+    // clean worktrees piled up instead. Only real work may block reclaiming.
+    #[tokio::test]
+    async fn idle_sweep_keeps_only_worktrees_with_uncommitted_work() {
+        let (_db_dir, pool) = migrated_pool().await;
+        let source = tempfile::tempdir().expect("source");
+        let repo = Repo::find_or_create(&pool, source.path(), "repo", false)
+            .await
+            .expect("repo");
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let worktree = workspace_dir.path().join(&repo.name);
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        git(&worktree, &["init", "-q"]);
+        std::fs::write(worktree.join(".gitignore"), "target/\n").expect("gitignore");
+        std::fs::write(worktree.join("a.txt"), "a").expect("file");
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-q", "-m", "init"]);
+        let repos = [repo];
+        let holds = || WorkspaceManager::holds_uncommitted_work(workspace_dir.path(), &repos);
+
+        assert!(!holds(), "clean worktree is reclaimable");
+
+        std::fs::create_dir_all(worktree.join("target")).expect("target");
+        std::fs::write(worktree.join("target/build.o"), "x").expect("build output");
+        assert!(!holds(), "ignored build output is not work");
+
+        std::fs::write(worktree.join("new.txt"), "n").expect("untracked");
+        assert!(holds(), "untracked file is work");
+        std::fs::remove_file(worktree.join("new.txt")).expect("remove");
+
+        std::fs::write(worktree.join("a.txt"), "changed").expect("modify");
+        assert!(holds(), "modified tracked file is work");
+
+        std::fs::remove_dir_all(&worktree).expect("remove worktree");
+        assert!(!holds(), "missing worktree holds nothing");
     }
 }
 
@@ -656,6 +710,18 @@ impl WorkspaceManager {
         }
 
         Ok(())
+    }
+
+    /// Uncommitted and untracked files exist only in the worktree, so the
+    /// idle sweep must keep a workspace that has them. Ignored files such as
+    /// build output do not count. A worktree that cannot be inspected counts
+    /// as holding work.
+    pub fn holds_uncommitted_work(workspace_dir: &Path, repos: &[Repo]) -> bool {
+        let git = GitCli::new();
+        repos.iter().any(|repo| {
+            let worktree = workspace_dir.join(&repo.name);
+            worktree.exists() && git.has_changes(&worktree).unwrap_or(true)
+        })
     }
 
     /// Get the base directory for workspaces (same as worktree base dir)
