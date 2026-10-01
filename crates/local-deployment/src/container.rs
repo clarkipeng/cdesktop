@@ -357,11 +357,19 @@ impl LocalContainerService {
         );
         for workspace in &expired_workspaces {
             if let Some(workspace_dir) = WorkspaceManager::workspace_dir_for(workspace) {
-                let repositories =
-                    WorkspaceRepo::find_repos_for_workspace(&self.db.pool, workspace.id)
-                        .await
-                        .unwrap_or_default();
-                if WorkspaceManager::holds_uncommitted_work(&workspace_dir, &repositories) {
+                // A failed lookup cannot prove the worktree is clean, so keep it.
+                let holds_work = match WorkspaceRepo::find_repos_for_workspace(
+                    &self.db.pool,
+                    workspace.id,
+                )
+                .await
+                {
+                    Ok(repositories) => {
+                        WorkspaceManager::holds_uncommitted_work(&workspace_dir, &repositories)
+                    }
+                    Err(_) => true,
+                };
+                if holds_work {
                     tracing::info!(
                         "Keeping expired workspace {} because it has uncommitted work",
                         workspace.id
